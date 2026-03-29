@@ -1,0 +1,8 @@
+[general]
+name = "peanut_internship_rust"
+version = "0.1.0"
+mode = "development"
+
+[logging]
+level = "info"
+format = "text"
