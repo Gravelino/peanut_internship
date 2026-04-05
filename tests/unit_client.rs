@@ -1,5 +1,16 @@
 use peanut_internship_rust::chain::client::classify_rpc_error;
-use peanut_internship_rust::ChainError;
+use peanut_internship_rust::{Address, ChainClient, ChainError};
+
+const TEST_RPC_URL: &str = "http://127.0.0.1:1";
+const TEST_TIMEOUT: u64 = 1;
+const TEST_RETRIES: usize = 0;
+const TEST_RECIPIENT: &str = "0x0000000000000000000000000000000000000001";
+
+fn setup_failing_client() -> (ChainClient, Address) {
+    let client = ChainClient::new(vec![TEST_RPC_URL.to_string()], TEST_TIMEOUT, TEST_RETRIES);
+    let address = Address::new(TEST_RECIPIENT).unwrap();
+    (client, address)
+}
 
 #[test]
 fn classify_insufficient_funds() {
@@ -73,31 +84,26 @@ fn classify_generic_rpc_error() {
     );
 }
 
-#[test]
-fn client_with_zero_retries_fails_immediately() {
-    use peanut_internship_rust::{Address, ChainClient};
+#[tokio::test]
+async fn client_with_zero_retries_fails_immediately() {
+    let (client, address) = setup_failing_client();
 
-    let client = ChainClient::new(vec!["http://127.0.0.1:1".to_string()], 1, 0);
-    let address = Address::new("0x0000000000000000000000000000000000000001").unwrap();
-
-    let result = client.get_balance(&address);
+    let result = client.get_balance(&address).await;
     assert!(result.is_err());
 }
 
-#[test]
-fn client_retry_exhausts_all_urls() {
-    use peanut_internship_rust::{Address, ChainClient};
-
+#[tokio::test]
+async fn client_retry_exhausts_all_urls() {
     let client = ChainClient::new(
         vec![
             "http://127.0.0.1:1".to_string(),
             "http://127.0.0.1:2".to_string(),
         ],
-        1,
+        TEST_TIMEOUT,
         1,
     );
-    let address = Address::new("0x0000000000000000000000000000000000000001").unwrap();
+    let address = Address::new(TEST_RECIPIENT).unwrap();
 
-    let result = client.get_balance(&address);
+    let result = client.get_balance(&address).await;
     assert!(result.is_err());
 }

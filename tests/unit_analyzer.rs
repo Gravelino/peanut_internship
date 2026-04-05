@@ -1,5 +1,5 @@
 use peanut_internship_rust::chain::analyzer::{
-    analyze_transaction, decode_event_topic, extract_selector, known_selectors,
+    analyze_transaction, decode_event_topic, extract_selector, known_selectors, TRANSFER_TOPIC, SWAP_V2_TOPIC, SYNC_TOPIC,
 };
 
 #[test]
@@ -56,14 +56,14 @@ fn unknown_selector_is_not_in_map() {
 
 #[test]
 fn decode_transfer_event_topic() {
-    let topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let topic = TRANSFER_TOPIC;
     let name = decode_event_topic(topic);
     assert!(name.contains("Transfer"), "Expected Transfer, got: {name}");
 }
 
 #[test]
 fn decode_swap_v2_event_topic() {
-    let topic = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+    let topic = SWAP_V2_TOPIC;
     let name = decode_event_topic(topic);
     assert!(name.contains("Swap"), "Expected Swap, got: {name}");
     assert!(name.contains("V2"), "Expected V2 marker, got: {name}");
@@ -71,7 +71,7 @@ fn decode_swap_v2_event_topic() {
 
 #[test]
 fn decode_sync_event_topic() {
-    let topic = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
+    let topic = SYNC_TOPIC;
     let name = decode_event_topic(topic);
     assert!(name.contains("Sync"), "Expected Sync, got: {name}");
 }
@@ -81,9 +81,9 @@ fn unknown_event_topic_returns_unknown() {
     assert_eq!(decode_event_topic("0x0000000000000000000000000000000000000000000000000000000000000000"), "Unknown");
 }
 
-#[test]
-fn invalid_tx_hash_returns_clear_error() {
-    let result = analyze_transaction("http://localhost:1", "not-a-hash");
+#[tokio::test]
+async fn invalid_tx_hash_returns_clear_error() {
+    let result = analyze_transaction("http://localhost:1", "not-a-hash").await;
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(

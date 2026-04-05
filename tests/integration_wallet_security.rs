@@ -1,14 +1,24 @@
-use peanut_internship_rust::{Address, TokenAmount, WalletManager};
+use peanut_internship_rust::{Address, TokenAmount, WalletManager, MAINNET_CHAIN_ID, MIN_GAS_LIMIT};
 use ethers::types::Bytes;
 use std::fs;
 use std::path::PathBuf;
 
 const TEST_PASSWORD: &str = "test_password_secure_123";
+const TEST_RECIPIENT: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
+const TEST_RECIPIENT_ALT: &str = "0x70997970C51812e339D9B73b0245ad59E6f629E9";
 
 fn test_keystore_path() -> PathBuf {
     let path = PathBuf::from("target/test_keystores");
     let _ = fs::create_dir_all(&path);
     path.join(format!("test_keystore_{}.json", std::process::id()))
+}
+
+fn test_address() -> Address {
+    Address::new(TEST_RECIPIENT).unwrap()
+}
+
+fn test_address_alt() -> Address {
+    Address::new(TEST_RECIPIENT_ALT).unwrap()
 }
 
 #[test]
@@ -25,22 +35,22 @@ fn repr_display_never_expose_private_key() {
     assert!(!display_str.to_lowercase().contains("secret"));
 }
 
-#[test]
-fn empty_message_rejected_before_crypto() {
+#[tokio::test]
+async fn empty_message_rejected_before_crypto() {
     let wallet = WalletManager::generate().unwrap();
-    let result = wallet.sign_message("");
+    let result = wallet.sign_message("").await;
     
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(error.to_string(), "message must not be empty");
 }
 
-#[test]
-fn message_size_validation_before_crypto() {
+#[tokio::test]
+async fn message_size_validation_before_crypto() {
     let wallet = WalletManager::generate().unwrap();
 
     let huge_msg = "A".repeat(1_000_001);
-    let result = wallet.sign_message(&huge_msg);
+    let result = wallet.sign_message(&huge_msg).await;
 
     assert!(result.is_err());
     let error = result.unwrap_err();
@@ -48,15 +58,15 @@ fn message_size_validation_before_crypto() {
     assert!(error.to_string().contains("1000000"));
 }
 
-#[test]
-fn normal_messages_sign_successfully() {
+#[tokio::test]
+async fn normal_messages_sign_successfully() {
     let wallet = WalletManager::generate().unwrap();
 
-    let sig1 = wallet.sign_message("Hello, Ethereum!").unwrap();
+    let sig1 = wallet.sign_message("Hello, Ethereum!").await.unwrap();
     assert!(!sig1.to_string().is_empty());
 
     let big_msg = "B".repeat(1_000_000);
-    let sig2 = wallet.sign_message(&big_msg).unwrap();
+    let sig2 = wallet.sign_message(&big_msg).await.unwrap();
     assert!(!sig2.to_string().is_empty());
 }
 
@@ -73,44 +83,44 @@ fn error_messages_sanitize_sensitive_data() {
     assert!(!error_msg.contains("0xF"));
 }
 
-#[test]
-fn transaction_validation_rejects_invalid_fees() {
+#[tokio::test]
+async fn transaction_validation_rejects_invalid_fees() {
     let wallet = WalletManager::generate().unwrap();
-    let to = Address::new("0x52908400098527886E0F7030069857D2E4169EE7").unwrap();
+    let to = test_address();
 
     let tx_request = peanut_internship_rust::TransactionRequest {
         to,
-        value: TokenAmount::from_human("0", 18, None).unwrap(),
+        value: TokenAmount::eth(0),
         data: Bytes::new(),
         nonce: Some(0),
-        gas_limit: Some(21000),
+        gas_limit: Some(MIN_GAS_LIMIT),
         max_fee_per_gas: Some(ethers::types::U256::from(1_000_000_000u64)),
         max_priority_fee: Some(ethers::types::U256::from(2_000_000_000u64)),
-        chain_id: 1,
+        chain_id: MAINNET_CHAIN_ID,
     };
     
-    let result = wallet.sign_transaction(&tx_request);
+    let result = wallet.sign_transaction(&tx_request).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("maxPriorityFeePerGas"));
 }
 
-#[test]
-fn transaction_validation_rejects_zero_chain_id() {
+#[tokio::test]
+async fn transaction_validation_rejects_zero_chain_id() {
     let wallet = WalletManager::generate().unwrap();
-    let to = Address::new("0x52908400098527886E0F7030069857D2E4169EE7").unwrap();
+    let to = test_address();
 
     let tx_request = peanut_internship_rust::TransactionRequest {
         to,
-        value: TokenAmount::from_human("0", 18, None).unwrap(),
+        value: TokenAmount::eth(0),
         data: Bytes::new(),
         nonce: None,
-        gas_limit: Some(21000),
+        gas_limit: Some(MIN_GAS_LIMIT),
         max_fee_per_gas: Some(ethers::types::U256::from(1_000_000_000u64)),
         max_priority_fee: None,
         chain_id: 0,
     };
     
-    let result = wallet.sign_transaction(&tx_request);
+    let result = wallet.sign_transaction(&tx_request).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("chain_id"));
 }
@@ -151,8 +161,8 @@ fn keyfile_export_creates_encrypted_file(){
     let _ = fs::remove_dir_all(&test_dir);
 }
 
-#[test]
-fn keyfile_import_decrypts_correctly() {
+#[tokio::test]
+async fn keyfile_import_decrypts_correctly() {
     let wallet1 = WalletManager::generate().unwrap();
     let addr1 = wallet1.address();
 
@@ -183,8 +193,8 @@ fn keyfile_import_decrypts_correctly() {
     assert_eq!(wallet2.address(), addr1, "Imported wallet has different address");
 
     let message = "Test message for signature verification";
-    let sig1 = wallet1.sign_message(message).unwrap();
-    let sig2 = wallet2.sign_message(message).unwrap();
+    let sig1 = wallet1.sign_message(message).await.unwrap();
+    let sig2 = wallet2.sign_message(message).await.unwrap();
 
     assert_eq!(sig1.to_string(), sig2.to_string(), "Signatures do not match");
 
@@ -260,23 +270,23 @@ fn keyfile_corrupted_json_fails_gracefully() {
     let _ = fs::remove_dir_all(dir);
 }
 
-#[test]
-fn keyfile_roundtrip_preserves_functionality() {
+#[tokio::test]
+async fn keyfile_roundtrip_preserves_functionality() {
     let wallet_orig = WalletManager::generate().unwrap();
-    let recipient = Address::new("0x70997970C51812e339D9B73b0245ad59E6f629E9").unwrap();
+    let recipient = test_address_alt();
 
     let tx = peanut_internship_rust::TransactionRequest {
         to: recipient.clone(),
-        value: TokenAmount::from_human("1.5", 18, Some("ETH".to_string())).unwrap(),
+        value: TokenAmount::from_eth("1.5").unwrap(),
         data: Bytes::new(),
         nonce: Some(42),
-        gas_limit: Some(21000),
+        gas_limit: Some(MIN_GAS_LIMIT),
         max_fee_per_gas: Some(ethers::types::U256::from(1_000_000_000u64)),
         max_priority_fee: None,
-        chain_id: 1,
+        chain_id: MAINNET_CHAIN_ID,
     };
 
-    let sig_orig = wallet_orig.sign_transaction(&tx).unwrap();
+    let sig_orig = wallet_orig.sign_transaction(&tx).await.unwrap();
 
     let test_dir = std::env::temp_dir().join("peanut_tests_roundtrip");
     let _ = fs::remove_dir_all(&test_dir);
@@ -302,7 +312,7 @@ fn keyfile_roundtrip_preserves_functionality() {
     let wallet_reimport = WalletManager::from_keyfile(&actual_file, TEST_PASSWORD)
         .expect("failed to import keyfile");
 
-    let sig_reimport = wallet_reimport.sign_transaction(&tx).unwrap();
+    let sig_reimport = wallet_reimport.sign_transaction(&tx).await.unwrap();
 
     assert_eq!(sig_orig.to_string(), sig_reimport.to_string(), 
                "Reimported wallet produces different signature");

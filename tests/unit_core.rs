@@ -1,12 +1,20 @@
 use std::collections::HashSet;
 
-use peanut_internship_rust::{Address, CanonicalSerializer, Token, TokenAmount, WalletManager, TransactionRequest};
+use peanut_internship_rust::{Address, CanonicalSerializer, Token, TokenAmount, WalletManager, TransactionRequest, ETH_DECIMALS, MAINNET_CHAIN_ID, MIN_GAS_LIMIT};
 use ethers::types::{Bytes, U256};
 use rust_decimal::Decimal;
 
+const TEST_RECIPIENT: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
+const TEST_ADDRESS_1: &str = "0x0000000000000000000000000000000000000001";
+const TEST_ADDRESS_2: &str = "0x0000000000000000000000000000000000000002";
+
+fn test_recipient() -> Address {
+    Address::new(TEST_RECIPIENT).unwrap()
+}
+
 #[test]
 fn address_validation_and_equality_are_case_insensitive() {
-    let lower = Address::new("0x52908400098527886E0F7030069857D2E4169EE7").unwrap();
+    let lower = Address::new(TEST_RECIPIENT).unwrap();
     let mixed = Address::new("0x52908400098527886e0f7030069857d2e4169ee7").unwrap();
 
     assert_eq!(lower, mixed);
@@ -21,26 +29,26 @@ fn invalid_address_is_rejected() {
 
 #[test]
 fn token_amount_from_human_uses_integer_scaling() {
-    let amount = TokenAmount::from_human("1.5", 18, Some("ETH".to_string())).unwrap();
+    let amount = TokenAmount::from_eth("1.5").unwrap();
     assert_eq!(amount.raw.to_string(), "1500000000000000000");
     assert_eq!(amount.human(), Decimal::new(15, 1));
 }
 
 #[test]
 fn token_amount_arithmetic_requires_matching_decimals() {
-    let left = TokenAmount::from_human("1", 18, None).unwrap();
+    let left = TokenAmount::from_eth("1").unwrap();
     let right = TokenAmount::from_human("1", 6, None).unwrap();
 
-    assert!(left.checked_add(&right).is_err());
+    assert!(left.checked_add(right).is_err());
 }
 
 #[test]
 fn token_identity_depends_only_on_address() {
-    let address = Address::new("0x0000000000000000000000000000000000000001").unwrap();
+    let address = Address::new(TEST_ADDRESS_1).unwrap();
     let token_a = Token {
         address: address.clone(),
         symbol: "AAA".to_string(),
-        decimals: 18,
+        decimals: ETH_DECIMALS,
     };
     let token_b = Token {
         address,
@@ -91,26 +99,26 @@ fn wallet_repr_does_not_expose_private_key() {
     assert!(!display.to_lowercase().contains("private key"));
 }
 
-#[test]
-fn empty_message_is_rejected_before_signing() {
+#[tokio::test]
+async fn empty_message_is_rejected_before_signing() {
     let wallet = WalletManager::generate().unwrap();
-    let error = wallet.sign_message("").unwrap_err();
+    let error = wallet.sign_message("").await.unwrap_err();
     assert!(error.to_string().contains("must not be empty"));
 }
 
-#[test]
-fn oversized_message_is_rejected_before_crypto() {
+#[tokio::test]
+async fn oversized_message_is_rejected_before_crypto() {
     let wallet = WalletManager::generate().unwrap();
     let huge_message = "x".repeat(2_000_000);
-    let error = wallet.sign_message(&huge_message).unwrap_err();
+    let error = wallet.sign_message(&huge_message).await.unwrap_err();
     assert!(error.to_string().contains("exceeds maximum size"));
 }
 
-#[test]
-fn exception_messages_do_not_leak_sensitive_data() {
+#[tokio::test]
+async fn exception_messages_do_not_leak_sensitive_data() {
     let wallet = WalletManager::generate().unwrap();
 
-    let result = wallet.sign_message("test");
+    let result = wallet.sign_message("test").await;
     assert!(result.is_ok());
 
     let error = WalletManager::from_env("NONEXISTENT_VAR_12345").unwrap_err();
@@ -121,36 +129,36 @@ fn exception_messages_do_not_leak_sensitive_data() {
     assert!(error_str.len() < 500);
 }
 
-#[test]
-fn transaction_validation_before_signing() {
+#[tokio::test]
+async fn transaction_validation_before_signing() {
     let wallet = WalletManager::generate().unwrap();
-    let recipient = Address::new("0x52908400098527886E0F7030069857D2E4169EE7").unwrap();
+    let recipient = test_recipient();
 
     let valid_tx = TransactionRequest {
         to: recipient.clone(),
-        value: TokenAmount::from_human("0", 18, None).unwrap(),
+        value: TokenAmount::eth(0),
         data: Bytes::new(),
         nonce: Some(0),
-        gas_limit: Some(21000),
+        gas_limit: Some(MIN_GAS_LIMIT),
         max_fee_per_gas: Some(U256::from(1_000_000_000u64)),
         max_priority_fee: Some(U256::from(1_000_000_000u64)),
-        chain_id: 1,
+        chain_id: MAINNET_CHAIN_ID,
     };
 
-    assert!(wallet.sign_transaction(&valid_tx).is_ok());
+    assert!(wallet.sign_transaction(&valid_tx).await.is_ok());
 
     let invalid_tx = TransactionRequest {
         to: recipient.clone(),
-        value: TokenAmount::from_human("0", 18, None).unwrap(),
+        value: TokenAmount::eth(0),
         data: Bytes::new(),
         nonce: Some(0),
-        gas_limit: Some(21000),
+        gas_limit: Some(MIN_GAS_LIMIT),
         max_fee_per_gas: Some(U256::from(1_000_000_000u64)),
         max_priority_fee: Some(U256::from(2_000_000_000u64)),
-        chain_id: 1,
+        chain_id: MAINNET_CHAIN_ID,
     };
     
-    let error = wallet.sign_transaction(&invalid_tx).unwrap_err();
+    let error = wallet.sign_transaction(&invalid_tx).await.unwrap_err();
     assert!(error.to_string().contains("maxPriorityFeePerGas"));
 }
 
@@ -189,6 +197,20 @@ fn canonical_serializer_handles_empty_objects_and_arrays() {
 }
 
 #[test]
+fn web3_receipt_requires_effective_gas_price() {
+    let receipt = serde_json::json!({
+        "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "blockNumber": 123456,
+        "status": true,
+        "gasUsed": "21000",
+        "logs": []
+    });
+
+    let error = peanut_internship_rust::TransactionReceipt::from_web3(&receipt).unwrap_err();
+    assert!(error.to_string().contains("missing effective gas price"));
+}
+
+#[test]
 fn canonical_serializer_handles_large_integers() {
     let payload = serde_json::json!({"big": 9007199254740993_i64});
     let result = CanonicalSerializer::serialize(&payload);
@@ -215,14 +237,14 @@ fn canonical_serializer_determinism_1000_iterations() {
 #[test]
 fn tokens_with_different_addresses_are_not_equal() {
     let token_a = Token {
-        address: Address::new("0x0000000000000000000000000000000000000001").unwrap(),
+        address: Address::new(TEST_ADDRESS_1).unwrap(),
         symbol: "AAA".to_string(),
-        decimals: 18,
+        decimals: ETH_DECIMALS,
     };
     let token_b = Token {
-        address: Address::new("0x0000000000000000000000000000000000000002").unwrap(),
+        address: Address::new(TEST_ADDRESS_2).unwrap(),
         symbol: "AAA".to_string(),
-        decimals: 18,
+        decimals: ETH_DECIMALS,
     };
 
     assert_ne!(token_a, token_b);
