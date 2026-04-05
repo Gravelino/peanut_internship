@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::str::FromStr;
 
 use ethers::providers::{Http, Middleware, Provider};
@@ -7,52 +6,27 @@ use ethers::utils::format_ether;
 use serde_json::Value;
 
 use super::errors::{ChainError, ChainResult};
+pub use super::selectors::{known_selectors, decode_event_topic, TRANSFER_TOPIC, SWAP_V2_TOPIC, SYNC_TOPIC};
+use crate::core::types::{TransactionStatus, RECEIPT_STATUS_SUCCESS, RECEIPT_STATUS_FAILED};
 
-pub fn known_selectors() -> HashMap<String, String> {
-    HashMap::from([
-        // ERC-20
-        ("0xa9059cbb".into(), "transfer(address,uint256)".into()),
-        ("0x095ea7b3".into(), "approve(address,uint256)".into()),
-        ("0x23b872dd".into(), "transferFrom(address,address,uint256)".into()),
-        // Uniswap V2
-        ("0x38ed1739".into(), "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)".into()),
-        ("0x7ff36ab5".into(), "swapExactETHForTokens(uint256,address[],address,uint256)".into()),
-        ("0x18cbafe5".into(), "swapExactTokensForETH(uint256,uint256,address[],address,uint256)".into()),
-        ("0xe8e33700".into(), "addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256)".into()),
-        ("0xf305d719".into(), "addLiquidityETH(address,uint256,uint256,uint256,address,uint256)".into()),
-        ("0xbaa2abde".into(), "removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)".into()),
-        ("0x02751cec".into(), "removeLiquidityETH(address,uint256,uint256,uint256,address,uint256)".into()),
-        // Uniswap V3
-        ("0xac9650d8".into(), "multicall(bytes[])".into()),
-        ("0x414bf389".into(), "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))".into()),
-        ("0xc04b8d59".into(), "exactInput((bytes,address,uint256,uint256,uint256))".into()),
-        ("0xdb3e2198".into(), "exactOutputSingle((address,address,uint24,address,uint256,uint256,uint160))".into()),
-        ("0xf28c0498".into(), "exactOutput((bytes,address,uint256,uint256,uint256))".into()),
-    ])
-}
+/// Maximum length for truncated revert reasons in reports.
+const REVERT_REASON_MAX_LEN: usize = 200;
 
-const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const APPROVAL_TOPIC: &str = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
-const SWAP_V2_TOPIC: &str = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
-const SYNC_TOPIC: &str = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
-const SWAP_V3_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+/// Length of the Ethereum function selector (4 bytes).
+const SELECTOR_LEN: usize = 4;
 
-pub fn decode_event_topic(topic: &str) -> &'static str {
-    match topic {
-        TRANSFER_TOPIC => "Transfer(address,address,uint256)",
-        APPROVAL_TOPIC => "Approval(address,address,uint256)",
-        SWAP_V2_TOPIC => "Swap(address,uint256,uint256,uint256,uint256,address) [Uniswap V2]",
-        SYNC_TOPIC => "Sync(uint112,uint112)",
-        SWAP_V3_TOPIC => "Swap(address,address,int256,int256,uint160,uint128,int24) [Uniswap V3]",
-        _ => "Unknown",
-    }
-}
+/// Standard size of a word in the EVM (32 bytes).
+const EVM_WORD_LEN: usize = 32;
 
+/// Number of bytes to skip in a 32-byte word to extract a 20-byte address.
+const ADDRESS_SKIP_LEN: usize = 12;
+
+/// Extracts the 4-byte function selector from transaction input data.
 pub fn extract_selector(input: &[u8]) -> Option<String> {
-    if input.len() < 4 {
+    if input.len() < SELECTOR_LEN {
         return None;
     }
-    Some(format!("0x{}", hex::encode(&input[..4])))
+    Some(format!("0x{}", hex::encode(&input[..SELECTOR_LEN])))
 }
 
 fn format_log_entry(log: &ethers::types::Log, index: usize) -> String {
@@ -69,12 +43,12 @@ fn format_log_entry(log: &ethers::types::Log, index: usize) -> String {
     if log.topics.len() >= 3 {
         let topic0 = format!("0x{}", hex::encode(log.topics[0].as_bytes()));
         if topic0 == TRANSFER_TOPIC {
-            let from = format!("0x{}", hex::encode(&log.topics[1].as_bytes()[12..]));
-            let to = format!("0x{}", hex::encode(&log.topics[2].as_bytes()[12..]));
+            let from = format!("0x{}", hex::encode(&log.topics[1].as_bytes()[ADDRESS_SKIP_LEN..]));
+            let to = format!("0x{}", hex::encode(&log.topics[2].as_bytes()[ADDRESS_SKIP_LEN..]));
             out.push_str(&format!("    From:    {from}\n"));
             out.push_str(&format!("    To:      {to}\n"));
-            if log.data.len() >= 32 {
-                let value = U256::from_big_endian(&log.data.0[..32]);
+            if log.data.len() >= EVM_WORD_LEN {
+                let value = U256::from_big_endian(&log.data.0[..EVM_WORD_LEN]);
                 out.push_str(&format!("    Value:   {value}\n"));
             }
         }
@@ -84,9 +58,8 @@ fn format_log_entry(log: &ethers::types::Log, index: usize) -> String {
     out
 }
 
-fn try_get_revert_reason(
+async fn try_get_revert_reason(
     provider: &Provider<Http>,
-    rt: &tokio::runtime::Runtime,
     tx: &ethers::types::Transaction,
 ) -> Option<String> {
     let mut call = ethers::types::transaction::eip2718::TypedTransaction::Legacy(Default::default());
@@ -101,16 +74,16 @@ fn try_get_revert_reason(
 
     let block = tx.block_number.map(|n| ethers::types::BlockId::Number(n.into()));
 
-    match rt.block_on(provider.call(&call, block)) {
+    match provider.call(&call, block).await {
         Err(ethers::providers::ProviderError::JsonRpcClientError(e)) => {
             let msg = e.to_string();
             if msg.contains("revert") || msg.contains("execution reverted") {
                 Some(msg)
             } else {
-                Some(format!("call failed: {}", truncate(&msg, 200)))
+                Some(format!("call failed: {}", truncate(&msg, REVERT_REASON_MAX_LEN)))
             }
         }
-        Err(e) => Some(format!("call failed: {}", truncate(&e.to_string(), 200))),
+        Err(e) => Some(format!("call failed: {}", truncate(&e.to_string(), REVERT_REASON_MAX_LEN))),
         Ok(_) => None,
     }
 }
@@ -119,26 +92,43 @@ fn truncate(s: &str, max: usize) -> &str {
     if s.len() > max { &s[..max] } else { s }
 }
 
+/// Detailed results of a transaction analysis.
 #[derive(Debug)]
 pub struct AnalysisResult {
+    /// Transaction hash.
     pub hash: String,
+    /// Block number (None if pending).
     pub block: Option<u64>,
+    /// Block timestamp (None if pending/unknown).
     pub timestamp: Option<u64>,
-    pub status: String,
+    /// Status (Success, Failed, Pending).
+    pub status: TransactionStatus,
+    /// Transaction sender.
     pub from: String,
+    /// Transaction recipient (or "contract creation").
     pub to: String,
+    /// Value transferred in ETH.
     pub value_eth: String,
+    /// Gas limit.
     pub gas_limit: String,
+    /// Gas used (None if pending).
     pub gas_used: Option<String>,
+    /// Effective gas price (None if pending).
     pub effective_gas_price: Option<String>,
+    /// Transaction fee in ETH (None if pending).
     pub tx_fee_eth: Option<String>,
+    /// Function selector (4 bytes prefix).
     pub selector: Option<String>,
+    /// Human-readable function name (e.g., "transfer(address,uint256)").
     pub function_name: String,
+    /// List of formatted events/logs.
     pub events: Vec<String>,
+    /// Optional revert reason if the transaction failed.
     pub revert_reason: Option<String>,
 }
 
 impl AnalysisResult {
+    /// Formats the analysis results as a human-readable text report.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         out.push_str("Transaction Analysis\n");
@@ -189,6 +179,7 @@ impl AnalysisResult {
         out
     }
 
+    /// Serializes the analysis results to a JSON value.
     pub fn to_json(&self) -> Value {
         serde_json::json!({
             "hash": self.hash,
@@ -210,22 +201,26 @@ impl AnalysisResult {
     }
 }
 
-pub fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<AnalysisResult> {
+/// Orchestrates the analysis of an Ethereum transaction.
+/// 
+/// Fetches transaction data, receipt, and block details, then decodes
+/// the function called and its events.
+pub async fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<AnalysisResult> {
     let hash = H256::from_str(tx_hash).map_err(|e| ChainError::Other(format!("invalid transaction hash: {e}")))?;
     let provider = Provider::<Http>::try_from(rpc_url).map_err(|e| ChainError::Rpc(e.to_string()))?;
-    let rt = tokio::runtime::Runtime::new().map_err(|e| ChainError::Other(e.to_string()))?;
 
-    let tx = rt
-        .block_on(provider.get_transaction(hash))
+    let tx = provider.get_transaction(hash)
+        .await
         .map_err(|e| ChainError::Rpc(e.to_string()))?
         .ok_or_else(|| ChainError::Other("transaction not found".into()))?;
 
-    let receipt = rt
-        .block_on(provider.get_transaction_receipt(hash))
+    let receipt = provider.get_transaction_receipt(hash)
+        .await
         .map_err(|e| ChainError::Rpc(e.to_string()))?;
 
     let block_timestamp = if let Some(block_number) = tx.block_number {
-        rt.block_on(provider.get_block(block_number))
+        provider.get_block(block_number)
+            .await
             .map_err(|e| ChainError::Rpc(e.to_string()))?
             .map(|block| block.timestamp.as_u64())
     } else {
@@ -245,10 +240,10 @@ pub fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<Analysis
             }
         });
 
-    let status_str = match receipt.as_ref().and_then(|r| r.status).map(|v| v.as_u64()) {
-        Some(1) => "SUCCESS",
-        Some(0) => "FAILED",
-        _ => "PENDING",
+    let status = match receipt.as_ref().and_then(|r| r.status).map(|v| v.as_u64()) {
+        Some(RECEIPT_STATUS_SUCCESS) => TransactionStatus::Success,
+        Some(RECEIPT_STATUS_FAILED) => TransactionStatus::Failed,
+        _ => TransactionStatus::Pending,
     };
 
     let mut events = Vec::new();
@@ -258,8 +253,8 @@ pub fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<Analysis
         }
     }
 
-    let revert_reason = if status_str == "FAILED" {
-        try_get_revert_reason(&provider, &rt, &tx)
+    let revert_reason = if status == TransactionStatus::Failed {
+        try_get_revert_reason(&provider, &tx).await
     } else {
         None
     };
@@ -272,7 +267,7 @@ pub fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<Analysis
         hash: format!("{:?}", tx.hash),
         block: tx.block_number.map(|n| n.as_u64()),
         timestamp: block_timestamp,
-        status: status_str.into(),
+        status,
         from: format!("{:?}", tx.from),
         to: tx.to.map(|v| format!("{:?}", v)).unwrap_or_else(|| "contract creation".into()),
         value_eth: format_ether(tx.value).to_string(),
@@ -287,6 +282,7 @@ pub fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<Analysis
     })
 }
 
-pub fn analyze_transaction_text(rpc_url: &str, tx_hash: &str) -> ChainResult<String> {
-    analyze_transaction(rpc_url, tx_hash).map(|r| r.to_text())
+/// Analyzes a transaction and returns a human-readable text report.
+pub async fn analyze_transaction_text(rpc_url: &str, tx_hash: &str) -> ChainResult<String> {
+    analyze_transaction(rpc_url, tx_hash).await.map(|r| r.to_text())
 }
