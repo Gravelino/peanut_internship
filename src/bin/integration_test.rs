@@ -19,9 +19,26 @@
 //! 10. Analyze the receipt
 //! 11. Print full analysis
 
-use peanut_internship_rust::{Address, ChainClient, TokenAmount, TransactionBuilder, WalletManager};
+use peanut_internship_rust::{Address, ChainClient, TokenAmount, TransactionBuilder, WalletManager, GasPriority, SEPOLIA_CHAIN_ID};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Timeout for waiting for transaction confirmation in seconds.
+const CONFIRMATION_TIMEOUT_SECS: u64 = 120;
+
+/// Interval for polling transaction status during wait in seconds.
+const POLL_INTERVAL_SECS: f64 = 3.0;
+
+/// Minimum amount required for the test transaction.
+const TEST_MIN_BALANCE_ETH: &str = "0.001";
+
+/// Amount of ETH to send in the test transaction.
+const TEST_SEND_AMOUNT_ETH: &str = "0.0001";
+
+/// Maximum length of redacted URL for printing.
+const URL_REDACT_LEN: usize = 30;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     let _ = dotenvy::dotenv();
 
     println!("╔═══════════════════════════════════════════╗");
@@ -41,10 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  RPC: {}", redact_url(&rpc_url));
 
     println!("\nStep 3: Checking balance…");
-    let balance = client.get_balance(&wallet_address)?;
+    let balance = client.get_balance(&wallet_address).await?;
     println!("  Balance: {balance}");
 
-    let min_balance = TokenAmount::from_human("0.001", 18, Some("ETH".into()))?;
+    let min_balance = TokenAmount::from_eth(TEST_MIN_BALANCE_ETH)?;
     if balance.raw < min_balance.raw {
         return Err(format!(
             "Insufficient balance for test transaction. Have {balance}, need at least {min_balance}. \
@@ -53,45 +70,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nStep 4: Building ETH self-transfer transaction…");
-    let send_amount = TokenAmount::from_human("0.0001", 18, Some("ETH".into()))?;
+    let send_amount = TokenAmount::from_eth(TEST_SEND_AMOUNT_ETH)?;
     println!("  To:     {wallet_address_str} (self-transfer)");
     println!("  Value:  {send_amount}");
 
     let builder = TransactionBuilder::new(client.clone(), wallet.clone())
         .to(wallet_address.clone())
         .value(send_amount)
-        .chain_id(11155111);
+        .chain_id(SEPOLIA_CHAIN_ID);
 
     println!("\nStep 5: Estimating gas…");
-    let builder = builder.with_gas_estimate(1.2)?;
+    let builder = builder.with_gas_estimate(None).await?;
     println!("  Gas estimate obtained");
 
-    let builder = builder.with_gas_price("medium")?;
+    let builder = builder.with_gas_price(GasPriority::Medium).await?;
     println!("  Gas price set (medium priority)");
 
     println!("\nStep 6: Building and signing transaction…");
-    let tx_request = builder.clone().build()?;
+    let tx_request = builder.clone().build().await?;
     println!("  Nonce:  {:?}", tx_request.nonce);
     println!("  Gas:    {:?}", tx_request.gas_limit);
     println!("  Chain:  {}", tx_request.chain_id);
 
-    let signed_bytes = wallet.sign_transaction_bytes(&tx_request)?;
+    let signed_bytes = wallet.sign_transaction_bytes(&tx_request).await?;
     println!("  Signed bytes: {} bytes", signed_bytes.len());
 
     println!("\nStep 7: Verifying signature…");
-    let sig = wallet.sign_transaction(&tx_request)?;
+    let sig = wallet.sign_transaction(&tx_request).await?;
     println!("  Signature r: 0x{}", hex::encode(&sig.r.to_string()));
     println!("  Signature s: 0x{}", hex::encode(&sig.s.to_string()));
     println!("  Signature v: {}", sig.v);
     println!("  ✓ Signature produced successfully");
 
     println!("\nStep 8: Sending transaction to Sepolia…");
-    let tx_hash = client.send_transaction(&signed_bytes)?;
+    let tx_hash = client.send_transaction(&signed_bytes).await?;
     println!("  TX hash: {tx_hash}");
     println!("  Explorer: https://sepolia.etherscan.io/tx/{tx_hash}");
 
-    println!("\nStep 9: Waiting for confirmation (up to 120s)…");
-    let receipt = client.wait_for_receipt(&tx_hash, 120, 3.0)?;
+    println!("\nStep 9: Waiting for confirmation (up to {}s)…", CONFIRMATION_TIMEOUT_SECS);
+    let receipt = client.wait_for_receipt(&tx_hash, CONFIRMATION_TIMEOUT_SECS, POLL_INTERVAL_SECS).await?;
     println!("  ✓ Confirmed in block {}", receipt.block_number);
 
     println!("\nStep 10: Analyzing receipt…");
@@ -118,8 +135,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn redact_url(url: &str) -> String {
-    if url.len() > 30 {
-        format!("{}…", &url[..30])
+    if url.len() > URL_REDACT_LEN {
+        format!("{}…", &url[..URL_REDACT_LEN])
     } else {
         url.to_string()
     }

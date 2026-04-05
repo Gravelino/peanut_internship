@@ -1,9 +1,11 @@
 use std::env;
 
 use ethers::providers::{Http, Middleware, Provider};
-use peanut_internship_rust::{Address, ChainClient, WalletManager};
+use peanut_internship_rust::{Address, ChainClient, WalletManager, BlockId};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     let _ = dotenvy::dotenv();
 
     let wallet = WalletManager::from_env("PRIVATE_KEY")?;
@@ -16,12 +18,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sepolia_url = required_env("SEPOLIA_RPC_URL")?;
     println!("Sepolia RPC: configured");
-    run_chain_checks("Sepolia", &sepolia_url, &address)?;
+    run_chain_checks("Sepolia", &sepolia_url, &address).await?;
 
     match env::var("MAINNET_RPC_URL") {
         Ok(mainnet_url) if !mainnet_url.trim().is_empty() => {
             println!("\nMainnet RPC: configured");
-            run_chain_checks("Mainnet", &mainnet_url, &address)?;
+            run_chain_checks("Mainnet", &mainnet_url, &address).await?;
         }
         _ => {
             println!("\nMainnet RPC: not configured (skipped)");
@@ -31,17 +33,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_chain_checks(name: &str, rpc_url: &str, address: &Address) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_chain_checks(name: &str, rpc_url: &str, address: &Address) -> Result<(), Box<dyn std::error::Error>> {
     let chain_client = ChainClient::new(vec![rpc_url.to_string()], 20, 2);
 
     let provider = Provider::<Http>::try_from(rpc_url)?;
-    let rt = tokio::runtime::Runtime::new()?;
-    let chain_id = rt.block_on(provider.get_chainid())?;
-    let block_number = rt.block_on(provider.get_block_number())?;
+    let chain_id = provider.get_chainid().await?;
+    let block_number = provider.get_block_number().await?;
 
-    let balance = chain_client.get_balance(address)?;
-    let nonce = chain_client.get_nonce(address, "pending")?;
-    let gas = chain_client.get_gas_price()?;
+    let balance = chain_client.get_balance(address).await?;
+    let nonce = chain_client.get_nonce(address, BlockId::Pending).await?;
+    let gas = chain_client.get_gas_price().await?;
 
     println!("\n{name} check");
     println!("-----------");
