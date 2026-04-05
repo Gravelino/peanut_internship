@@ -57,6 +57,18 @@ Features:
 - Parses event logs (Transfer, Swap, Sync events)
 - Shows revert reason for failed transactions
 - Supports `--format json` for programmatic output
+```
+
+### Generating Documentation
+The project is fully documented using `rustdoc`. You can generate and view the technical documentation (including all core types and chain logic) locally:
+
+```sh
+# Generate and open documentation for the project and all its dependencies
+cargo doc --open
+
+# Generate documentation for this crate ONLY (much faster)
+cargo doc --no-deps --open
+```
 
 ### Repository Architecture
 - `src/core/`: Base types (Address, TokenAmount, Token), WalletManager, CanonicalSerializer
