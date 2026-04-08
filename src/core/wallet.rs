@@ -90,7 +90,7 @@ impl WalletManager {
         let _uuid = eth_keystore::encrypt_key(
             dir_path,
             &mut rng,
-            &secret,
+            secret,
             password.as_bytes(),
             Some(&name_val),
         ).map_err(|e| WalletError::KeyfileEncrypt(format!("failed to encrypt keyfile: {}", e)))?;

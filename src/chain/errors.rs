@@ -15,7 +15,7 @@ pub enum ChainError {
     #[error("transaction reverted: {tx_hash}")]
     TransactionFailed {
         tx_hash: String,
-        receipt: TransactionReceipt,
+        receipt: Box<TransactionReceipt>,
     },
     #[error("insufficient funds")]
     InsufficientFunds,

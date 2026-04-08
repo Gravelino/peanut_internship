@@ -97,8 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nStep 7: Verifying signature…");
     let sig = wallet.sign_transaction(&tx_request).await?;
-    println!("  Signature r: 0x{}", hex::encode(&sig.r.to_string()));
-    println!("  Signature s: 0x{}", hex::encode(&sig.s.to_string()));
+    println!("  Signature r: 0x{}", hex::encode(sig.r.to_string()));
+    println!("  Signature s: 0x{}", hex::encode(sig.s.to_string()));
     println!("  Signature v: {}", sig.v);
     println!("  ✓ Signature produced successfully");
 

@@ -92,7 +92,8 @@ impl FromStr for GasPriority {
         match s.to_lowercase().as_str() {
             "low" => Ok(Self::Low),
             "high" => Ok(Self::High),
-            "medium" | _ => Ok(Self::Medium),
+            "medium" => Ok(Self::Medium),
+            _ => Ok(Self::Medium),
         }
     }
 }
@@ -478,20 +479,18 @@ impl TransactionRequest {
             ));
         }
 
-        if let Some(gas) = self.gas_limit {
-            if gas < MIN_GAS_LIMIT {
-                return Err(CoreError::InvalidTransactionRequest(
-                    format!("gas_limit {gas} is too low; minimum is {MIN_GAS_LIMIT}")
-                ));
-            }
+        if let Some(gas) = self.gas_limit
+            && gas < MIN_GAS_LIMIT {
+            return Err(CoreError::InvalidTransactionRequest(
+                format!("gas_limit {gas} is too low; minimum is {MIN_GAS_LIMIT}")
+            ));
         }
 
-        if let (Some(fee), Some(priority)) = (self.max_fee_per_gas, self.max_priority_fee) {
-            if priority > fee {
-                return Err(CoreError::InvalidTransactionRequest(
-                    "maxPriorityFeePerGas cannot exceed maxFeePerGas".to_string(),
-                ));
-            }
+        if let (Some(fee), Some(priority)) = (self.max_fee_per_gas, self.max_priority_fee)
+            && priority > fee {
+            return Err(CoreError::InvalidTransactionRequest(
+                "maxPriorityFeePerGas cannot exceed maxFeePerGas".to_string(),
+            ));
         }
 
         Ok(())
