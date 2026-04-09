@@ -34,6 +34,10 @@ pub enum PricingError {
     /// Binary-search bound exceeded.
     #[error("no trade size satisfies the given impact constraint")]
     NoFeasibleSize,
+
+    /// No valid route was found between tokens.
+    #[error("no valid route found between tokens")]
+    NoRouteExists,
 }
 
 /// Convenience alias used throughout the pricing module.

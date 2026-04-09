@@ -7,11 +7,23 @@ use rust_decimal::Decimal;
 use ethers::types::Bytes;
 
 use crate::chain::client::ChainClient;
-use crate::core::types::{Address, BlockId, Token, TokenAmount, TransactionRequest};
+use crate::core::types::{Address, BlockId, Token, TokenAmount, TransactionRequest, ETH_DECIMALS};
 use super::errors::{PricingError, PricingResult};
 
 /// Basis-point scale used by Uniswap V2 fee math.
 const BPS: u128 = 10_000;
+
+/// Default fee in basis points (0.3%).
+const DEFAULT_FEE_BPS: u32 = 30;
+
+/// Base for decimal scaling.
+const DECIMAL_RADIX: u128 = 10;
+
+/// Chain ID for Ethereum Mainnet.
+const MAINNET_CHAIN_ID: u64 = 1;
+
+/// Multiplier to convert Gwei to Wei.
+const WEI_PER_GWEI: u128 = 1_000_000_000;
 
 /// Selector for `getReserves()` on a Uniswap V2 pair contract.
 /// keccak256("getReserves()")[..4] = 0x0902f1ac
@@ -60,7 +72,7 @@ impl UniswapV2Pair {
         reserve1: u128,
         fee_bps: u32,
     ) -> PricingResult<Self> {
-        if fee_bps >= 10_000 {
+        if fee_bps >= (BPS as u32) {
             return Err(PricingError::InvalidFeeBps(fee_bps));
         }
         Ok(Self { address, token0, token1, reserve0, reserve1, fee_bps })
@@ -147,8 +159,8 @@ impl UniswapV2Pair {
         let (reserve_in, reserve_out) = self.reserves_for(token_in)?;
         let token_out = self.token_out_for(token_in)?;
 
-        let scale_in = Decimal::from(10u128.pow(token_in.decimals as u32));
-        let scale_out = Decimal::from(10u128.pow(token_out.decimals as u32));
+        let scale_in = Decimal::from(DECIMAL_RADIX.pow(token_in.decimals as u32));
+        let scale_out = Decimal::from(DECIMAL_RADIX.pow(token_out.decimals as u32));
 
         let r_in = Decimal::from(reserve_in) / scale_in;
         let r_out = Decimal::from(reserve_out) / scale_out;
@@ -161,8 +173,8 @@ impl UniswapV2Pair {
         let amount_out = self.get_amount_out(amount_in, token_in)?;
         let token_out = self.token_out_for(token_in)?;
 
-        let scale_in = Decimal::from(10u128.pow(token_in.decimals as u32));
-        let scale_out = Decimal::from(10u128.pow(token_out.decimals as u32));
+        let scale_in = Decimal::from(DECIMAL_RADIX.pow(token_in.decimals as u32));
+        let scale_out = Decimal::from(DECIMAL_RADIX.pow(token_out.decimals as u32));
 
         let human_in = Decimal::from(amount_in) / scale_in;
         let human_out = Decimal::from(amount_out) / scale_out;
@@ -228,7 +240,7 @@ impl UniswapV2Pair {
             gas_limit: None,
             max_fee_per_gas: None,
             max_priority_fee: None,
-            chain_id: 1,
+            chain_id: MAINNET_CHAIN_ID,
         };
 
         let reserves_raw = client
@@ -260,7 +272,7 @@ impl UniswapV2Pair {
         let token0 = fetch_token_metadata(&token0_addr, client, dummy_value.clone()).await?;
         let token1 = fetch_token_metadata(&token1_addr, client, dummy_value.clone()).await?;
 
-        Self::new(address, token0, token1, reserve0, reserve1, 30)
+        Self::new(address, token0, token1, reserve0, reserve1, DEFAULT_FEE_BPS)
     }
 }
 
@@ -298,7 +310,7 @@ async fn fetch_token_metadata(
         gas_limit: None,
         max_fee_per_gas: None,
         max_priority_fee: None,
-        chain_id: 1,
+        chain_id: MAINNET_CHAIN_ID,
     };
 
     let dec_raw = client
@@ -441,16 +453,16 @@ impl PriceImpactAnalyzer {
         let gross_output = self.pair.get_amount_out(amount_in, token_in)?;
         let token_out = self.pair.token_out_for(token_in)?;
 
-        let gas_price_wei = gas_price_gwei * 1_000_000_000;
+        let gas_price_wei = gas_price_gwei * WEI_PER_GWEI;
         let gas_cost_eth = gas_estimate * gas_price_wei;
 
-        let scale_out = 10u128.pow(token_out.decimals as u32);
-        let scale_eth: u128 = 10u128.pow(18);
+        let scale_out = DECIMAL_RADIX.pow(token_out.decimals as u32);
+        let scale_eth: u128 = DECIMAL_RADIX.pow(ETH_DECIMALS as u32);
 
         let gas_cost_in_output_token = gas_cost_eth * scale_out / scale_eth;
         let net_output = gross_output.saturating_sub(gas_cost_in_output_token);
 
-        let scale_in = Decimal::from(10u128.pow(token_in.decimals as u32));
+        let scale_in = Decimal::from(DECIMAL_RADIX.pow(token_in.decimals as u32));
         let human_in = Decimal::from(amount_in) / scale_in;
         let human_net = Decimal::from(net_output) / Decimal::from(scale_out);
         
