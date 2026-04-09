@@ -7,6 +7,7 @@
 //! - **Core**: Types for [Address], [TokenAmount], and [WalletManager] for signing.
 //! - **Chain**: [ChainClient] for RPC interaction and [TransactionBuilder] for fluent transaction creation.
 //! - **Analysis**: Transaction analysis and event log decoding (ERC-20, Uniswap).
+//! - **Pricing**: Exact Uniswap V2 math, price impact analysis, and route finding.
 //! 
 //! ## Example: Transferring ETH
 //! ```no_run
@@ -32,6 +33,7 @@
 
 pub mod chain;
 pub mod core;
+pub mod pricing;
 
 pub use chain::{
     ChainClient,
@@ -49,3 +51,4 @@ pub use core::types::{
     ETH_SYMBOL, MAINNET_CHAIN_ID, SEPOLIA_CHAIN_ID, RECEIPT_STATUS_SUCCESS, RECEIPT_STATUS_FAILED,
 };
 pub use core::wallet::{WalletError, WalletManager};
+pub use pricing::{ImpactRow, PriceImpactAnalyzer, PricingError, PricingResult, TradeCost, UniswapV2Pair};
