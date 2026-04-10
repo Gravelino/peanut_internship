@@ -155,33 +155,45 @@ async fn run_mempool() -> Result<(), Box<dyn std::error::Error>> {
     println!("Waiting for swap transactions... press Ctrl+C to stop");
 
     let mut rx = monitor.start().await?;
+    let mut seen = 0u64;
 
-    while let Some(swap) = rx.recv().await {
-        let token_in = swap
-            .token_in
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "none".to_string());
-        let token_out = swap
-            .token_out
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "none".to_string());
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
+            Ok(Some(swap)) => {
+                seen += 1;
+                let token_in = swap
+                    .token_in
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".to_string());
+                let token_out = swap
+                    .token_out
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".to_string());
 
-        println!(
-            "swap tx={} dex={} method={} token_in={} token_out={} amount_in={} min_out={} gas_price={}",
-            swap.tx_hash,
-            swap.dex,
-            swap.method,
-            token_in,
-            token_out,
-            swap.amount_in,
-            swap.min_amount_out,
-            swap.gas_price,
-        );
+                println!(
+                    "[{}] swap tx={} dex={} method={} token_in={} token_out={} amount_in={} min_out={} gas_price={}",
+                    seen,
+                    swap.tx_hash,
+                    swap.dex,
+                    swap.method,
+                    token_in,
+                    token_out,
+                    swap.amount_in,
+                    swap.min_amount_out,
+                    swap.gas_price,
+                );
+            }
+            Ok(None) => {
+                println!("mempool channel closed");
+                break;
+            }
+            Err(_) => {
+                println!("still waiting for pending swap tx... seen={}", seen);
+            }
+        }
     }
-
-    println!("mempool channel closed");
 
     Ok(())
 }

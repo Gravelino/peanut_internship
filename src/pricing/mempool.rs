@@ -5,10 +5,10 @@ use ethers::providers::{Provider, Ws};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::core::types::Address;
-use crate::pricing::errors::PricingResult;
+use crate::pricing::errors::{PricingError, PricingResult};
 
 /// Parsed swap transaction from mempool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,37 +91,61 @@ impl MempoolMonitor {
         let (tx, rx) = mpsc::channel(Self::SWAP_CHANNEL_SIZE);
         let ws_url = self.ws_url.clone();
 
-        tokio::spawn(async move {
-            info!(ws_url = %ws_url, "Starting MempoolMonitor on WebSocket");
+        info!(ws_url = %ws_url, "Starting MempoolMonitor on WebSocket");
 
+        let probe = Provider::<Ws>::connect(&ws_url)
+            .await
+            .map_err(|e| PricingError::ChainCall(format!("websocket connect failed: {e}")))?;
+
+        let full_supported = match probe.subscribe_full_pending_txs().await {
+            Ok(_) => true,
+            Err(full_err) => {
+                warn!(
+                    error = %full_err,
+                    "Node does not support full pending tx subscription, probing hash fallback"
+                );
+
+                let _ = probe
+                    .subscribe_pending_txs()
+                    .await
+                    .map_err(|hash_err| {
+                        PricingError::ChainCall(format!(
+                            "pending tx subscription failed (full stream unsupported: {full_err}; hash fallback failed: {hash_err})"
+                        ))
+                    })?;
+                false
+            }
+        };
+
+        drop(probe);
+
+        tokio::spawn(async move {
             let provider = match Provider::<Ws>::connect(&ws_url).await {
                 Ok(p) => Arc::new(p),
                 Err(e) => {
-                    error!(error = %e, "Failed to connect to WebSocket provider");
+                    warn!(error = %e, "WebSocket provider lost before monitor task start");
                     return;
                 }
             };
 
-            // Try full transactions first (best latency and less RPC chatter).
-            if let Ok(mut full_stream) = provider.subscribe_full_pending_txs().await {
-                while let Some(tx_data) = full_stream.next().await {
-                    if let Some(parsed) = Self::parse_transaction(&tx_data)
-                        && let Err(e) = tx.send(parsed).await
-                    {
-                        warn!(error = %e, "Mempool notification channel closed");
-                        break;
+            if full_supported {
+                if let Ok(mut full_stream) = provider.subscribe_full_pending_txs().await {
+                    while let Some(tx_data) = full_stream.next().await {
+                        if let Some(parsed) = Self::parse_transaction(&tx_data)
+                            && let Err(e) = tx.send(parsed).await
+                        {
+                            warn!(error = %e, "Mempool notification channel closed");
+                            break;
+                        }
                     }
+                    return;
                 }
-                return;
             }
 
-            warn!(
-                "Node does not support full pending tx subscription, falling back to pending hashes"
-            );
             let mut hash_stream = match provider.subscribe_pending_txs().await {
                 Ok(s) => s,
                 Err(e) => {
-                    error!(error = %e, "Failed to subscribe to pending tx hashes");
+                    warn!(error = %e, "Failed to subscribe to pending tx hashes in monitor task");
                     return;
                 }
             };
