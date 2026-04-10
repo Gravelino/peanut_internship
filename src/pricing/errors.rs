@@ -38,6 +38,10 @@ pub enum PricingError {
     /// No valid route was found between tokens.
     #[error("no valid route found between tokens")]
     NoRouteExists,
+
+    /// Integer arithmetic overflow occurred in AMM math.
+    #[error("arithmetic overflow during {0}")]
+    ArithmeticOverflow(&'static str),
 }
 
 /// Convenience alias used throughout the pricing module.

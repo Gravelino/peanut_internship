@@ -1,17 +1,14 @@
-use std::collections::{HashMap, HashSet};
 use ethers::types::U256;
+use std::collections::{HashMap, HashSet};
 
-use crate::core::types::{Token, ETH_DECIMALS};
 use super::amm::UniswapV2Pair;
 use super::errors::{PricingError, PricingResult};
+use crate::core::types::{ETH_DECIMALS, Token, WEI_PER_GWEI};
 
 /// Base gas cost for any swap transaction.
 const BASE_GAS_COST: u128 = 150_000;
 /// Additional gas cost per route hop.
 const GAS_PER_HOP: u128 = 100_000;
-/// Multiplier to convert Gwei to Wei.
-const WEI_PER_GWEI: u128 = 1_000_000_000;
-
 /// Represents a swap route through one or more pools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -20,6 +17,7 @@ pub struct Route {
 }
 
 impl Route {
+    /// Creates a route from ordered pools and matching token path.
     pub fn new(pools: Vec<UniswapV2Pair>, path: Vec<Token>) -> Self {
         Self { pools, path }
     }
@@ -87,6 +85,7 @@ pub struct RouteFinder {
 }
 
 impl RouteFinder {
+    /// Builds a route finder and adjacency graph from known pools.
     pub fn new(pools: Vec<UniswapV2Pair>) -> Self {
         let graph = Self::build_graph(&pools);
         Self { pools, graph }
@@ -97,8 +96,14 @@ impl RouteFinder {
         let mut graph: HashMap<Token, Vec<(UniswapV2Pair, Token)>> = HashMap::new();
 
         for pool in pools {
-            graph.entry(pool.token0.clone()).or_default().push((pool.clone(), pool.token1.clone()));
-            graph.entry(pool.token1.clone()).or_default().push((pool.clone(), pool.token0.clone()));
+            graph
+                .entry(pool.token0.clone())
+                .or_default()
+                .push((pool.clone(), pool.token1.clone()));
+            graph
+                .entry(pool.token1.clone())
+                .or_default()
+                .push((pool.clone(), pool.token0.clone()));
         }
 
         graph
@@ -134,7 +139,10 @@ impl RouteFinder {
     fn dfs(&self, current_token: &Token, ctx: &mut DfsContext<'_>) {
         if current_token == ctx.target_token {
             if !ctx.current_pools.is_empty() {
-                ctx.all_routes.push(Route::new(ctx.current_pools.clone(), ctx.current_path.clone()));
+                ctx.all_routes.push(Route::new(
+                    ctx.current_pools.clone(),
+                    ctx.current_path.clone(),
+                ));
             }
             return;
         }
@@ -213,13 +221,186 @@ impl RouteFinder {
         gas_price_gwei: u128,
         max_hops: usize,
     ) -> PricingResult<(Route, u128)> {
-        let comparisons = self.compare_routes(token_in, token_out, amount_in, gas_price_gwei, max_hops);
+        let comparisons =
+            self.compare_routes(token_in, token_out, amount_in, gas_price_gwei, max_hops);
 
         let best = comparisons.into_iter().max_by_key(|c| c.net_output);
 
         match best {
             Some(c) => Ok((c.route, c.net_output)),
             None => Err(PricingError::NoRouteExists),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::Address;
+    use proptest::prelude::*;
+
+    fn mock_token(symbol: &str, addr_hex: &str) -> Token {
+        Token {
+            address: Address::new(addr_hex).unwrap(),
+            symbol: symbol.to_string(),
+            decimals: 18,
+        }
+    }
+
+    fn setup_pools() -> (Token, Token, Token, Vec<UniswapV2Pair>) {
+        let shib = mock_token("SHIB", "0x0000000000000000000000000000000000000001");
+        let usdc = mock_token("USDC", "0x0000000000000000000000000000000000000002");
+        let eth = mock_token("ETH", "0x0000000000000000000000000000000000000003");
+
+        let pool_shib_usdc = UniswapV2Pair::new(
+            Address::new("0x1000000000000000000000000000000000000000").unwrap(),
+            shib.clone(),
+            usdc.clone(),
+            100_000_000_000_000_000_000,
+            100_000_000_000_000_000_000,
+            30,
+        )
+        .unwrap();
+
+        let pool_shib_eth = UniswapV2Pair::new(
+            Address::new("0x2000000000000000000000000000000000000000").unwrap(),
+            shib.clone(),
+            eth.clone(),
+            10_000_000_000_000_000_000_000,
+            10_000_000_000_000_000_000_000,
+            30,
+        )
+        .unwrap();
+
+        let pool_eth_usdc = UniswapV2Pair::new(
+            Address::new("0x3000000000000000000000000000000000000000").unwrap(),
+            eth.clone(),
+            usdc.clone(),
+            10_000_000_000_000_000_000_000,
+            10_000_000_000_000_000_000_000,
+            30,
+        )
+        .unwrap();
+
+        (
+            shib,
+            usdc,
+            eth,
+            vec![pool_shib_usdc, pool_shib_eth, pool_eth_usdc],
+        )
+    }
+
+    #[test]
+    fn test_direct_vs_multihop() {
+        let (shib, usdc, _eth, pools) = setup_pools();
+        let finder = RouteFinder::new(pools);
+        let amount_in = 10_000_000_000_000_000_000;
+        let (best_route, _net_out) = finder
+            .find_best_route(&shib, &usdc, amount_in, 0, 3)
+            .unwrap();
+        assert_eq!(best_route.num_hops(), 2);
+        assert_eq!(best_route.path[0].symbol, "SHIB");
+        assert_eq!(best_route.path[1].symbol, "ETH");
+        assert_eq!(best_route.path[2].symbol, "USDC");
+    }
+
+    #[test]
+    fn test_gas_makes_direct_better() {
+        let (shib, usdc, _eth, pools) = setup_pools();
+        let finder = RouteFinder::new(pools);
+        let amount_in = 10_000_000_000_000_000_000;
+        let gas_price_gwei = 10_000;
+        let (best_route, _net_out) = finder
+            .find_best_route(&shib, &usdc, amount_in, gas_price_gwei, 3)
+            .unwrap();
+        assert_eq!(best_route.num_hops(), 1);
+        assert_eq!(best_route.path.len(), 2);
+        assert_eq!(best_route.path[0].symbol, "SHIB");
+        assert_eq!(best_route.path[1].symbol, "USDC");
+    }
+
+    #[test]
+    fn test_no_route_exists() {
+        let shib = mock_token("SHIB", "0x0000000000000000000000000000000000000001");
+        let usdc = mock_token("USDC", "0x0000000000000000000000000000000000000002");
+        let finder = RouteFinder::new(vec![]);
+        let res = finder.find_best_route(&shib, &usdc, 1000, 10, 3);
+        assert!(matches!(res, Err(PricingError::NoRouteExists)));
+    }
+
+    #[test]
+    fn test_route_output_matches_sequential_swaps() {
+        let (shib, usdc, eth, pools) = setup_pools();
+        let multi_route = Route::new(
+            vec![pools[1].clone(), pools[2].clone()],
+            vec![shib.clone(), eth.clone(), usdc.clone()],
+        );
+        let amount_in = 5_000_000_000_000_000_000;
+        let out1 = pools[1].get_amount_out(amount_in, &shib).unwrap();
+        let out2 = pools[2].get_amount_out(out1, &eth).unwrap();
+        let route_out = multi_route.get_output(amount_in).unwrap();
+        assert_eq!(route_out, out2);
+        let intermediate = multi_route.get_intermediate_amounts(amount_in).unwrap();
+        assert_eq!(intermediate.len(), 3);
+        assert_eq!(intermediate[0], amount_in);
+        assert_eq!(intermediate[1], out1);
+        assert_eq!(intermediate[2], out2);
+    }
+
+    #[test]
+    fn test_gas_flip_changes_best_route_by_net_output() {
+        let (shib, usdc, _eth, pools) = setup_pools();
+        let finder = RouteFinder::new(pools);
+        let amount_in = 10_000_000_000_000_000_000u128;
+
+        let low_gas = finder.compare_routes(&shib, &usdc, amount_in, 0, 3);
+        let low_best = low_gas.iter().max_by_key(|c| c.net_output).unwrap();
+        let low_direct = low_gas.iter().find(|c| c.route.num_hops() == 1).unwrap();
+        assert_eq!(low_best.route.num_hops(), 2);
+        assert!(low_best.gross_output > low_direct.gross_output);
+
+        let high_gas = finder.compare_routes(&shib, &usdc, amount_in, 10_000, 3);
+        let high_best = high_gas.iter().max_by_key(|c| c.net_output).unwrap();
+        let high_direct = high_gas.iter().find(|c| c.route.num_hops() == 1).unwrap();
+        let high_multihop = high_gas.iter().find(|c| c.route.num_hops() == 2).unwrap();
+
+        assert_eq!(high_best.route.num_hops(), 1);
+        assert!(high_direct.net_output >= high_multihop.net_output);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_multihop_output_matches_sequential_for_any_amount(
+            amount_in in 1u128..1_000_000_000_000_000_000_000u128,
+        ) {
+            let (shib, usdc, eth, pools) = setup_pools();
+            let route = Route::new(
+                vec![pools[1].clone(), pools[2].clone()],
+                vec![shib.clone(), eth.clone(), usdc.clone()],
+            );
+
+            let out1 = pools[1].get_amount_out(amount_in, &shib).unwrap();
+            let out2 = pools[2].get_amount_out(out1, &eth).unwrap();
+            let route_out = route.get_output(amount_in).unwrap();
+
+            prop_assert_eq!(route_out, out2);
+        }
+
+        #[test]
+        fn prop_route_comparison_has_consistent_net_math(
+            amount_in in 1u128..1_000_000_000_000_000_000_000u128,
+            gas_price_gwei in 0u128..50_000u128,
+        ) {
+            let (shib, usdc, _eth, pools) = setup_pools();
+            let finder = RouteFinder::new(pools);
+
+            let comparisons = finder.compare_routes(&shib, &usdc, amount_in, gas_price_gwei, 3);
+            prop_assert!(!comparisons.is_empty());
+
+            for cmp in comparisons {
+                prop_assert!(cmp.net_output <= cmp.gross_output);
+                prop_assert_eq!(cmp.gas_estimate, BASE_GAS_COST + GAS_PER_HOP * (cmp.route.num_hops() as u128));
+            }
         }
     }
 }
