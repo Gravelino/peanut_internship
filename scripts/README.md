@@ -1,6 +1,6 @@
 # Project Automation Scripts
-
-- `scripts/install-hooks.ps1`: (Work-In-Progress) Installs Git hooks for local environment matching CI standards. 
+ 
+- `scripts/start_fork.sh`: Starts local Anvil fork for pricing simulations (`ETH_RPC_URL` required).
 - Use the `Makefile` as the primary interface for running and testing the project.
 
 ## CI Workflow (Github Actions / GitLab CI)
