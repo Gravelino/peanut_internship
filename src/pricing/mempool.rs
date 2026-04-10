@@ -128,8 +128,8 @@ impl MempoolMonitor {
                 }
             };
 
-            if full_supported {
-                if let Ok(mut full_stream) = provider.subscribe_full_pending_txs().await {
+            if full_supported
+                && let Ok(mut full_stream) = provider.subscribe_full_pending_txs().await {
                     while let Some(tx_data) = full_stream.next().await {
                         if let Some(parsed) = Self::parse_transaction(&tx_data)
                             && let Err(e) = tx.send(parsed).await
@@ -140,7 +140,6 @@ impl MempoolMonitor {
                     }
                     return;
                 }
-            }
 
             let mut hash_stream = match provider.subscribe_pending_txs().await {
                 Ok(s) => s,
