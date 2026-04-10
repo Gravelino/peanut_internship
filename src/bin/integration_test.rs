@@ -19,7 +19,10 @@
 //! 10. Analyze the receipt
 //! 11. Print full analysis
 
-use peanut_internship_rust::{Address, ChainClient, TokenAmount, TransactionBuilder, WalletManager, GasPriority, SEPOLIA_CHAIN_ID};
+use peanut_internship_rust::{
+    Address, ChainClient, GasPriority, SEPOLIA_CHAIN_ID, TokenAmount, TransactionBuilder,
+    WalletManager,
+};
 
 /// Timeout for waiting for transaction confirmation in seconds.
 const CONFIRMATION_TIMEOUT_SECS: u64 = 120;
@@ -52,8 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Wallet address: {wallet_address_str}");
 
     println!("\nStep 2: Connecting to Sepolia…");
-    let rpc_url = std::env::var("SEPOLIA_RPC_URL")
-        .map_err(|_| "SEPOLIA_RPC_URL is required")?;
+    let rpc_url = std::env::var("SEPOLIA_RPC_URL").map_err(|_| "SEPOLIA_RPC_URL is required")?;
     let client = ChainClient::new(vec![rpc_url.clone()], 30, 3);
     println!("  RPC: {}", redact_url(&rpc_url));
 
@@ -107,14 +109,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  TX hash: {tx_hash}");
     println!("  Explorer: https://sepolia.etherscan.io/tx/{tx_hash}");
 
-    println!("\nStep 9: Waiting for confirmation (up to {}s)…", CONFIRMATION_TIMEOUT_SECS);
-    let receipt = client.wait_for_receipt(&tx_hash, CONFIRMATION_TIMEOUT_SECS, POLL_INTERVAL_SECS).await?;
+    println!(
+        "\nStep 9: Waiting for confirmation (up to {}s)…",
+        CONFIRMATION_TIMEOUT_SECS
+    );
+    let receipt = client
+        .wait_for_receipt(&tx_hash, CONFIRMATION_TIMEOUT_SECS, POLL_INTERVAL_SECS)
+        .await?;
     println!("  ✓ Confirmed in block {}", receipt.block_number);
 
     println!("\nStep 10: Analyzing receipt…");
     println!("  TX hash:  {}", receipt.tx_hash);
     println!("  Block:    {}", receipt.block_number);
-    println!("  Status:   {}", if receipt.status { "SUCCESS ✓" } else { "FAILED ✗" });
+    println!(
+        "  Status:   {}",
+        if receipt.status {
+            "SUCCESS ✓"
+        } else {
+            "FAILED ✗"
+        }
+    );
     println!("  Gas used: {}", receipt.gas_used);
     println!("  TX fee:   {}", receipt.tx_fee());
     println!("  Logs:     {} event(s)", receipt.logs.len());

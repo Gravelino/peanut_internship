@@ -8,10 +8,7 @@ pub enum ChainError {
     #[error("rpc error: {0}")]
     Rpc(String),
     #[error("rpc request failed: {message}")]
-    RPCError {
-        message: String,
-        code: Option<i64>,
-    },
+    RPCError { message: String, code: Option<i64> },
     #[error("transaction reverted: {tx_hash}")]
     TransactionFailed {
         tx_hash: String,

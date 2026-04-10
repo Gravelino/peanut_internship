@@ -4,9 +4,11 @@ use std::hash::{Hash, Hasher};
 use std::ops::Add;
 use std::str::FromStr;
 
-use ethers::types::{Address as EthAddress, Bytes, TransactionRequest as EthTransactionRequest, U256};
-use rust_decimal::prelude::FromPrimitive;
+use ethers::types::{
+    Address as EthAddress, Bytes, TransactionRequest as EthTransactionRequest, U256,
+};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -34,6 +36,15 @@ pub const MAINNET_CHAIN_ID: u64 = 1;
 
 /// Chain ID for Sepolia Testnet.
 pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
+
+/// Multiplier to convert Gwei to Wei.
+pub const WEI_PER_GWEI: u128 = 1_000_000_000;
+
+/// Divisor for low-priority fee suggestions (`base / 4`).
+pub const PRIORITY_FEE_LOW_DIVISOR: u64 = 4;
+
+/// Divisor for medium-priority fee suggestions (`base / 2`).
+pub const PRIORITY_FEE_MEDIUM_DIVISOR: u64 = 2;
 
 /// String representation of success in hex.
 pub const SUCCESS_HEX: &str = "0x1";
@@ -204,7 +215,8 @@ impl Address {
     /// Validates the format and stores both the original and checksummed versions.
     pub fn new(value: impl AsRef<str>) -> Result<Self, CoreError> {
         let raw = value.as_ref().trim();
-        let parsed = EthAddress::from_str(raw).map_err(|_| CoreError::InvalidAddress(raw.to_string()))?;
+        let parsed =
+            EthAddress::from_str(raw).map_err(|_| CoreError::InvalidAddress(raw.to_string()))?;
         Ok(Self {
             value: ethers::utils::to_checksum(&parsed, None),
             parsed,
@@ -246,7 +258,9 @@ impl Hash for Address {
 
 impl fmt::Debug for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple(stringify!(Address)).field(&self.value).finish()
+        f.debug_tuple(stringify!(Address))
+            .field(&self.value)
+            .finish()
     }
 }
 
@@ -310,7 +324,11 @@ impl TokenAmount {
     }
 
     /// Creates a TokenAmount from a human-readable string (e.g., "0.1").
-    pub fn from_human(amount: impl ToString, decimals: u8, symbol: Option<String>) -> Result<Self, CoreError> {
+    pub fn from_human(
+        amount: impl ToString,
+        decimals: u8,
+        symbol: Option<String>,
+    ) -> Result<Self, CoreError> {
         let amount_string = amount.to_string();
         let decimal = match Decimal::from_str(&amount_string) {
             Ok(decimal) => decimal,
@@ -318,7 +336,9 @@ impl TokenAmount {
         };
 
         if decimal.is_sign_negative() {
-            return Err(CoreError::InvalidTokenAmount("negative amounts are not supported".to_string()));
+            return Err(CoreError::InvalidTokenAmount(
+                "negative amounts are not supported".to_string(),
+            ));
         }
 
         let scale = get_scale(decimals);
@@ -336,7 +356,11 @@ impl TokenAmount {
             Err(_) => return Err(CoreError::InvalidTokenAmount(raw_string)),
         };
 
-        Ok(Self { raw, decimals, symbol })
+        Ok(Self {
+            raw,
+            decimals,
+            symbol,
+        })
     }
 
     /// Converts the amount to its human-readable decimal representation.
@@ -365,7 +389,9 @@ impl TokenAmount {
     /// Multiplies the amount by a decimal factor, returning a new TokenAmount.
     pub fn checked_mul_decimal(self, factor: Decimal) -> Result<Self, CoreError> {
         if factor.is_sign_negative() {
-            return Err(CoreError::InvalidTokenAmount("negative factor is not supported".to_string()));
+            return Err(CoreError::InvalidTokenAmount(
+                "negative factor is not supported".to_string(),
+            ));
         }
 
         let product = self.human() * factor;
@@ -394,8 +420,11 @@ impl fmt::Display for TokenAmount {
 
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct Token {
+    /// Contract address of the token.
     pub address: Address,
+    /// Human-readable ticker symbol.
     pub symbol: String,
+    /// Number of decimal places used by the token.
     pub decimals: u8,
 }
 
@@ -480,14 +509,16 @@ impl TransactionRequest {
         }
 
         if let Some(gas) = self.gas_limit
-            && gas < MIN_GAS_LIMIT {
-            return Err(CoreError::InvalidTransactionRequest(
-                format!("gas_limit {gas} is too low; minimum is {MIN_GAS_LIMIT}")
-            ));
+            && gas < MIN_GAS_LIMIT
+        {
+            return Err(CoreError::InvalidTransactionRequest(format!(
+                "gas_limit {gas} is too low; minimum is {MIN_GAS_LIMIT}"
+            )));
         }
 
         if let (Some(fee), Some(priority)) = (self.max_fee_per_gas, self.max_priority_fee)
-            && priority > fee {
+            && priority > fee
+        {
             return Err(CoreError::InvalidTransactionRequest(
                 "maxPriorityFeePerGas cannot exceed maxFeePerGas".to_string(),
             ));
@@ -542,7 +573,10 @@ impl TransactionReceipt {
         let logs = receipt
             .logs
             .iter()
-            .map(|log| serde_json::to_value(log).map_err(|_| CoreError::InvalidReceipt(ReceiptError::LogSerializationFailed)))
+            .map(|log| {
+                serde_json::to_value(log)
+                    .map_err(|_| CoreError::InvalidReceipt(ReceiptError::LogSerializationFailed))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -551,13 +585,18 @@ impl TransactionReceipt {
                 .block_number
                 .map(|n| n.as_u64())
                 .ok_or(CoreError::InvalidReceipt(ReceiptError::MissingBlockNumber))?,
-            status: receipt.status.map(|status| status.as_u64() == RECEIPT_STATUS_SUCCESS).unwrap_or(false),
+            status: receipt
+                .status
+                .map(|status| status.as_u64() == RECEIPT_STATUS_SUCCESS)
+                .unwrap_or(false),
             gas_used: receipt
                 .gas_used
                 .ok_or(CoreError::InvalidReceipt(ReceiptError::MissingGasUsed))?,
             effective_gas_price: receipt
                 .effective_gas_price
-                .ok_or(CoreError::InvalidReceipt(ReceiptError::MissingEffectiveGasPrice))?,
+                .ok_or(CoreError::InvalidReceipt(
+                    ReceiptError::MissingEffectiveGasPrice,
+                ))?,
             logs,
         })
     }
@@ -602,7 +641,11 @@ impl GasPrice {
             GasPriority::Medium => self.priority_fee_medium,
         };
 
-        let normalized_buffer = if buffer.is_finite() && buffer > MIN_GAS_BUFFER_THRESHOLD { buffer } else { DEFAULT_GAS_BUFFER };
+        let normalized_buffer = if buffer.is_finite() && buffer > MIN_GAS_BUFFER_THRESHOLD {
+            buffer
+        } else {
+            DEFAULT_GAS_BUFFER
+        };
         let buffer_bps = (normalized_buffer * (BPS_SCALE as f64)).ceil() as u64;
 
         let ratio_base = U256::from(BPS_SCALE);
