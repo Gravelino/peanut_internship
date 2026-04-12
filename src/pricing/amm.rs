@@ -2,25 +2,42 @@
 //! Exact Uniswap V2 math using integer arithmetic.
 //! Display helpers produce Decimal values.
 
-use ethers::types::Bytes;
 use ethers::types::U256;
 use rust_decimal::Decimal;
 
 use super::errors::{PricingError, PricingResult};
 use crate::chain::client::ChainClient;
 use crate::core::types::{
-    Address, BlockId, ETH_DECIMALS, MAINNET_CHAIN_ID, Token, TokenAmount, TransactionRequest,
-    WEI_PER_GWEI,
+    Address, BPS_SCALE, BlockId, DECIMAL_BASE, ETH_DECIMALS, MAINNET_CHAIN_ID, Token, TokenAmount,
+    TransactionRequest, WEI_PER_GWEI,
 };
-
-/// Basis-point scale used by Uniswap V2 fee math.
-const BPS: u128 = 10_000;
 
 /// Default fee in basis points (0.3%).
 const DEFAULT_FEE_BPS: u32 = 30;
 
-/// Base for decimal scaling.
-const DECIMAL_RADIX: u128 = 10;
+/// Size of an EVM word in bytes.
+const EVM_WORD_LEN: usize = 32;
+
+/// Number of bytes in an `address` type (20 bytes).
+const ADDRESS_LEN: usize = 20;
+
+/// Byte offset to skip the leading 12 bytes of a 32-byte slot when extracting an address.
+const ADDRESS_SKIP_LEN: usize = EVM_WORD_LEN - ADDRESS_LEN;
+
+/// Minimum byte length of a `getReserves()` ABI return (3 EVM words = 96 bytes).
+const GET_RESERVES_RETURN_MIN: usize = EVM_WORD_LEN * 3;
+
+/// Minimum byte length of an ABI-encoded string (offset + length + at least 1 word of data).
+const ABI_STRING_MIN: usize = EVM_WORD_LEN * 3;
+
+/// Byte offset of the string length field within an ABI-encoded string return.
+const ABI_STRING_LEN_OFFSET: usize = EVM_WORD_LEN * 2 - 8;
+
+/// Byte offset where string data starts in an ABI-encoded string return.
+const ABI_STRING_DATA_START: usize = EVM_WORD_LEN * 2;
+
+/// Upper bound divisor for binary search: never swap more than half the reserve.
+const MAX_SWAP_RESERVE_DIVISOR: u128 = 2;
 
 /// Selector for `getReserves()` on a Uniswap V2 pair contract.
 /// keccak256("getReserves()")[..4] = 0x0902f1ac
@@ -85,7 +102,7 @@ impl UniswapV2Pair {
         reserve1: u128,
         fee_bps: u32,
     ) -> PricingResult<Self> {
-        if fee_bps >= (BPS as u32) {
+        if fee_bps >= (BPS_SCALE as u32) {
             return Err(PricingError::InvalidFeeBps(fee_bps));
         }
         Ok(Self {
@@ -96,6 +113,18 @@ impl UniswapV2Pair {
             reserve1,
             fee_bps,
         })
+    }
+
+    /// Returns `token0` or `token1` if its address matches the given hex string.
+    pub fn token0_if_matches(&self, address: &str) -> Option<Token> {
+        let target = Address::new(address).ok()?;
+        if self.token0.address == target {
+            Some(self.token0.clone())
+        } else if self.token1.address == target {
+            Some(self.token1.clone())
+        } else {
+            None
+        }
     }
 
     /// Returns `(reserve_in, reserve_out)` for a swap where `token_in` is sold.
@@ -129,7 +158,7 @@ impl UniswapV2Pair {
         let ain = U256::from(amount_in);
         let r_in = U256::from(reserve_in);
         let r_out = U256::from(reserve_out);
-        let bps = U256::from(BPS);
+        let bps = U256::from(BPS_SCALE);
         let fee = U256::from(self.fee_bps);
 
         let amount_in_with_fee = Self::u256_mul_checked(ain, bps - fee, "amount_in_with_fee")?;
@@ -168,7 +197,7 @@ impl UniswapV2Pair {
         let aout = U256::from(amount_out);
         let r_in = U256::from(reserve_in);
         let r_out = U256::from(reserve_out);
-        let bps = U256::from(BPS);
+        let bps = U256::from(BPS_SCALE);
         let fee = U256::from(self.fee_bps);
 
         let reserve_times_out =
@@ -184,8 +213,8 @@ impl UniswapV2Pair {
         let (reserve_in, reserve_out) = self.reserves_for(token_in)?;
         let token_out = self.token_out_for(token_in)?;
 
-        let scale_in = Decimal::from(DECIMAL_RADIX.pow(token_in.decimals as u32));
-        let scale_out = Decimal::from(DECIMAL_RADIX.pow(token_out.decimals as u32));
+        let scale_in = Decimal::from(DECIMAL_BASE.pow(token_in.decimals as u32));
+        let scale_out = Decimal::from(DECIMAL_BASE.pow(token_out.decimals as u32));
 
         let r_in = Decimal::from(reserve_in) / scale_in;
         let r_out = Decimal::from(reserve_out) / scale_out;
@@ -198,8 +227,8 @@ impl UniswapV2Pair {
         let amount_out = self.get_amount_out(amount_in, token_in)?;
         let token_out = self.token_out_for(token_in)?;
 
-        let scale_in = Decimal::from(DECIMAL_RADIX.pow(token_in.decimals as u32));
-        let scale_out = Decimal::from(DECIMAL_RADIX.pow(token_out.decimals as u32));
+        let scale_in = Decimal::from(DECIMAL_BASE.pow(token_in.decimals as u32));
+        let scale_out = Decimal::from(DECIMAL_BASE.pow(token_out.decimals as u32));
 
         let human_in = Decimal::from(amount_in) / scale_in;
         let human_out = Decimal::from(amount_out) / scale_out;
@@ -239,9 +268,15 @@ impl UniswapV2Pair {
         let amount_out = self.get_amount_out(amount_in, token_in)?;
 
         let (new_reserve0, new_reserve1) = if *token_in == self.token0 {
-            (self.reserve0 + amount_in, self.reserve1 - amount_out)
+            (
+                self.reserve0 + amount_in,
+                self.reserve1.saturating_sub(amount_out),
+            )
         } else {
-            (self.reserve0 - amount_out, self.reserve1 + amount_in)
+            (
+                self.reserve0.saturating_sub(amount_out),
+                self.reserve1 + amount_in,
+            )
         };
 
         Ok(Self {
@@ -256,49 +291,39 @@ impl UniswapV2Pair {
 
     /// Fetches live pair data and token metadata from an on-chain Uniswap V2 pair contract.
     pub async fn from_chain(address: Address, client: &ChainClient) -> PricingResult<Self> {
-        let dummy_value = TokenAmount::eth(0u64);
-        let dummy_data_tx = |data: Vec<u8>| TransactionRequest {
-            to: address.clone(),
-            value: dummy_value.clone(),
-            data: Bytes::from(data),
-            nonce: None,
-            gas_limit: None,
-            max_fee_per_gas: None,
-            max_priority_fee: None,
-            chain_id: MAINNET_CHAIN_ID,
+        let call = |data: Vec<u8>| {
+            TransactionRequest::contract_call(address.clone(), data, MAINNET_CHAIN_ID)
         };
 
         let reserves_raw = client
-            .call(
-                &dummy_data_tx(GET_RESERVES_SELECTOR.to_vec()),
-                BlockId::Latest,
-            )
+            .call(&call(GET_RESERVES_SELECTOR.to_vec()), BlockId::Latest)
             .await
             .map_err(|e| PricingError::ChainCall(e.to_string()))?;
 
-        if reserves_raw.len() < 96 {
+        if reserves_raw.len() < GET_RESERVES_RETURN_MIN {
             return Err(PricingError::AbiDecode(format!(
-                "getReserves returned {} bytes, expected 96",
+                "getReserves returned {} bytes, expected {GET_RESERVES_RETURN_MIN}",
                 reserves_raw.len()
             )));
         }
-        let reserve0 = decode_u128_from_slot(&reserves_raw[0..32])?;
-        let reserve1 = decode_u128_from_slot(&reserves_raw[32..64])?;
+        let reserve0 = decode_u128_from_slot(&reserves_raw[0..EVM_WORD_LEN])?;
+        let reserve1 = decode_u128_from_slot(&reserves_raw[EVM_WORD_LEN..EVM_WORD_LEN * 2])?;
 
         let token0_raw = client
-            .call(&dummy_data_tx(TOKEN0_SELECTOR.to_vec()), BlockId::Latest)
+            .call(&call(TOKEN0_SELECTOR.to_vec()), BlockId::Latest)
             .await
             .map_err(|e| PricingError::ChainCall(e.to_string()))?;
         let token0_addr = decode_address_from_slot(&token0_raw)?;
 
         let token1_raw = client
-            .call(&dummy_data_tx(TOKEN1_SELECTOR.to_vec()), BlockId::Latest)
+            .call(&call(TOKEN1_SELECTOR.to_vec()), BlockId::Latest)
             .await
             .map_err(|e| PricingError::ChainCall(e.to_string()))?;
         let token1_addr = decode_address_from_slot(&token1_raw)?;
 
-        let token0 = fetch_token_metadata(&token0_addr, client, dummy_value.clone()).await?;
-        let token1 = fetch_token_metadata(&token1_addr, client, dummy_value.clone()).await?;
+        let zero_value = TokenAmount::eth(0u64);
+        let token0 = fetch_token_metadata(&token0_addr, client, zero_value.clone()).await?;
+        let token1 = fetch_token_metadata(&token1_addr, client, zero_value.clone()).await?;
 
         Self::new(address, token0, token1, reserve0, reserve1, DEFAULT_FEE_BPS)
     }
@@ -306,46 +331,47 @@ impl UniswapV2Pair {
 
 /// Decodes a `uint256` (or smaller) from a 32-byte ABI slot into `u128`.
 fn decode_u128_from_slot(slot: &[u8]) -> PricingResult<u128> {
-    if slot.len() < 32 {
+    if slot.len() < EVM_WORD_LEN {
         return Err(PricingError::AbiDecode("slot too short".into()));
     }
-    let bytes: [u8; 16] = slot[16..32]
+    let bytes: [u8; 16] = slot[EVM_WORD_LEN / 2..EVM_WORD_LEN]
         .try_into()
         .map_err(|_| PricingError::AbiDecode("slice conversion failed".into()))?;
     Ok(u128::from_be_bytes(bytes))
 }
 
-/// Decodes an `address` (20 bytes) from a 32-byte ABI slot.
 fn decode_address_from_slot(slot: &[u8]) -> PricingResult<Address> {
-    if slot.len() < 32 {
+    if slot.len() < EVM_WORD_LEN {
         return Err(PricingError::AbiDecode("slot too short".into()));
     }
-    let hex = format!("0x{}", hex::encode(&slot[12..32]));
+    let hex = format!("0x{}", hex::encode(&slot[ADDRESS_SKIP_LEN..EVM_WORD_LEN]));
     Address::new(&hex).map_err(|e| PricingError::AbiDecode(e.to_string()))
+}
+
+/// Decodes a `uint8` from a 32-byte ABI slot.
+fn decode_u8_from_slot(slot: &[u8]) -> Option<u8> {
+    if slot.len() < EVM_WORD_LEN {
+        return None;
+    }
+    let bytes: [u8; EVM_WORD_LEN] = slot.try_into().ok()?;
+    let value = U256::from_big_endian(&bytes);
+    Some(value.as_u64() as u8)
 }
 
 /// Fetches `symbol()` and `decimals()` from an ERC-20 token contract.
 async fn fetch_token_metadata(
     addr: &Address,
     client: &ChainClient,
-    dummy_value: TokenAmount,
+    _zero_value: TokenAmount,
 ) -> PricingResult<Token> {
-    let call = |selector: Vec<u8>| TransactionRequest {
-        to: addr.clone(),
-        value: dummy_value.clone(),
-        data: Bytes::from(selector),
-        nonce: None,
-        gas_limit: None,
-        max_fee_per_gas: None,
-        max_priority_fee: None,
-        chain_id: MAINNET_CHAIN_ID,
-    };
+    let call =
+        |data: Vec<u8>| TransactionRequest::contract_call(addr.clone(), data, MAINNET_CHAIN_ID);
 
     let dec_raw = client
         .call(&call(DECIMALS_SELECTOR.to_vec()), BlockId::Latest)
         .await
         .map_err(|e| PricingError::ChainCall(e.to_string()))?;
-    let decimals = dec_raw.last().copied().unwrap_or(18);
+    let decimals = decode_u8_from_slot(&dec_raw).unwrap_or(ETH_DECIMALS);
 
     let sym_raw = client
         .call(&call(SYMBOL_SELECTOR.to_vec()), BlockId::Latest)
@@ -362,15 +388,17 @@ async fn fetch_token_metadata(
 
 /// Decodes an ABI-encoded `string` (dynamic type) from a raw byte slice.
 fn decode_string_from_abi(raw: &[u8]) -> Option<String> {
-    if raw.len() < 96 {
+    if raw.len() < ABI_STRING_MIN {
         return None;
     }
-    let len_bytes: [u8; 8] = raw[56..64].try_into().ok()?;
+    let len_bytes: [u8; 8] = raw[ABI_STRING_LEN_OFFSET..ABI_STRING_DATA_START]
+        .try_into()
+        .ok()?;
     let len = u64::from_be_bytes(len_bytes) as usize;
-    if raw.len() < 64 + len {
+    if raw.len() < ABI_STRING_DATA_START + len {
         return None;
     }
-    String::from_utf8(raw[64..64 + len].to_vec()).ok()
+    String::from_utf8(raw[ABI_STRING_DATA_START..ABI_STRING_DATA_START + len].to_vec()).ok()
 }
 
 /// A single row in the impact table.
@@ -456,7 +484,7 @@ impl PriceImpactAnalyzer {
         }
 
         let mut lo: u128 = 1;
-        let mut hi: u128 = reserve_in / 2;
+        let mut hi: u128 = reserve_in / MAX_SWAP_RESERVE_DIVISOR;
         let mut best: u128 = 1;
 
         while lo <= hi {
@@ -466,9 +494,6 @@ impl PriceImpactAnalyzer {
                 best = mid;
                 lo = mid + 1;
             } else {
-                if mid == 0 {
-                    break;
-                }
                 hi = mid - 1;
             }
         }
@@ -490,13 +515,13 @@ impl PriceImpactAnalyzer {
         let gas_price_wei = gas_price_gwei * WEI_PER_GWEI;
         let gas_cost_eth = gas_estimate * gas_price_wei;
 
-        let scale_out = DECIMAL_RADIX.pow(token_out.decimals as u32);
-        let scale_eth: u128 = DECIMAL_RADIX.pow(ETH_DECIMALS as u32);
+        let scale_out = DECIMAL_BASE.pow(token_out.decimals as u32);
+        let scale_eth: u128 = DECIMAL_BASE.pow(ETH_DECIMALS as u32);
 
         let gas_cost_in_output_token = gas_cost_eth * scale_out / scale_eth;
         let net_output = gross_output.saturating_sub(gas_cost_in_output_token);
 
-        let scale_in = Decimal::from(DECIMAL_RADIX.pow(token_in.decimals as u32));
+        let scale_in = Decimal::from(DECIMAL_BASE.pow(token_in.decimals as u32));
         let human_in = Decimal::from(amount_in) / scale_in;
         let human_net = Decimal::from(net_output) / Decimal::from(scale_out);
 
@@ -545,8 +570,8 @@ mod tests {
             pair_addr,
             weth(),
             usdc(),
-            1_000 * 10u128.pow(18),
-            2_000_000 * 10u128.pow(6),
+            1_000 * DECIMAL_BASE.pow(18),
+            2_000_000 * DECIMAL_BASE.pow(6),
             30,
         )
         .unwrap()
@@ -555,9 +580,9 @@ mod tests {
     #[test]
     fn test_get_amount_out_basic() {
         let pair = eth_usdc_pair();
-        let usdc_in: u128 = 2_000 * 10u128.pow(6);
+        let usdc_in: u128 = 2_000 * DECIMAL_BASE.pow(6);
         let eth_out = pair.get_amount_out(usdc_in, &usdc()).unwrap();
-        let one_eth: u128 = 10u128.pow(18);
+        let one_eth: u128 = DECIMAL_BASE.pow(18);
         assert!(eth_out < one_eth);
         assert!(eth_out > (one_eth * 99) / 100);
     }
@@ -565,10 +590,10 @@ mod tests {
     #[test]
     fn test_get_amount_out_matches_solidity() {
         let pair = eth_usdc_pair();
-        let usdc_in: u128 = 2_000 * 10u128.pow(6);
+        let usdc_in: u128 = 2_000 * DECIMAL_BASE.pow(6);
         let amount_in_with_fee: u128 = usdc_in * (10_000 - 30);
-        let reserve_in: u128 = 2_000_000 * 10u128.pow(6);
-        let reserve_out: u128 = 1_000 * 10u128.pow(18);
+        let reserve_in: u128 = 2_000_000 * DECIMAL_BASE.pow(6);
+        let reserve_out: u128 = 1_000 * DECIMAL_BASE.pow(18);
         let numerator = amount_in_with_fee * reserve_out;
         let denominator = reserve_in * 10_000 + amount_in_with_fee;
         let expected = numerator / denominator;
@@ -583,15 +608,15 @@ mod tests {
             pair_addr,
             weth(),
             usdc(),
-            10u128.pow(30),
-            10u128.pow(30),
+            DECIMAL_BASE.pow(30),
+            DECIMAL_BASE.pow(30),
             30,
         )
         .unwrap();
-        let amount_in: u128 = 10u128.pow(25);
+        let amount_in: u128 = DECIMAL_BASE.pow(25);
         let out = pair.get_amount_out(amount_in, &weth()).unwrap();
         assert!(out > 0);
-        assert!(out < 10u128.pow(30));
+        assert!(out < DECIMAL_BASE.pow(30));
     }
 
     #[test]
@@ -616,17 +641,17 @@ mod tests {
     #[test]
     fn test_get_amount_in_inverse_of_out() {
         let pair = eth_usdc_pair();
-        let desired_eth_out: u128 = 10u128.pow(17);
+        let desired_eth_out: u128 = DECIMAL_BASE.pow(17);
         let usdc_in_required = pair.get_amount_in(desired_eth_out, &weth()).unwrap();
         let actual_out = pair.get_amount_out(usdc_in_required, &usdc()).unwrap();
         assert!(actual_out >= desired_eth_out);
-        assert!(actual_out - desired_eth_out < 10u128.pow(12));
+        assert!(actual_out - desired_eth_out < DECIMAL_BASE.pow(12));
     }
 
     #[test]
     fn test_get_amount_in_insufficient_liquidity() {
         let pair = eth_usdc_pair();
-        let too_much: u128 = 1_001 * 10u128.pow(18);
+        let too_much: u128 = 1_001 * DECIMAL_BASE.pow(18);
         let err = pair.get_amount_in(too_much, &weth()).unwrap_err();
         assert!(matches!(err, PricingError::InsufficientLiquidity { .. }));
     }
@@ -643,7 +668,7 @@ mod tests {
         let pair = eth_usdc_pair();
         let original_reserve0 = pair.reserve0;
         let original_reserve1 = pair.reserve1;
-        let usdc_in: u128 = 2_000 * 10u128.pow(6);
+        let usdc_in: u128 = 2_000 * DECIMAL_BASE.pow(6);
         let new_pair = pair.simulate_swap(usdc_in, &usdc()).unwrap();
         assert_eq!(pair.reserve0, original_reserve0);
         assert_eq!(pair.reserve1, original_reserve1);
@@ -654,7 +679,7 @@ mod tests {
     #[test]
     fn test_simulate_swap_updates_price() {
         let pair = eth_usdc_pair();
-        let usdc_in: u128 = 100_000 * 10u128.pow(6);
+        let usdc_in: u128 = 100_000 * DECIMAL_BASE.pow(6);
         let spot_before = pair.get_spot_price(&usdc()).unwrap();
         let new_pair = pair.simulate_swap(usdc_in, &usdc()).unwrap();
         let spot_after = new_pair.get_spot_price(&usdc()).unwrap();
@@ -676,7 +701,7 @@ mod tests {
     #[test]
     fn test_price_impact_small_trade() {
         let pair = eth_usdc_pair();
-        let tiny: u128 = 100 * 10u128.pow(6);
+        let tiny: u128 = 100 * DECIMAL_BASE.pow(6);
         let impact = pair.get_price_impact(tiny, &usdc()).unwrap();
         assert!(impact < Decimal::new(4, 3));
         assert!(impact > Decimal::ZERO);
@@ -685,7 +710,7 @@ mod tests {
     #[test]
     fn test_price_impact_large_trade() {
         let pair = eth_usdc_pair();
-        let large: u128 = 1_000_000 * 10u128.pow(6);
+        let large: u128 = 1_000_000 * DECIMAL_BASE.pow(6);
         let impact = pair.get_price_impact(large, &usdc()).unwrap();
         assert!(impact > Decimal::new(30, 2));
     }
@@ -694,9 +719,9 @@ mod tests {
     fn test_impact_table_row_count() {
         let analyzer = PriceImpactAnalyzer::new(eth_usdc_pair());
         let sizes: Vec<u128> = vec![
-            1_000 * 10u128.pow(6),
-            10_000 * 10u128.pow(6),
-            100_000 * 10u128.pow(6),
+            1_000 * DECIMAL_BASE.pow(6),
+            10_000 * DECIMAL_BASE.pow(6),
+            100_000 * DECIMAL_BASE.pow(6),
         ];
         let table = analyzer.generate_impact_table(&usdc(), &sizes).unwrap();
         assert_eq!(table.len(), 3);
@@ -706,7 +731,7 @@ mod tests {
     fn test_impact_table_impact_monotonically_increases() {
         let analyzer = PriceImpactAnalyzer::new(eth_usdc_pair());
         let sizes: Vec<u128> = (1..=5)
-            .map(|i| i as u128 * 100_000 * 10u128.pow(6))
+            .map(|i| i as u128 * 100_000 * DECIMAL_BASE.pow(6))
             .collect();
         let table = analyzer.generate_impact_table(&usdc(), &sizes).unwrap();
         for window in table.windows(2) {
@@ -727,7 +752,7 @@ mod tests {
     #[test]
     fn test_estimate_true_cost_net_lte_gross() {
         let analyzer = PriceImpactAnalyzer::new(eth_usdc_pair());
-        let usdc_in: u128 = 2_000 * 10u128.pow(6);
+        let usdc_in: u128 = 2_000 * DECIMAL_BASE.pow(6);
         let cost = analyzer
             .estimate_true_cost(usdc_in, &usdc(), 20, 150_000)
             .unwrap();

@@ -10,6 +10,9 @@ use tracing::{debug, info, warn};
 use crate::core::types::Address;
 use crate::pricing::errors::{PricingError, PricingResult};
 
+/// Length of a function selector in bytes.
+const SELECTOR_LEN: usize = 4;
+
 /// Parsed swap transaction from mempool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedSwap {
@@ -40,9 +43,10 @@ pub struct ParsedSwap {
 impl ParsedSwap {
     /// Calculate implied slippage tolerance.
     ///
-    /// Currently returns 0.0 until simulation is implemented.
-    pub fn slippage_tolerance(&self) -> Decimal {
-        Decimal::ZERO
+    /// Requires a price quote to compute; returns `None` until
+    /// simulation support is implemented.
+    pub fn slippage_tolerance(&self) -> Option<Decimal> {
+        None
     }
 }
 
@@ -117,16 +121,14 @@ impl MempoolMonitor {
             }
         };
 
+        let live_provider =
+            Arc::new(Provider::<Ws>::connect(&ws_url).await.map_err(|e| {
+                PricingError::ChainCall(format!("websocket reconnect failed: {e}"))
+            })?);
         drop(probe);
 
         tokio::spawn(async move {
-            let provider = match Provider::<Ws>::connect(&ws_url).await {
-                Ok(p) => Arc::new(p),
-                Err(e) => {
-                    warn!(error = %e, "WebSocket provider lost before monitor task start");
-                    return;
-                }
-            };
+            let provider = live_provider;
 
             if full_supported
                 && let Ok(mut full_stream) = provider.subscribe_full_pending_txs().await
@@ -187,11 +189,11 @@ impl MempoolMonitor {
     /// or required transaction fields are missing.
     pub fn parse_transaction(tx: &Transaction) -> Option<ParsedSwap> {
         let data = &tx.input;
-        if data.len() < 4 {
+        if data.len() < SELECTOR_LEN {
             return None;
         }
 
-        let selector_hex = format!("0x{}", hex::encode(&data[..4]));
+        let selector_hex = format!("0x{}", hex::encode(&data[..SELECTOR_LEN]));
         let (dex, method) = match Self::SWAP_SELECTORS
             .iter()
             .find(|(s, _, _)| *s == selector_hex)
@@ -202,14 +204,8 @@ impl MempoolMonitor {
 
         let router_raw = tx.to?;
         let tx_hash = format!("0x{:x}", tx.hash);
-        let router = match Address::new(format!("0x{:x}", router_raw)) {
-            Ok(a) => a,
-            Err(_) => return None,
-        };
-        let sender = match Address::new(format!("0x{:x}", tx.from)) {
-            Ok(a) => a,
-            Err(_) => return None,
-        };
+        let router = Address::from_eth_address(router_raw);
+        let sender = Address::from_eth_address(tx.from);
 
         let gas_price = tx.gas_price.unwrap_or_default();
         let context = SwapContext {
@@ -223,10 +219,14 @@ impl MempoolMonitor {
 
         match method {
             "swapExactTokensForTokens" => {
-                Self::decode_v2_tokens_for_tokens(tx, &data[4..], &context)
+                Self::decode_v2_tokens_for_tokens(tx, &data[SELECTOR_LEN..], &context)
             }
-            "swapExactETHForTokens" => Self::decode_v2_eth_for_tokens(tx, &data[4..], &context),
-            "swapExactTokensForETH" => Self::decode_v2_tokens_for_eth(tx, &data[4..], &context),
+            "swapExactETHForTokens" => {
+                Self::decode_v2_eth_for_tokens(tx, &data[SELECTOR_LEN..], &context)
+            }
+            "swapExactTokensForETH" => {
+                Self::decode_v2_tokens_for_eth(tx, &data[SELECTOR_LEN..], &context)
+            }
             _ => {
                 debug!(method = %method, "Selector recognized but decoding not yet implemented");
                 None
@@ -261,11 +261,11 @@ impl MempoolMonitor {
         let token_in = path
             .first()
             .and_then(|t| t.clone().into_address())
-            .and_then(|a| Address::new(format!("0x{:x}", a)).ok());
+            .map(Address::from_eth_address);
         let token_out = path
             .last()
             .and_then(|t| t.clone().into_address())
-            .and_then(|a| Address::new(format!("0x{:x}", a)).ok());
+            .map(Address::from_eth_address);
 
         Some(Self::build_parsed_swap(
             context,
@@ -303,11 +303,11 @@ impl MempoolMonitor {
         let token_in = path
             .first()
             .and_then(|t| t.clone().into_address())
-            .and_then(|a| Address::new(format!("0x{:x}", a)).ok());
+            .map(Address::from_eth_address);
         let token_out = path
             .last()
             .and_then(|t| t.clone().into_address())
-            .and_then(|a| Address::new(format!("0x{:x}", a)).ok());
+            .map(Address::from_eth_address);
 
         Some(Self::build_parsed_swap(
             context,
@@ -346,11 +346,11 @@ impl MempoolMonitor {
         let token_in = path
             .first()
             .and_then(|t| t.clone().into_address())
-            .and_then(|a| Address::new(format!("0x{:x}", a)).ok());
+            .map(Address::from_eth_address);
         let token_out = path
             .last()
             .and_then(|t| t.clone().into_address())
-            .and_then(|a| Address::new(format!("0x{:x}", a)).ok());
+            .map(Address::from_eth_address);
 
         Some(Self::build_parsed_swap(
             context,

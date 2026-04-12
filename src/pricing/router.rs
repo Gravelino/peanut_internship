@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::amm::UniswapV2Pair;
 use super::errors::{PricingError, PricingResult};
-use crate::core::types::{ETH_DECIMALS, Token, WEI_PER_GWEI};
+use crate::core::types::{DECIMAL_BASE, ETH_DECIMALS, Token, WEI_PER_GWEI};
 
 /// Base gas cost for any swap transaction.
 const BASE_GAS_COST: u128 = 150_000;
@@ -80,8 +80,8 @@ struct DfsContext<'a> {
 /// Finds optimal routes between tokens.
 #[derive(Debug, Clone)]
 pub struct RouteFinder {
-    pub pools: Vec<UniswapV2Pair>,
-    pub graph: HashMap<Token, Vec<(UniswapV2Pair, Token)>>,
+    pools: Vec<UniswapV2Pair>,
+    graph: HashMap<Token, Vec<(UniswapV2Pair, Token)>>,
 }
 
 impl RouteFinder {
@@ -89,6 +89,11 @@ impl RouteFinder {
     pub fn new(pools: Vec<UniswapV2Pair>) -> Self {
         let graph = Self::build_graph(&pools);
         Self { pools, graph }
+    }
+
+    /// Returns a reference to the loaded pools.
+    pub fn pools(&self) -> &[UniswapV2Pair] {
+        &self.pools
     }
 
     /// Build adjacency graph: token -> [ (pool, other_token), ... ]
@@ -181,8 +186,8 @@ impl RouteFinder {
         let mut comparisons = Vec::new();
 
         let gas_price_wei = gas_price_gwei * WEI_PER_GWEI;
-        let scale_out = 10u128.pow(token_out.decimals as u32);
-        let scale_eth: u128 = 10u128.pow(ETH_DECIMALS as u32);
+        let scale_out = DECIMAL_BASE.pow(token_out.decimals as u32);
+        let scale_eth: u128 = DECIMAL_BASE.pow(ETH_DECIMALS as u32);
 
         for route in routes {
             let gross_output_res = route.get_output(amount_in);
