@@ -7,8 +7,6 @@ use crate::core::types::TransactionReceipt;
 pub enum ChainError {
     #[error("rpc error: {0}")]
     Rpc(String),
-    #[error("rpc request failed: {message}")]
-    RPCError { message: String, code: Option<i64> },
     #[error("transaction reverted: {tx_hash}")]
     TransactionFailed {
         tx_hash: String,
@@ -30,8 +28,8 @@ pub enum ChainError {
     RuntimeInit,
     #[error("invalid wallet address")]
     InvalidWalletAddress,
-    #[error("failed to sign transaction")]
-    SignTransactionFailed,
+    #[error("failed to sign transaction: {0}")]
+    SignTransactionFailed(String),
     #[error("missing destination address")]
     MissingDestinationAddress,
     #[error("missing transaction value")]

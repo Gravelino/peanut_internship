@@ -19,9 +19,10 @@ pub const MIN_POLL_INTERVAL: f64 = 0.1;
 /// A high-level client for interacting with the Ethereum blockchain.
 ///
 /// Supports multiple RPC endpoints with automatic failover and retries.
+/// Providers are created once at construction and reused across calls.
 #[derive(Clone)]
 pub struct ChainClient {
-    rpc_urls: Vec<String>,
+    providers: Vec<Arc<Provider<Http>>>,
     timeout_secs: u64,
     max_retries: usize,
 }
@@ -31,12 +32,25 @@ impl ChainClient {
     ///
     /// `rpc_urls` are tried in order; each endpoint is retried up to
     /// `max_retries` times for each operation.
-    pub fn new(rpc_urls: Vec<String>, timeout_secs: u64, max_retries: usize) -> Self {
-        Self {
-            rpc_urls,
+    pub fn new(rpc_urls: Vec<String>, timeout_secs: u64, max_retries: usize) -> ChainResult<Self> {
+        let providers = rpc_urls
+            .iter()
+            .map(|url| {
+                Provider::<Http>::try_from(url.as_str())
+                    .map(Arc::new)
+                    .map_err(|error| ChainError::Rpc(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            providers,
             timeout_secs,
             max_retries,
-        }
+        })
+    }
+
+    /// Returns a reference to the first (primary) provider, if any.
+    pub fn provider(&self) -> Option<Arc<Provider<Http>>> {
+        self.providers.first().cloned()
     }
 
     /// Fetches the native ETH balance for an address.
@@ -93,7 +107,7 @@ impl ChainClient {
 
     /// Estimates the gas required to execute a transaction.
     pub async fn estimate_gas(&self, tx: &TransactionRequest) -> ChainResult<u64> {
-        let request: Arc<TypedTransaction> = Arc::new(tx.to_ethers_request().into());
+        let request: Arc<TypedTransaction> = Arc::new(tx.to_ethers_typed());
         self.with_provider(|provider| {
             let request = Arc::clone(&request);
             async move { provider.estimate_gas(&request, None).await }
@@ -165,7 +179,7 @@ impl ChainClient {
 
     /// Performs a read-only call to a smart contract.
     pub async fn call(&self, tx: &TransactionRequest, block: BlockId) -> ChainResult<Vec<u8>> {
-        let request: Arc<TypedTransaction> = Arc::new(tx.to_ethers_request().into());
+        let request: Arc<TypedTransaction> = Arc::new(tx.to_ethers_typed());
         let block_number = match block {
             BlockId::Latest => BlockNumber::Latest,
             BlockId::Pending => BlockNumber::Pending,
@@ -193,19 +207,17 @@ impl ChainClient {
 
     async fn with_provider<T, F, Fut>(&self, mut operation: F) -> ChainResult<T>
     where
-        F: FnMut(Provider<Http>) -> Fut,
+        F: FnMut(Arc<Provider<Http>>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ethers::providers::ProviderError>>,
     {
         let mut last_error: Option<ethers::providers::ProviderError> = None;
 
-        for (url_idx, url) in self.rpc_urls.iter().enumerate() {
-            let provider = Provider::<Http>::try_from(url.as_str())
-                .map_err(|error| ChainError::Rpc(error.to_string()))?;
+        for (url_idx, provider) in self.providers.iter().enumerate() {
             for retry in 0..=self.max_retries {
                 if retry > 0 {
                     debug!(url_idx, retry, "Retrying RPC operation");
                 }
-                let result = operation(provider.clone()).await;
+                let result = operation(Arc::clone(provider)).await;
                 match result {
                     Ok(value) => return Ok(value),
                     Err(error) => {
@@ -259,7 +271,8 @@ mod tests {
     const TEST_RECIPIENT: &str = "0x0000000000000000000000000000000000000001";
 
     fn setup_failing_client() -> (ChainClient, Address) {
-        let client = ChainClient::new(vec![TEST_RPC_URL.to_string()], TEST_TIMEOUT, TEST_RETRIES);
+        let client =
+            ChainClient::new(vec![TEST_RPC_URL.to_string()], TEST_TIMEOUT, TEST_RETRIES).unwrap();
         let address = Address::new(TEST_RECIPIENT).unwrap();
         (client, address)
     }
@@ -328,7 +341,8 @@ mod tests {
             ],
             TEST_TIMEOUT,
             1,
-        );
+        )
+        .unwrap();
         let address = Address::new(TEST_RECIPIENT).unwrap();
         let result = client.get_balance(&address).await;
         assert!(result.is_err());

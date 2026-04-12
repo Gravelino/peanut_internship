@@ -2,16 +2,16 @@ use ethers::types::Bytes;
 use ethers::types::U256;
 
 use crate::core::types::{
-    Address, BlockId, DEFAULT_GAS_BUFFER, GasPriority, MAINNET_CHAIN_ID, TokenAmount,
-    TransactionReceipt, TransactionRequest,
+    Address, BPS_SCALE, BlockId, DEFAULT_GAS_BUFFER_BPS, GasPriority, MAINNET_CHAIN_ID,
+    TokenAmount, TransactionReceipt, TransactionRequest,
 };
 use crate::core::wallet::WalletManager;
 
 use super::client::ChainClient;
 use super::errors::{ChainError, ChainResult};
 
-/// Minimum threshold for gas buffer multiplier (1.0 = no buffer).
-const MIN_MULTIPLIER_THRESHOLD: f64 = 1.0;
+/// Minimum buffer in basis points for gas estimation (1.0× = 10_000 bps).
+const MIN_GAS_ESTIMATE_BUFFER_BPS: u64 = BPS_SCALE;
 
 /// Default poll interval for transaction confirmations in seconds.
 const DEFAULT_POLL_INTERVAL_SECS: f64 = 1.0;
@@ -90,17 +90,18 @@ impl TransactionBuilder {
         self
     }
 
-    /// Estimates gas for the transaction and applies a buffer multiplier.
+    /// Estimates gas for the transaction and applies a buffer in basis points.
     ///
-    /// When `buffer` is `None` or not greater than `1.0`,
-    /// [`DEFAULT_GAS_BUFFER`] is applied.
-    pub async fn with_gas_estimate(mut self, buffer: Option<f64>) -> ChainResult<Self> {
+    /// When `buffer_bps` is `None` or below [`MIN_GAS_ESTIMATE_BUFFER_BPS`],
+    /// [`DEFAULT_GAS_BUFFER_BPS`] is applied (12_000 bps = 1.2×).
+    pub async fn with_gas_estimate(mut self, buffer_bps: Option<u64>) -> ChainResult<Self> {
         let request = self.build_partial_request(self.nonce)?;
         let estimated = self.client.estimate_gas(&request).await?;
-        let multiplier = buffer
-            .filter(|&b| b.is_finite() && b > MIN_MULTIPLIER_THRESHOLD)
-            .unwrap_or(DEFAULT_GAS_BUFFER);
-        let limit = ((estimated as f64) * multiplier).ceil() as u64;
+        let multiplier_bps = buffer_bps
+            .filter(|&b| b >= MIN_GAS_ESTIMATE_BUFFER_BPS)
+            .unwrap_or(DEFAULT_GAS_BUFFER_BPS);
+        let limit =
+            (U256::from(estimated) * U256::from(multiplier_bps) / U256::from(BPS_SCALE)).as_u64();
         self.gas_limit = Some(limit);
         Ok(self)
     }
@@ -114,12 +115,12 @@ impl TransactionBuilder {
             GasPriority::Medium => gas.priority_fee_medium,
         };
         self.max_priority_fee = Some(priority_fee);
-        self.max_fee_per_gas = Some(gas.get_max_fee(priority, DEFAULT_GAS_BUFFER));
+        self.max_fee_per_gas = Some(gas.get_max_fee(priority, DEFAULT_GAS_BUFFER_BPS));
         Ok(self)
     }
 
     /// Builds the final TransactionRequest, fetching the nonce if not set.
-    pub async fn build(&self) -> ChainResult<TransactionRequest> {
+    pub async fn build(self) -> ChainResult<TransactionRequest> {
         let nonce = match self.nonce {
             Some(value) => Some(value),
             None => {
@@ -137,24 +138,32 @@ impl TransactionBuilder {
     }
 
     /// Builds and signs the transaction.
-    pub async fn build_and_sign(&self) -> ChainResult<Vec<u8>> {
+    pub async fn build_and_sign(self) -> ChainResult<Vec<u8>> {
+        let wallet = self.wallet.clone();
         let request = self.build().await?;
-        self.wallet
+        wallet
             .sign_transaction_bytes(&request)
             .await
-            .map_err(|_| ChainError::SignTransactionFailed)
+            .map_err(|e| ChainError::SignTransactionFailed(e.to_string()))
     }
 
     /// Builds, signs, and sends the transaction to the network.
-    pub async fn send(&self) -> ChainResult<String> {
-        let signed = self.build_and_sign().await?;
-        self.client.send_transaction(&signed).await
+    pub async fn send(self) -> ChainResult<String> {
+        let wallet = self.wallet.clone();
+        let client = self.client.clone();
+        let request = self.build().await?;
+        let signed = wallet
+            .sign_transaction_bytes(&request)
+            .await
+            .map_err(|e| ChainError::SignTransactionFailed(e.to_string()))?;
+        client.send_transaction(&signed).await
     }
 
     /// Sends the transaction and waits for it to be confirmed.
-    pub async fn send_and_wait(&self, timeout: u64) -> ChainResult<TransactionReceipt> {
+    pub async fn send_and_wait(self, timeout: u64) -> ChainResult<TransactionReceipt> {
+        let client = self.client.clone();
         let tx_hash = self.send().await?;
-        self.client
+        client
             .wait_for_receipt(&tx_hash, timeout, DEFAULT_POLL_INTERVAL_SECS)
             .await
     }
@@ -193,7 +202,8 @@ mod tests {
     const TEST_RECIPIENT: &str = "0x0000000000000000000000000000000000000001";
 
     fn setup() -> (ChainClient, WalletManager) {
-        let client = ChainClient::new(vec![TEST_RPC_URL.to_string()], TEST_TIMEOUT, TEST_RETRIES);
+        let client =
+            ChainClient::new(vec![TEST_RPC_URL.to_string()], TEST_TIMEOUT, TEST_RETRIES).unwrap();
         let wallet = WalletManager::generate().unwrap();
         (client, wallet)
     }

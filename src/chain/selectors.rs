@@ -91,7 +91,7 @@ pub const WETH_DEPOSIT_TOPIC: &str =
     "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
 /// Topic hash for the WETH `Withdrawal(address,uint256)` event.
 pub const WETH_WITHDRAWAL_TOPIC: &str =
-    "0x7fcf532c15f0a6dbed9992d9921443650d7e6235f29174924f928cc2ac818eb";
+    "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
 /// Alternative topic hash for the WETH `Withdrawal(address,uint256)` event.
 pub const WETH_WITHDRAWAL_ALT_TOPIC: &str =
     "0x27f12abfe35860a9a927b465bb3d4a9c23c8428174b83f278fe45ed7b4da2662";

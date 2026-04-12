@@ -109,7 +109,15 @@ async fn try_get_revert_reason(
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() > max { &s[..max] } else { s }
+    if s.len() <= max {
+        s
+    } else {
+        let mut boundary = max;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        &s[..boundary]
+    }
 }
 
 /// Detailed results of a transaction analysis.
@@ -240,11 +248,16 @@ impl AnalysisResult {
 ///
 /// Fetches transaction data, receipt, and block details, then decodes
 /// the function called and its events.
-pub async fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<AnalysisResult> {
+pub async fn analyze_transaction(
+    client: &crate::chain::client::ChainClient,
+    tx_hash: &str,
+) -> ChainResult<AnalysisResult> {
     let hash = H256::from_str(tx_hash)
         .map_err(|e| ChainError::Other(format!("invalid transaction hash: {e}")))?;
-    let provider =
-        Provider::<Http>::try_from(rpc_url).map_err(|e| ChainError::Rpc(e.to_string()))?;
+
+    let provider = client
+        .provider()
+        .ok_or_else(|| ChainError::Rpc("no provider available".into()))?;
 
     let tx = provider
         .get_transaction(hash)
@@ -326,8 +339,11 @@ pub async fn analyze_transaction(rpc_url: &str, tx_hash: &str) -> ChainResult<An
 }
 
 /// Analyzes a transaction and returns a human-readable text report.
-pub async fn analyze_transaction_text(rpc_url: &str, tx_hash: &str) -> ChainResult<String> {
-    analyze_transaction(rpc_url, tx_hash)
+pub async fn analyze_transaction_text(
+    client: &crate::chain::client::ChainClient,
+    tx_hash: &str,
+) -> ChainResult<String> {
+    analyze_transaction(client, tx_hash)
         .await
         .map(|r| r.to_text())
 }
@@ -424,7 +440,10 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_tx_hash_returns_clear_error() {
-        let result = analyze_transaction("http://localhost:1", "not-a-hash").await;
+        let client =
+            crate::chain::client::ChainClient::new(vec!["http://localhost:1".to_string()], 5, 0)
+                .unwrap();
+        let result = analyze_transaction(&client, "not-a-hash").await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("invalid") || msg.contains("hash"));
