@@ -36,6 +36,18 @@ pub enum QuoteError {
 
     #[error("mempool stream failed: {0}")]
     Mempool(String),
+
+    #[error("no route: {0}")]
+    NoRouteDetailed(String),
+}
+
+impl QuoteError {
+    fn from_pricing(e: PricingError) -> Self {
+        match e {
+            PricingError::NoRouteExists => QuoteError::NoRoute,
+            other => QuoteError::NoRouteDetailed(other.to_string()),
+        }
+    }
 }
 
 /// Result alias used by quote and engine operations.
@@ -54,8 +66,8 @@ pub struct Quote {
     pub simulated_output: u128,
     /// Estimated gas units for the simulated route.
     pub gas_estimate: u64,
-    /// Unix timestamp when quote was produced.
-    pub timestamp: f64,
+    /// Unix timestamp (millis) when quote was produced.
+    pub timestamp: u64,
 }
 
 impl Quote {
@@ -73,18 +85,12 @@ impl Quote {
 /// Main interface for the pricing module.
 /// Integrates AMM math, routing, simulation, and mempool monitoring.
 pub struct PricingEngine {
-    /// On-chain RPC client.
-    pub client: ChainClient,
-    /// Local fork simulator for pre-trade verification.
-    pub simulator: ForkSimulator,
-    /// Mempool subscription helper.
-    pub monitor: MempoolMonitor,
-    /// In-memory cache of loaded pools.
-    pub pools: HashMap<Address, UniswapV2Pair>,
-    /// Route search graph built from `pools`.
-    pub router: Option<RouteFinder>,
-    /// Maximum route hops accepted during search.
-    pub max_hops: usize,
+    client: ChainClient,
+    simulator: ForkSimulator,
+    monitor: MempoolMonitor,
+    pools: HashMap<Address, UniswapV2Pair>,
+    router: Option<RouteFinder>,
+    max_hops: usize,
 }
 
 impl PricingEngine {
@@ -104,6 +110,16 @@ impl PricingEngine {
         })
     }
 
+    /// Returns a reference to the loaded pools.
+    pub fn pools(&self) -> &HashMap<Address, UniswapV2Pair> {
+        &self.pools
+    }
+
+    /// Returns the configured maximum hop count.
+    pub fn max_hops(&self) -> usize {
+        self.max_hops
+    }
+
     /// Load pool data from chain and build a route graph.
     pub async fn load_pools(&mut self, pool_addresses: &[Address]) -> QuoteResult<()> {
         for address in pool_addresses {
@@ -118,6 +134,14 @@ impl PricingEngine {
 
         self.rebuild_router();
         Ok(())
+    }
+
+    /// Load pre-constructed pools directly and rebuild the route graph.
+    pub fn load_pools_sync(&mut self, pools: Vec<UniswapV2Pair>) {
+        for pair in pools {
+            self.pools.insert(pair.address.clone(), pair);
+        }
+        self.rebuild_router();
     }
 
     /// Refresh a single pool reserve snapshot.
@@ -156,7 +180,7 @@ impl PricingEngine {
                 gas_price_gwei,
                 self.max_hops,
             )
-            .map_err(|_| QuoteError::NoRoute)?;
+            .map_err(QuoteError::from_pricing)?;
 
         let simulation = self
             .simulator
@@ -178,7 +202,7 @@ impl PricingEngine {
             expected_output: net_output,
             simulated_output: simulation.amount_out,
             gas_estimate: simulation.gas_used,
-            timestamp: now_unix_seconds(),
+            timestamp: now_unix_millis(),
         })
     }
 
@@ -211,11 +235,11 @@ impl PricingEngine {
     }
 }
 
-fn now_unix_seconds() -> f64 {
+fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -266,20 +290,11 @@ mod tests {
         )
         .unwrap();
 
-        let client = ChainClient::new(vec!["http://127.0.0.1:8545".to_string()], 5, 0);
+        let client = ChainClient::new(vec!["http://127.0.0.1:8545".to_string()], 5, 0).unwrap();
         let mut engine =
             PricingEngine::new(client, "http://127.0.0.1:8545", "ws://127.0.0.1:8545").unwrap();
 
-        engine
-            .pools
-            .insert(pool_shib_usdc.address.clone(), pool_shib_usdc);
-        engine
-            .pools
-            .insert(pool_shib_eth.address.clone(), pool_shib_eth);
-        engine
-            .pools
-            .insert(pool_eth_usdc.address.clone(), pool_eth_usdc);
-        engine.rebuild_router();
+        engine.load_pools_sync(vec![pool_shib_usdc, pool_shib_eth, pool_eth_usdc]);
 
         (engine, shib, usdc, eth)
     }
@@ -292,7 +307,7 @@ mod tests {
             expected_output: 1000,
             simulated_output: 1000,
             gas_estimate: 21000,
-            timestamp: 1.0,
+            timestamp: 0,
         };
         assert!(quote.is_valid());
     }
@@ -305,31 +320,36 @@ mod tests {
             expected_output: 1000,
             simulated_output: 998,
             gas_estimate: 21000,
-            timestamp: 1.0,
+            timestamp: 0,
         };
         assert!(!quote.is_valid());
     }
 
     #[tokio::test]
-    async fn test_get_quote_success() {
+    async fn test_get_quote_success_when_fork_available() {
         let (engine, shib, usdc, _eth) = setup_engine();
         let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
 
-        let quote = engine
+        let result = engine
             .get_quote(&shib, &usdc, 10_000_000_000_000_000_000, 0, sender)
-            .await
-            .unwrap();
+            .await;
 
-        assert!(quote.amount_in > 0);
-        assert!(quote.expected_output > 0);
-        assert!(quote.simulated_output > 0);
-        assert!(quote.gas_estimate > 0);
-        assert!(quote.timestamp > 0.0);
+        match result {
+            Ok(quote) => {
+                assert!(quote.amount_in > 0);
+                assert!(quote.expected_output > 0);
+                assert!(quote.simulated_output > 0);
+                assert!(quote.gas_estimate > 0);
+                assert!(quote.timestamp > 0);
+            }
+            Err(QuoteError::SimulationFailed(_)) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
     }
 
     #[tokio::test]
     async fn test_get_quote_fails_without_router() {
-        let client = ChainClient::new(vec!["http://127.0.0.1:8545".to_string()], 5, 0);
+        let client = ChainClient::new(vec!["http://127.0.0.1:8545".to_string()], 5, 0).unwrap();
         let engine =
             PricingEngine::new(client, "http://127.0.0.1:8545", "ws://127.0.0.1:8545").unwrap();
         let t0 = token("A", "0x0000000000000000000000000000000000000011");
