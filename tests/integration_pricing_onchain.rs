@@ -22,13 +22,13 @@ fn usdc() -> Token {
 }
 
 #[tokio::test]
-async fn amm_matches_uniswap_router_get_amounts_out_on_chain() {
+async fn amm_matches_uniswap_router_get_amounts_out_on_chain()
+-> Result<(), Box<dyn std::error::Error>> {
     let Ok(rpc_url) = std::env::var("MAINNET_RPC_URL") else {
-        // Optional integration test: skip when mainnet RPC is not configured.
-        return;
+        return Ok(());
     };
 
-    let client = ChainClient::new(vec![rpc_url], 20, 1);
+    let client = ChainClient::new(vec![rpc_url], 20, 1)?;
 
     let pair_address = Address::new("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc").unwrap();
     let pair = UniswapV2Pair::from_chain(pair_address, &client)
@@ -82,4 +82,5 @@ async fn amm_matches_uniswap_router_get_amounts_out_on_chain() {
         .as_u128();
 
     assert_eq!(local_out, router_out);
+    Ok(())
 }

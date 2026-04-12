@@ -38,7 +38,7 @@ async fn run_chain_checks(
     rpc_url: &str,
     address: &Address,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let chain_client = ChainClient::new(vec![rpc_url.to_string()], 20, 2);
+    let chain_client = ChainClient::new(vec![rpc_url.to_string()], 20, 2)?;
 
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?;

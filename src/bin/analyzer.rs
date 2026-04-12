@@ -1,5 +1,6 @@
 use std::env;
 
+use peanut_internship_rust::ChainClient;
 use peanut_internship_rust::chain::analyzer::analyze_transaction;
 
 #[tokio::main]
@@ -40,7 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| env::var("MAINNET_RPC_URL").ok())
         .ok_or("missing RPC URL; provide --rpc or set MAINNET_RPC_URL")?;
 
-    let result = analyze_transaction(&rpc_url, tx_hash).await?;
+    let client = ChainClient::new(vec![rpc_url], 20, 1)?;
+    let result = analyze_transaction(&client, tx_hash).await?;
 
     if format_json {
         println!("{}", serde_json::to_string_pretty(&result.to_json())?);

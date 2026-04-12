@@ -46,7 +46,7 @@ async fn run_impact_table() -> Result<(), Box<dyn std::error::Error>> {
     let rpc = env::var("MAINNET_RPC_URL")
         .map_err(|_| "MAINNET_RPC_URL is required for impact-table demo")?;
 
-    let client = ChainClient::new(vec![rpc], 20, 1);
+    let client = ChainClient::new(vec![rpc], 20, 1)?;
     let pair_addr = Address::new(PAIR_WETH_USDC)?;
     let pair = UniswapV2Pair::from_chain(pair_addr, &client).await?;
 
@@ -85,7 +85,7 @@ async fn run_best_route() -> Result<(), Box<dyn std::error::Error>> {
     let rpc = env::var("MAINNET_RPC_URL")
         .map_err(|_| "MAINNET_RPC_URL is required for best-route demo")?;
 
-    let client = ChainClient::new(vec![rpc], 20, 1);
+    let client = ChainClient::new(vec![rpc], 20, 1)?;
 
     let pool_addrs = [PAIR_WETH_USDC, PAIR_WETH_USDT, PAIR_USDC_USDT]
         .iter()
@@ -202,7 +202,7 @@ async fn run_solidity_check() -> Result<(), Box<dyn std::error::Error>> {
     let rpc = env::var("MAINNET_RPC_URL")
         .map_err(|_| "MAINNET_RPC_URL is required for solidity-check demo")?;
 
-    let client = ChainClient::new(vec![rpc], 20, 1);
+    let client = ChainClient::new(vec![rpc], 20, 1)?;
 
     let pair_address = Address::new(PAIR_WETH_USDC)?;
     let pair = UniswapV2Pair::from_chain(pair_address, &client).await?;
@@ -275,21 +275,4 @@ fn print_usage() {
     println!("Required env vars:");
     println!("  MAINNET_RPC_URL for impact-table, best-route, solidity-check");
     println!("  WS_RPC_URL (optional) for mempool, default ws://127.0.0.1:8545");
-}
-
-trait TokenMatcher {
-    fn token0_if_matches(&self, address: &str) -> Option<Token>;
-}
-
-impl TokenMatcher for UniswapV2Pair {
-    fn token0_if_matches(&self, address: &str) -> Option<Token> {
-        let target = Address::new(address).ok()?;
-        if self.token0.address == target {
-            Some(self.token0.clone())
-        } else if self.token1.address == target {
-            Some(self.token1.clone())
-        } else {
-            None
-        }
-    }
 }

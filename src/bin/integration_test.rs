@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nStep 2: Connecting to Sepolia…");
     let rpc_url = std::env::var("SEPOLIA_RPC_URL").map_err(|_| "SEPOLIA_RPC_URL is required")?;
-    let client = ChainClient::new(vec![rpc_url.clone()], 30, 3);
+    let client = ChainClient::new(vec![rpc_url.clone()], 30, 3)?;
     println!("  RPC: {}", redact_url(&rpc_url));
 
     println!("\nStep 3: Checking balance…");
@@ -82,14 +82,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chain_id(SEPOLIA_CHAIN_ID);
 
     println!("\nStep 5: Estimating gas…");
-    let builder = builder.with_gas_estimate(None).await?;
+    let builder = builder.with_gas_estimate(None as Option<u64>).await?;
     println!("  Gas estimate obtained");
 
     let builder = builder.with_gas_price(GasPriority::Medium).await?;
     println!("  Gas price set (medium priority)");
 
     println!("\nStep 6: Building and signing transaction…");
-    let tx_request = builder.clone().build().await?;
+    let tx_request = builder.build().await?;
     println!("  Nonce:  {:?}", tx_request.nonce);
     println!("  Gas:    {:?}", tx_request.gas_limit);
     println!("  Chain:  {}", tx_request.chain_id);
