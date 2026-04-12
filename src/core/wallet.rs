@@ -64,7 +64,7 @@ impl WalletManager {
         fs::metadata(path_ref)
             .map_err(|e| WalletError::KeyfileRead(format!("failed to read keyfile: {}", e)))?;
 
-        let secret = eth_keystore::decrypt_key(path_ref, password).map_err(|e| {
+        let mut secret = eth_keystore::decrypt_key(path_ref, password).map_err(|e| {
             WalletError::KeyfileDecrypt(format!("failed to decrypt keyfile: {}", e))
         })?;
 
@@ -74,6 +74,8 @@ impl WalletManager {
                 type_name_of_error(&e)
             ))
         })?;
+
+        secret.zeroize();
 
         Ok(Self { wallet })
     }
@@ -88,7 +90,7 @@ impl WalletManager {
     ) -> Result<(), WalletError> {
         debug!("Exporting wallet to keyfile");
         let dir_path = dir.as_ref();
-        let secret = self.wallet.signer().to_bytes();
+        let mut secret = self.wallet.signer().to_bytes();
 
         fs::create_dir_all(dir_path)
             .map_err(|e| WalletError::KeyfileWrite(format!("failed to create directory: {}", e)))?;
@@ -110,6 +112,8 @@ impl WalletManager {
             Some(&name_val),
         )
         .map_err(|e| WalletError::KeyfileEncrypt(format!("failed to encrypt keyfile: {}", e)))?;
+
+        secret.zeroize();
 
         let keyfile_path = dir_path.join(&name_val);
         let content = fs::read_to_string(&keyfile_path).map_err(|e| {
@@ -174,7 +178,7 @@ impl WalletManager {
         debug!("Signing transaction");
         tx.validate()?;
 
-        let request: TypedTransaction = tx.to_ethers_request().into();
+        let request: TypedTransaction = tx.to_ethers_typed();
         self.wallet
             .sign_transaction(&request)
             .await
@@ -188,7 +192,7 @@ impl WalletManager {
     ) -> Result<Vec<u8>, WalletError> {
         tx.validate()?;
 
-        let typed_tx: TypedTransaction = tx.to_ethers_request().into();
+        let typed_tx: TypedTransaction = tx.to_ethers_typed();
         let signature = self
             .wallet
             .sign_transaction(&typed_tx)
@@ -236,7 +240,7 @@ impl fmt::Display for WalletManager {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WalletError {
     #[error("missing private key environment variable: {0}")]
     MissingKey(String),

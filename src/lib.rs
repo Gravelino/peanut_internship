@@ -41,7 +41,7 @@ pub use chain::{
 };
 pub use core::serializer::CanonicalSerializer;
 pub use core::types::{
-    Address, BlockId, CoreError, DEFAULT_GAS_BUFFER, ETH_DECIMALS, ETH_SYMBOL, GasPrice,
+    Address, BlockId, CoreError, DEFAULT_GAS_BUFFER_BPS, ETH_DECIMALS, ETH_SYMBOL, GasPrice,
     GasPriority, MAINNET_CHAIN_ID, MIN_GAS_LIMIT, RECEIPT_STATUS_FAILED, RECEIPT_STATUS_SUCCESS,
     SEPOLIA_CHAIN_ID, Token, TokenAmount, TransactionReceipt, TransactionRequest,
     TransactionStatus,
