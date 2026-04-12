@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use ethers::abi::ParamType;
+use ethers::abi::{ParamType, Token as AbiToken};
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{BlockNumber, Bytes, TransactionRequest as EthTransactionRequest, U256};
+use ethers::types::{BlockNumber, Bytes, H160, TransactionRequest as EthTransactionRequest, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::core::types::{Address, BlockId, Token as CoreToken};
@@ -18,6 +18,29 @@ const DEFAULT_AMOUNT_OUT: u128 = 0;
 
 /// Fallback gas value used when estimation fails.
 const DEFAULT_GAS_USED: u64 = 0;
+
+/// Uniswap V2 Router02 on Ethereum mainnet.
+const UNISWAP_V2_ROUTER: &str = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D";
+
+/// Selector for `swapExactTokensForTokens(uint256,uint256,address[],address,uint256)`.
+const SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
+
+/// Selector for `swapExactETHForTokens(uint256,address[],address,uint256)`.
+const SWAP_EXACT_ETH_FOR_TOKENS_SELECTOR: [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5];
+
+/// Selector for `swapExactTokensForETH(uint256,uint256,address[],address,uint256)`.
+const SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR: [u8; 4] = [0x18, 0xcb, 0xaf, 0xe5];
+
+/// Deadline far in the future used for simulation calls.
+fn simulation_deadline() -> U256 {
+    U256::from(u64::MAX)
+}
+
+/// Selector length in bytes.
+const SELECTOR_LEN: usize = 4;
+
+/// Estimated max ABI payload size for swap calldata.
+const ABI_PAYLOAD_CAPACITY: usize = 256;
 
 /// Final simulation verdict used by execution logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,38 +209,181 @@ impl ForkSimulator {
         }
     }
 
-    /// Simulate a multi-hop route with exact pool math and route gas model.
+    /// Simulate a multi-hop route by calling the Uniswap V2 router on the
+    /// fork node via `eth_call`.
+    ///
+    /// Encodes a `swapExactTokensForTokens`, `swapExactETHForTokens`, or
+    /// `swapExactTokensForETH` calldata depending on whether WETH appears at
+    /// the start or end of the path, then dry-runs the call against the fork.
     pub async fn simulate_route(
         &self,
         route: &Route,
         amount_in: u128,
         sender: Address,
     ) -> PricingResult<SimulationResult> {
-        let amounts = route.get_intermediate_amounts(amount_in)?;
-        let amount_out = amounts.last().copied().unwrap_or(DEFAULT_AMOUNT_OUT);
+        if route.path.is_empty() || route.pools.is_empty() {
+            return Ok(SimulationResult {
+                success: false,
+                amount_out: DEFAULT_AMOUNT_OUT,
+                gas_used: DEFAULT_GAS_USED,
+                error: Some("empty route".into()),
+                logs: Vec::new(),
+            });
+        }
+
+        let first_token = &route.path[0];
+        let last_token = &route.path[route.path.len() - 1];
+
+        let weth: Address = match Address::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2") {
+            Ok(a) => a,
+            Err(_) => {
+                return Ok(SimulationResult {
+                    success: false,
+                    amount_out: DEFAULT_AMOUNT_OUT,
+                    gas_used: DEFAULT_GAS_USED,
+                    error: Some("invalid WETH address".into()),
+                    logs: Vec::new(),
+                });
+            }
+        };
+
+        let is_eth_in = first_token.address == weth;
+        let is_eth_out = last_token.address == weth;
+
+        let (calldata, value) =
+            self.encode_route_calldata(route, amount_in, &sender, is_eth_in, is_eth_out)?;
+
+        let router = Address::new(UNISWAP_V2_ROUTER)
+            .map_err(|e| PricingError::ChainCall(format!("invalid router address: {e}")))?;
+
+        let mut req = EthTransactionRequest::new();
+        req.from = Some(sender.as_eth_address());
+        req.to = Some(router.as_eth_address().into());
+        req.value = Some(value);
+        req.data = Some(calldata);
+        let tx = req.into();
+
+        let block = Some(to_eth_block(self.block).into());
+
+        let gas_used = self
+            .provider
+            .estimate_gas(&tx, block)
+            .await
+            .map(|g| g.as_u64())
+            .unwrap_or(DEFAULT_GAS_USED);
+
         let mut logs = Vec::with_capacity(route.num_hops() + 1);
         logs.push(format!("simulated_for_sender={sender}"));
 
-        for i in 0..route.num_hops() {
-            let token_in = &route.path[i].symbol;
-            let token_out = &route.path[i + 1].symbol;
-            logs.push(format!(
-                "hop{} {}->{} in={} out={}",
-                i + 1,
-                token_in,
-                token_out,
-                amounts[i],
-                amounts[i + 1]
-            ));
-        }
+        match self.provider.call(&tx, block).await {
+            Ok(bytes) => {
+                let decoder = AmountOutDecoder::UniswapV2Amounts;
+                let amount_out =
+                    decode_amount_out(bytes.as_ref(), decoder).unwrap_or(DEFAULT_AMOUNT_OUT);
 
-        Ok(SimulationResult {
-            success: true,
-            amount_out,
-            gas_used: route.estimate_gas() as u64,
-            error: None,
-            logs,
-        })
+                let local_amounts = route.get_intermediate_amounts(amount_in)?;
+                for i in 0..route.num_hops() {
+                    let token_in = &route.path[i].symbol;
+                    let token_out = &route.path[i + 1].symbol;
+                    logs.push(format!(
+                        "hop{} {}->{} local_in={} local_out={}",
+                        i + 1,
+                        token_in,
+                        token_out,
+                        local_amounts[i],
+                        local_amounts[i + 1]
+                    ));
+                }
+
+                Ok(SimulationResult {
+                    success: true,
+                    amount_out,
+                    gas_used,
+                    error: None,
+                    logs,
+                })
+            }
+            Err(err) => {
+                let message = err.to_string();
+                Ok(SimulationResult {
+                    success: false,
+                    amount_out: DEFAULT_AMOUNT_OUT,
+                    gas_used,
+                    error: extract_revert_reason(&message).or(Some(message)),
+                    logs,
+                })
+            }
+        }
+    }
+
+    /// Encodes the calldata for a route swap on the Uniswap V2 router.
+    fn encode_route_calldata(
+        &self,
+        route: &Route,
+        amount_in: u128,
+        sender: &Address,
+        is_eth_in: bool,
+        is_eth_out: bool,
+    ) -> PricingResult<(Bytes, U256)> {
+        let path_addresses: Vec<H160> = route
+            .path
+            .iter()
+            .map(|t| t.address.as_eth_address())
+            .collect();
+
+        let amount_in_u256 = U256::from(amount_in);
+        let min_amount_out = U256::zero();
+        let sender_eth = sender.as_eth_address();
+        let deadline = simulation_deadline();
+
+        if is_eth_in && !is_eth_out {
+            let mut buf = Vec::with_capacity(SELECTOR_LEN + ABI_PAYLOAD_CAPACITY);
+            buf.extend_from_slice(&SWAP_EXACT_ETH_FOR_TOKENS_SELECTOR);
+            buf.extend_from_slice(&ethers::abi::encode(&[
+                AbiToken::Uint(min_amount_out),
+                AbiToken::Array(
+                    path_addresses
+                        .iter()
+                        .map(|a| AbiToken::Address(*a))
+                        .collect(),
+                ),
+                AbiToken::Address(sender_eth),
+                AbiToken::Uint(deadline),
+            ]));
+            Ok((Bytes::from(buf), amount_in_u256))
+        } else if !is_eth_in && is_eth_out {
+            let mut buf = Vec::with_capacity(SELECTOR_LEN + ABI_PAYLOAD_CAPACITY);
+            buf.extend_from_slice(&SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR);
+            buf.extend_from_slice(&ethers::abi::encode(&[
+                AbiToken::Uint(amount_in_u256),
+                AbiToken::Uint(min_amount_out),
+                AbiToken::Array(
+                    path_addresses
+                        .iter()
+                        .map(|a| AbiToken::Address(*a))
+                        .collect(),
+                ),
+                AbiToken::Address(sender_eth),
+                AbiToken::Uint(deadline),
+            ]));
+            Ok((Bytes::from(buf), U256::zero()))
+        } else {
+            let mut buf = Vec::with_capacity(SELECTOR_LEN + ABI_PAYLOAD_CAPACITY);
+            buf.extend_from_slice(&SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR);
+            buf.extend_from_slice(&ethers::abi::encode(&[
+                AbiToken::Uint(amount_in_u256),
+                AbiToken::Uint(min_amount_out),
+                AbiToken::Array(
+                    path_addresses
+                        .iter()
+                        .map(|a| AbiToken::Address(*a))
+                        .collect(),
+                ),
+                AbiToken::Address(sender_eth),
+                AbiToken::Uint(deadline),
+            ]));
+            Ok((Bytes::from(buf), U256::zero()))
+        }
     }
 
     /// Compare deterministic AMM math vs local simulated swap progression.
@@ -437,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simulate_route_produces_consistent_gas_and_logs() {
+    async fn test_simulate_route_encodes_calldata_correctly() {
         let token_a = Token {
             address: Address::new("0x00000000000000000000000000000000000000a1").unwrap(),
             symbol: "A".to_string(),
@@ -480,16 +646,97 @@ mod tests {
         let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
         let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
 
+        let (calldata, value) = simulator
+            .encode_route_calldata(&route, 1_000_000_000_000_000_000, &sender, false, false)
+            .unwrap();
+
+        assert_eq!(&calldata[..4], &SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR);
+        assert!(calldata.len() > 4);
+        assert_eq!(value, U256::zero());
+    }
+
+    #[tokio::test]
+    async fn test_simulate_route_encodes_eth_in_calldata() {
+        let weth = Token {
+            address: Address::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").unwrap(),
+            symbol: "WETH".to_string(),
+            decimals: 18,
+        };
+        let token_b = Token {
+            address: Address::new("0x00000000000000000000000000000000000000b1").unwrap(),
+            symbol: "B".to_string(),
+            decimals: 18,
+        };
+
+        let pool_weth_b = UniswapV2Pair::new(
+            Address::new("0x1000000000000000000000000000000000000001").unwrap(),
+            weth.clone(),
+            token_b.clone(),
+            1_000_000_000_000_000_000_000,
+            1_000_000_000_000_000_000_000,
+            30,
+        )
+        .unwrap();
+
+        let route = Route::new(vec![pool_weth_b], vec![weth, token_b]);
+        let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
+        let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
+
+        let (calldata, value) = simulator
+            .encode_route_calldata(&route, 1_000_000_000_000_000_000, &sender, true, false)
+            .unwrap();
+
+        assert_eq!(&calldata[..4], &SWAP_EXACT_ETH_FOR_TOKENS_SELECTOR);
+        assert_eq!(value, U256::from(1_000_000_000_000_000_000u128));
+    }
+
+    #[tokio::test]
+    async fn test_simulate_route_encodes_eth_out_calldata() {
+        let token_a = Token {
+            address: Address::new("0x00000000000000000000000000000000000000a1").unwrap(),
+            symbol: "A".to_string(),
+            decimals: 18,
+        };
+        let weth = Token {
+            address: Address::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").unwrap(),
+            symbol: "WETH".to_string(),
+            decimals: 18,
+        };
+
+        let pool_a_weth = UniswapV2Pair::new(
+            Address::new("0x1000000000000000000000000000000000000001").unwrap(),
+            token_a.clone(),
+            weth.clone(),
+            1_000_000_000_000_000_000_000,
+            1_000_000_000_000_000_000_000,
+            30,
+        )
+        .unwrap();
+
+        let route = Route::new(vec![pool_a_weth], vec![token_a, weth]);
+        let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
+        let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
+
+        let (calldata, value) = simulator
+            .encode_route_calldata(&route, 1_000_000_000_000_000_000, &sender, false, true)
+            .unwrap();
+
+        assert_eq!(&calldata[..4], &SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR);
+        assert_eq!(value, U256::zero());
+    }
+
+    #[tokio::test]
+    async fn test_simulate_route_handles_empty_route() {
+        let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
+        let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
+
+        let route = Route::new(vec![], vec![]);
         let result = simulator
-            .simulate_route(&route, 1_000_000_000_000_000_000, sender)
+            .simulate_route(&route, 1_000, sender)
             .await
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.amount_out > 0);
-        assert_eq!(result.gas_used, route.estimate_gas() as u64);
-        assert_eq!(result.logs.len(), route.num_hops() + 1);
-        assert!(result.logs[1].contains("hop1"));
-        assert!(result.logs[2].contains("hop2"));
+        assert!(!result.success);
+        assert_eq!(result.amount_out, DEFAULT_AMOUNT_OUT);
     }
 }
