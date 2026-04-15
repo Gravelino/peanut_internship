@@ -1,7 +1,7 @@
 //! Integration tests for complete pricing engine workflow
 //! Tests cross-module interactions with the current pricing API
 
-use peanut_internship_rust::pricing::{Route, RouteFinder};
+use peanut_internship_rust::pricing::{PoolRef, Route, RouteFinder};
 use peanut_internship_rust::{Address, Token, UniswapV2Pair};
 
 fn weth() -> Token {
@@ -95,7 +95,7 @@ fn multihop_chain_preserves_intermediate_values() {
     let intermediate = pair1.get_amount_out(input_amount, &usdc()).unwrap();
     let sequential_final = pair2.get_amount_out(intermediate, &weth()).unwrap();
 
-    let route = Route::new(vec![pair1, pair2], vec![usdc(), weth(), dai()]);
+    let route = Route::new(vec![PoolRef::V2(pair1), PoolRef::V2(pair2)], vec![usdc(), weth(), dai()]);
     let amounts = route.get_intermediate_amounts(input_amount).unwrap();
 
     assert_eq!(amounts.len(), 3);
@@ -134,7 +134,7 @@ fn route_comparison_selects_lower_net_cost() {
         30,
     );
 
-    let finder = RouteFinder::new(vec![direct.clone(), hop1.clone(), hop2.clone()]);
+    let finder = RouteFinder::new(vec![PoolRef::V2(direct.clone()), PoolRef::V2(hop1.clone()), PoolRef::V2(hop2.clone())]);
     let input_amount = 100_000 * 10u128.pow(6);
 
     let zero_gas = finder
@@ -226,15 +226,14 @@ fn route_accumulation_adds_pairs_independently() {
         30,
     );
 
-    let route_single = Route::new(vec![pair1.clone()], vec![usdc(), weth()]);
-    let route_double = Route::new(vec![pair1, pair2], vec![usdc(), weth(), dai()]);
+    let route_single = Route::new(vec![PoolRef::V2(pair1.clone())], vec![usdc(), weth()]);
+    let route_double = Route::new(vec![PoolRef::V2(pair1), PoolRef::V2(pair2)], vec![usdc(), weth(), dai()]);
 
     assert_eq!(route_single.num_hops(), 1);
     assert_eq!(route_double.num_hops(), 2);
-    assert_eq!(
-        route_single.pools[0].reserve0,
-        route_double.pools[0].reserve0
-    );
+    let r0_single = match &route_single.pools[0] { PoolRef::V2(p) => p.reserve0, _ => panic!("expected V2") };
+    let r0_double = match &route_double.pools[0] { PoolRef::V2(p) => p.reserve0, _ => panic!("expected V2") };
+    assert_eq!(r0_single, r0_double);
 }
 
 /// Test that get_amount_in is consistent with get_amount_out.

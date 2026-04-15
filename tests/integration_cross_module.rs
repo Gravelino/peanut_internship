@@ -1,7 +1,7 @@
 //! Cross-module integration tests
 //! Tests interactions between pricing, wallet, and route composition
 
-use peanut_internship_rust::pricing::{Route, RouteFinder};
+use peanut_internship_rust::pricing::{PoolRef, Route, RouteFinder};
 use peanut_internship_rust::{Address, Token, TokenAmount, UniswapV2Pair, WalletManager};
 
 fn usdc() -> Token {
@@ -166,7 +166,7 @@ fn multipath_gas_cost_accumulation() {
         30,
     );
 
-    let route_direct = Route::new(vec![pair1.clone()], vec![usdc(), weth()]);
+    let route_direct = Route::new(vec![PoolRef::V2(pair1.clone())], vec![usdc(), weth()]);
     let route_with_gas = route_direct.clone();
 
     let input_amount = 100_000 * 10u128.pow(6);
@@ -226,7 +226,7 @@ fn multihop_fee_accumulation_reasonable() {
         30,
     );
 
-    let route = Route::new(vec![pair1, pair2], vec![usdc(), dai(), weth()]);
+    let route = Route::new(vec![PoolRef::V2(pair1), PoolRef::V2(pair2)], vec![usdc(), dai(), weth()]);
 
     let input_amount = 100_000 * 10u128.pow(6);
 

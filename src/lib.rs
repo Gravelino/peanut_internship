@@ -15,7 +15,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let client = ChainClient::new(vec!["http://localhost:8545".to_string()], 30, 3);
+//!     let client = ChainClient::new(vec!["http://localhost:8545".to_string()], 30, 3).unwrap();
 //!     let wallet = WalletManager::from_env("PRIVATE_KEY")?;
 //!     let to = Address::new("0x...")?;
 //!     let amount = TokenAmount::from_eth("0.1")?;
