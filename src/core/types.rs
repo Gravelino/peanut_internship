@@ -4,9 +4,13 @@ use std::hash::{Hash, Hasher};
 use std::ops::Add;
 use std::str::FromStr;
 
-use ethers::types::{Address as EthAddress, Bytes, TransactionRequest as EthTransactionRequest, U256};
-use rust_decimal::prelude::FromPrimitive;
+use ethers::types::{
+    Address as EthAddress, Bytes, Eip1559TransactionRequest,
+    TransactionRequest as EthTransactionRequest, U256,
+};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
+use serde::de;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -14,14 +18,14 @@ use thiserror::Error;
 /// Minimum gas limit for a simple ETH transfer.
 pub const MIN_GAS_LIMIT: u64 = 21_000;
 
-/// Default multiplier for gas estimation buffers.
-pub const DEFAULT_GAS_BUFFER: f64 = 1.2;
+/// Default buffer for gas estimation in basis points (1.2× = 12_000 bps).
+pub const DEFAULT_GAS_BUFFER_BPS: u64 = 12_000;
 
 /// Basis points scale (10,000 = 100%).
 pub const BPS_SCALE: u64 = 10_000;
 
-/// Minimum allowed gas buffer multiplier.
-pub const MIN_GAS_BUFFER_THRESHOLD: f64 = 0.0;
+/// Minimum meaningful gas buffer in basis points (1.0× = 10_000 bps).
+pub const MIN_GAS_BUFFER_BPS: u64 = 10_000;
 
 /// Status code for a successful transaction receipt.
 pub const RECEIPT_STATUS_SUCCESS: u64 = 1;
@@ -34,6 +38,15 @@ pub const MAINNET_CHAIN_ID: u64 = 1;
 
 /// Chain ID for Sepolia Testnet.
 pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
+
+/// Multiplier to convert Gwei to Wei.
+pub const WEI_PER_GWEI: u128 = 1_000_000_000;
+
+/// Divisor for low-priority fee suggestions (`base / 4`).
+pub const PRIORITY_FEE_LOW_DIVISOR: u64 = 4;
+
+/// Divisor for medium-priority fee suggestions (`base / 2`).
+pub const PRIORITY_FEE_MEDIUM_DIVISOR: u64 = 2;
 
 /// String representation of success in hex.
 pub const SUCCESS_HEX: &str = "0x1";
@@ -93,7 +106,9 @@ impl FromStr for GasPriority {
             "low" => Ok(Self::Low),
             "high" => Ok(Self::High),
             "medium" => Ok(Self::Medium),
-            _ => Ok(Self::Medium),
+            other => Err(format!(
+                "invalid gas priority: {other}; expected low, medium, or high"
+            )),
         }
     }
 }
@@ -204,16 +219,12 @@ impl Address {
     /// Validates the format and stores both the original and checksummed versions.
     pub fn new(value: impl AsRef<str>) -> Result<Self, CoreError> {
         let raw = value.as_ref().trim();
-        let parsed = EthAddress::from_str(raw).map_err(|_| CoreError::InvalidAddress(raw.to_string()))?;
+        let parsed =
+            EthAddress::from_str(raw).map_err(|_| CoreError::InvalidAddress(raw.to_string()))?;
         Ok(Self {
             value: ethers::utils::to_checksum(&parsed, None),
             parsed,
         })
-    }
-
-    /// Alternative constructor for creating an Address from a string.
-    pub fn from_string(value: &str) -> Result<Self, CoreError> {
-        Self::new(value)
     }
 
     /// Returns the checksummed hex representation of the address.
@@ -229,6 +240,14 @@ impl Address {
     /// Returns the underlying ethers-core Address type.
     pub fn as_eth_address(&self) -> EthAddress {
         self.parsed
+    }
+
+    /// Creates an Address from an ethers H160 value.
+    pub fn from_eth_address(eth: EthAddress) -> Self {
+        Self {
+            value: ethers::utils::to_checksum(&eth, None),
+            parsed: eth,
+        }
     }
 }
 
@@ -246,7 +265,9 @@ impl Hash for Address {
 
 impl fmt::Debug for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple(stringify!(Address)).field(&self.value).finish()
+        f.debug_tuple(stringify!(Address))
+            .field(&self.value)
+            .finish()
     }
 }
 
@@ -280,7 +301,12 @@ impl Serialize for TokenAmount {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.raw.to_string())
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("TokenAmount", 3)?;
+        s.serialize_field("raw", &self.raw.to_string())?;
+        s.serialize_field("decimals", &self.decimals)?;
+        s.serialize_field("symbol", &self.symbol)?;
+        s.end()
     }
 }
 
@@ -289,8 +315,21 @@ impl<'de> Deserialize<'de> for TokenAmount {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = U256::deserialize(deserializer)?;
-        Ok(Self::eth(raw))
+        #[derive(Deserialize)]
+        struct TokenAmountFields {
+            raw: String,
+            decimals: u8,
+            symbol: Option<String>,
+        }
+
+        let fields = TokenAmountFields::deserialize(deserializer)?;
+        let raw = U256::from_dec_str(&fields.raw)
+            .map_err(|e| de::Error::custom(format!("invalid raw value: {e}")))?;
+        Ok(Self {
+            raw,
+            decimals: fields.decimals,
+            symbol: fields.symbol,
+        })
     }
 }
 
@@ -310,7 +349,11 @@ impl TokenAmount {
     }
 
     /// Creates a TokenAmount from a human-readable string (e.g., "0.1").
-    pub fn from_human(amount: impl ToString, decimals: u8, symbol: Option<String>) -> Result<Self, CoreError> {
+    pub fn from_human(
+        amount: impl ToString,
+        decimals: u8,
+        symbol: Option<String>,
+    ) -> Result<Self, CoreError> {
         let amount_string = amount.to_string();
         let decimal = match Decimal::from_str(&amount_string) {
             Ok(decimal) => decimal,
@@ -318,7 +361,9 @@ impl TokenAmount {
         };
 
         if decimal.is_sign_negative() {
-            return Err(CoreError::InvalidTokenAmount("negative amounts are not supported".to_string()));
+            return Err(CoreError::InvalidTokenAmount(
+                "negative amounts are not supported".to_string(),
+            ));
         }
 
         let scale = get_scale(decimals);
@@ -336,14 +381,20 @@ impl TokenAmount {
             Err(_) => return Err(CoreError::InvalidTokenAmount(raw_string)),
         };
 
-        Ok(Self { raw, decimals, symbol })
+        Ok(Self {
+            raw,
+            decimals,
+            symbol,
+        })
     }
 
     /// Converts the amount to its human-readable decimal representation.
-    pub fn human(&self) -> Decimal {
-        let raw_decimal = Decimal::from_str(&self.raw.to_string()).unwrap_or(Decimal::ZERO);
+    ///
+    /// Returns `None` if the raw value overflows `Decimal` precision.
+    pub fn human(&self) -> Option<Decimal> {
+        let raw_decimal = Decimal::from_str(&self.raw.to_string()).ok()?;
         let scale = get_scale(self.decimals);
-        raw_decimal / scale
+        Some(raw_decimal / scale)
     }
 
     /// Adds two TokenAmounts, ensuring they have the same decimal scale.
@@ -365,10 +416,15 @@ impl TokenAmount {
     /// Multiplies the amount by a decimal factor, returning a new TokenAmount.
     pub fn checked_mul_decimal(self, factor: Decimal) -> Result<Self, CoreError> {
         if factor.is_sign_negative() {
-            return Err(CoreError::InvalidTokenAmount("negative factor is not supported".to_string()));
+            return Err(CoreError::InvalidTokenAmount(
+                "negative factor is not supported".to_string(),
+            ));
         }
 
-        let product = self.human() * factor;
+        let human = self.human().ok_or_else(|| {
+            CoreError::InvalidTokenAmount("raw value overflows decimal precision".to_string())
+        })?;
+        let product = human * factor;
         Self::from_human(product, self.decimals, self.symbol)
     }
 
@@ -384,18 +440,24 @@ impl TokenAmount {
 
 impl fmt::Display for TokenAmount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let human = self
+            .human()
+            .map_or_else(|| self.raw.to_string(), |d| d.to_string());
         if let Some(symbol) = &self.symbol {
-            write!(f, "{}{}", self.human(), symbol)
+            write!(f, "{human}{symbol}")
         } else {
-            write!(f, "{}", self.human())
+            write!(f, "{human}")
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct Token {
+    /// Contract address of the token.
     pub address: Address,
+    /// Human-readable ticker symbol.
     pub symbol: String,
+    /// Number of decimal places used by the token.
     pub decimals: u8,
 }
 
@@ -443,6 +505,20 @@ pub struct TransactionRequest {
 }
 
 impl TransactionRequest {
+    /// Creates a read-only contract call request (eth_call) with zero value and no gas/nonce.
+    pub fn contract_call(to: Address, data: Vec<u8>, chain_id: u64) -> Self {
+        Self {
+            to,
+            value: TokenAmount::eth(0u64),
+            data: Bytes::from(data),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id,
+        }
+    }
+
     /// Converts the request to a BTreeMap for structured logging or serialization.
     pub fn to_dict(&self) -> BTreeMap<String, Value> {
         match serde_json::to_value(self) {
@@ -451,14 +527,38 @@ impl TransactionRequest {
         }
     }
 
-    /// Converts the request to an ethers-core TransactionRequest.
+    /// Converts the request into a `TypedTransaction` suitable for signing or sending.
+    ///
+    /// When EIP-1559 fee fields are present, builds an `Eip1559TransactionRequest`.
+    /// Otherwise falls back to a legacy `TransactionRequest`.
+    pub fn to_ethers_typed(&self) -> ethers::types::transaction::eip2718::TypedTransaction {
+        if self.max_fee_per_gas.is_some() || self.max_priority_fee.is_some() {
+            let mut req = Eip1559TransactionRequest::new();
+            req.to = Some(self.to.as_eth_address().into());
+            req.value = Some(self.value.raw);
+            req.data = Some(self.data.clone());
+            req.chain_id = Some(self.chain_id.into());
+            req.max_fee_per_gas = self.max_fee_per_gas;
+            req.max_priority_fee_per_gas = self.max_priority_fee;
+            if let Some(nonce) = self.nonce {
+                req.nonce = Some(nonce.into());
+            }
+            if let Some(gas_limit) = self.gas_limit {
+                req.gas = Some(gas_limit.into());
+            }
+            req.into()
+        } else {
+            self.to_ethers_request().into()
+        }
+    }
+
+    /// Converts the request to a legacy ethers-core TransactionRequest.
     pub fn to_ethers_request(&self) -> EthTransactionRequest {
         let mut request = EthTransactionRequest::new();
         request.to = Some(self.to.as_eth_address().into());
         request.value = Some(self.value.raw);
         request.data = Some(self.data.clone());
         request.chain_id = Some(self.chain_id.into());
-        request.gas_price = self.max_fee_per_gas.or(self.max_priority_fee);
 
         if let Some(nonce) = self.nonce {
             request.nonce = Some(nonce.into());
@@ -480,14 +580,16 @@ impl TransactionRequest {
         }
 
         if let Some(gas) = self.gas_limit
-            && gas < MIN_GAS_LIMIT {
-            return Err(CoreError::InvalidTransactionRequest(
-                format!("gas_limit {gas} is too low; minimum is {MIN_GAS_LIMIT}")
-            ));
+            && gas < MIN_GAS_LIMIT
+        {
+            return Err(CoreError::InvalidTransactionRequest(format!(
+                "gas_limit {gas} is too low; minimum is {MIN_GAS_LIMIT}"
+            )));
         }
 
         if let (Some(fee), Some(priority)) = (self.max_fee_per_gas, self.max_priority_fee)
-            && priority > fee {
+            && priority > fee
+        {
             return Err(CoreError::InvalidTransactionRequest(
                 "maxPriorityFeePerGas cannot exceed maxFeePerGas".to_string(),
             ));
@@ -524,7 +626,9 @@ where
     } else if let Some(s) = v.as_str() {
         Ok(s == SUCCESS_HEX || s == SUCCESS_STR || s == SUCCESS_BOOL_STR)
     } else {
-        Ok(false)
+        Err(de::Error::custom(format!(
+            "cannot deserialize receipt status from {v}"
+        )))
     }
 }
 
@@ -542,7 +646,10 @@ impl TransactionReceipt {
         let logs = receipt
             .logs
             .iter()
-            .map(|log| serde_json::to_value(log).map_err(|_| CoreError::InvalidReceipt(ReceiptError::LogSerializationFailed)))
+            .map(|log| {
+                serde_json::to_value(log)
+                    .map_err(|_| CoreError::InvalidReceipt(ReceiptError::LogSerializationFailed))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -551,13 +658,18 @@ impl TransactionReceipt {
                 .block_number
                 .map(|n| n.as_u64())
                 .ok_or(CoreError::InvalidReceipt(ReceiptError::MissingBlockNumber))?,
-            status: receipt.status.map(|status| status.as_u64() == RECEIPT_STATUS_SUCCESS).unwrap_or(false),
+            status: receipt
+                .status
+                .map(|status| status.as_u64() == RECEIPT_STATUS_SUCCESS)
+                .unwrap_or(false),
             gas_used: receipt
                 .gas_used
                 .ok_or(CoreError::InvalidReceipt(ReceiptError::MissingGasUsed))?,
             effective_gas_price: receipt
                 .effective_gas_price
-                .ok_or(CoreError::InvalidReceipt(ReceiptError::MissingEffectiveGasPrice))?,
+                .ok_or(CoreError::InvalidReceipt(
+                    ReceiptError::MissingEffectiveGasPrice,
+                ))?,
             logs,
         })
     }
@@ -594,24 +706,30 @@ pub struct GasPrice {
 }
 
 impl GasPrice {
-    /// Calculates the maximum fee per gas unit based on priority and a safety buffer.
-    pub fn get_max_fee(&self, priority: GasPriority, buffer: f64) -> U256 {
+    /// Calculates the maximum fee per gas unit based on priority and a safety buffer (in bps).
+    ///
+    /// `buffer_bps` is expressed in basis points: 10_000 = 1.0×, 12_000 = 1.2×, etc.
+    /// Falls back to [`DEFAULT_GAS_BUFFER_BPS`] when the value is below [`MIN_GAS_BUFFER_BPS`].
+    pub fn get_max_fee(&self, priority: GasPriority, buffer_bps: u64) -> U256 {
         let priority_fee = match priority {
             GasPriority::Low => self.priority_fee_low,
             GasPriority::High => self.priority_fee_high,
             GasPriority::Medium => self.priority_fee_medium,
         };
 
-        let normalized_buffer = if buffer.is_finite() && buffer > MIN_GAS_BUFFER_THRESHOLD { buffer } else { DEFAULT_GAS_BUFFER };
-        let buffer_bps = (normalized_buffer * (BPS_SCALE as f64)).ceil() as u64;
+        let effective_buffer = if buffer_bps >= MIN_GAS_BUFFER_BPS {
+            buffer_bps
+        } else {
+            DEFAULT_GAS_BUFFER_BPS
+        };
 
-        let ratio_base = U256::from(BPS_SCALE);
-        let ratio = U256::from(buffer_bps);
+        let ratio = U256::from(effective_buffer);
+        let bps_base = U256::from(BPS_SCALE);
+
         let numerator = self.base_fee.checked_mul(ratio).unwrap_or(U256::MAX);
-
         let buffered_base = numerator
-            .checked_add(ratio_base - U256::from(1u64))
-            .map(|value| value / ratio_base)
+            .checked_add(bps_base - U256::from(1u64))
+            .map(|value| value / bps_base)
             .unwrap_or(U256::MAX);
 
         buffered_base.checked_add(priority_fee).unwrap_or(U256::MAX)
@@ -619,9 +737,10 @@ impl GasPrice {
 }
 
 impl Add for TokenAmount {
-    type Output = Result<Self, CoreError>;
+    type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
         self.checked_add(rhs)
+            .expect("token amount decimals mismatch in add")
     }
 }

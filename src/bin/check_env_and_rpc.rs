@@ -1,7 +1,7 @@
 use std::env;
 
 use ethers::providers::{Http, Middleware, Provider};
-use peanut_internship_rust::{Address, ChainClient, WalletManager, BlockId};
+use peanut_internship_rust::{Address, BlockId, ChainClient, WalletManager};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,8 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_chain_checks(name: &str, rpc_url: &str, address: &Address) -> Result<(), Box<dyn std::error::Error>> {
-    let chain_client = ChainClient::new(vec![rpc_url.to_string()], 20, 2);
+async fn run_chain_checks(
+    name: &str,
+    rpc_url: &str,
+    address: &Address,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let chain_client = ChainClient::new(vec![rpc_url.to_string()], 20, 2)?;
 
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?;

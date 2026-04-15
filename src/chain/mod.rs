@@ -1,5 +1,5 @@
 //! # Chain Module
-//! 
+//!
 //! Components for interacting with Ethereum nodes and analyzing on-chain data:
 //! - **Chain Client**: Multi-endpoint RPC client with automatic retries and failover.
 //! - **Transaction Builder**: Fluent interface for preparing and sending transactions.

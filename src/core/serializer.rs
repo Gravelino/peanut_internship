@@ -5,14 +5,14 @@ use sha3::{Digest, Keccak256};
 use super::types::{CoreError, SerializationError};
 
 /// A serializer that produces deterministic, canonical JSON for Ethereum-related data.
-/// 
-/// Canonical JSON ensures that the same data structure always results in the exact same 
+///
+/// Canonical JSON ensures that the same data structure always results in the exact same
 /// byte sequence, which is essential for signature verification.
 pub struct CanonicalSerializer;
 
 impl CanonicalSerializer {
     /// Serializes an object to a canonical JSON byte sequence.
-    /// 
+    ///
     /// Rejects floating point numbers as they are non-deterministic across platforms.
     pub fn serialize<T: Serialize>(obj: &T) -> Result<Vec<u8>, CoreError> {
         let value = serde_json::to_value(obj)
@@ -61,7 +61,9 @@ impl CanonicalSerializer {
             }
             Value::Number(number) => {
                 if number.as_i64().is_none() && number.as_u64().is_none() {
-                    return Err(CoreError::InvalidSerialization(SerializationError::FloatingPointUnsupported));
+                    return Err(CoreError::InvalidSerialization(
+                        SerializationError::FloatingPointUnsupported,
+                    ));
                 }
                 Ok(Value::Number(number))
             }

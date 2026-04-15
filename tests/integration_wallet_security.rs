@@ -1,5 +1,7 @@
-use peanut_internship_rust::{Address, TokenAmount, WalletManager, MAINNET_CHAIN_ID, MIN_GAS_LIMIT};
 use ethers::types::Bytes;
+use peanut_internship_rust::{
+    Address, MAINNET_CHAIN_ID, MIN_GAS_LIMIT, TokenAmount, WalletManager,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -39,7 +41,7 @@ fn repr_display_never_expose_private_key() {
 async fn empty_message_rejected_before_crypto() {
     let wallet = WalletManager::generate().unwrap();
     let result = wallet.sign_message("").await;
-    
+
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(error.to_string(), "message must not be empty");
@@ -98,10 +100,15 @@ async fn transaction_validation_rejects_invalid_fees() {
         max_priority_fee: Some(ethers::types::U256::from(2_000_000_000u64)),
         chain_id: MAINNET_CHAIN_ID,
     };
-    
+
     let result = wallet.sign_transaction(&tx_request).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("maxPriorityFeePerGas"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("maxPriorityFeePerGas")
+    );
 }
 
 #[tokio::test]
@@ -119,14 +126,14 @@ async fn transaction_validation_rejects_zero_chain_id() {
         max_priority_fee: None,
         chain_id: 0,
     };
-    
+
     let result = wallet.sign_transaction(&tx_request).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("chain_id"));
 }
 
 #[test]
-fn keyfile_export_creates_encrypted_file(){
+fn keyfile_export_creates_encrypted_file() {
     let wallet = WalletManager::generate().unwrap();
     let test_dir = std::env::temp_dir().join("peanut_tests_export");
 
@@ -134,7 +141,11 @@ fn keyfile_export_creates_encrypted_file(){
     fs::create_dir_all(&test_dir).expect("failed to create test dir");
 
     let result = wallet.to_keyfile(&test_dir, TEST_PASSWORD, Some("test_wallet".to_string()));
-    assert!(result.is_ok(), "Failed to export keyfile: {:?}", result.unwrap_err());
+    assert!(
+        result.is_ok(),
+        "Failed to export keyfile: {:?}",
+        result.unwrap_err()
+    );
 
     let entries: Vec<_> = fs::read_dir(&test_dir)
         .expect("Cannot read directory")
@@ -142,21 +153,27 @@ fn keyfile_export_creates_encrypted_file(){
         .filter(|p| p.is_file())
         .collect();
 
-    assert!(!entries.is_empty(), "No files created in keystore directory");
+    assert!(
+        !entries.is_empty(),
+        "No files created in keystore directory"
+    );
 
     let mut found_valid = false;
     for file_path in entries {
-        if let Ok(contents) = fs::read_to_string(&file_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let has_crypto = json.get("crypto").is_some() || json.get("Crypto").is_some();
-                if json.get("address").is_some() && has_crypto {
-                    found_valid = true;
-                    break;
-                }
+        if let Ok(contents) = fs::read_to_string(&file_path)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents)
+        {
+            let has_crypto = json.get("crypto").is_some() || json.get("Crypto").is_some();
+            if json.get("address").is_some() && has_crypto {
+                found_valid = true;
+                break;
             }
         }
     }
-    assert!(found_valid, "No valid keystore JSON file found in directory");
+    assert!(
+        found_valid,
+        "No valid keystore JSON file found in directory"
+    );
 
     let _ = fs::remove_dir_all(&test_dir);
 }
@@ -170,7 +187,8 @@ async fn keyfile_import_decrypts_correctly() {
     let _ = fs::remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("failed to create test dir");
 
-    wallet1.to_keyfile(&test_dir, TEST_PASSWORD, Some("wallet1".to_string()))
+    wallet1
+        .to_keyfile(&test_dir, TEST_PASSWORD, Some("wallet1".to_string()))
         .expect("failed to export keyfile");
 
     let actual_file = fs::read_dir(&test_dir)
@@ -178,11 +196,7 @@ async fn keyfile_import_decrypts_correctly() {
         .find_map(|entry| {
             entry.ok().and_then(|e| {
                 let path = e.path();
-                if path.is_file() {
-                    Some(path)
-                } else {
-                    None
-                }
+                if path.is_file() { Some(path) } else { None }
             })
         })
         .expect("No keystore file found");
@@ -190,13 +204,21 @@ async fn keyfile_import_decrypts_correctly() {
     let wallet2 = WalletManager::from_keyfile(&actual_file, TEST_PASSWORD)
         .expect("Failed to import wallet from keyfile");
 
-    assert_eq!(wallet2.address(), addr1, "Imported wallet has different address");
+    assert_eq!(
+        wallet2.address(),
+        addr1,
+        "Imported wallet has different address"
+    );
 
     let message = "Test message for signature verification";
     let sig1 = wallet1.sign_message(message).await.unwrap();
     let sig2 = wallet2.sign_message(message).await.unwrap();
 
-    assert_eq!(sig1.to_string(), sig2.to_string(), "Signatures do not match");
+    assert_eq!(
+        sig1.to_string(),
+        sig2.to_string(),
+        "Signatures do not match"
+    );
 
     let _ = fs::remove_dir_all(&test_dir);
 }
@@ -209,7 +231,8 @@ fn keyfile_wrong_password_fails_gracefully() {
     let _ = fs::remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("failed to create test dir");
 
-    wallet.to_keyfile(&test_dir, TEST_PASSWORD, Some("wallet2".to_string()))
+    wallet
+        .to_keyfile(&test_dir, TEST_PASSWORD, Some("wallet2".to_string()))
         .expect("failed to export keyfile");
 
     let actual_file = fs::read_dir(&test_dir)
@@ -217,11 +240,7 @@ fn keyfile_wrong_password_fails_gracefully() {
         .find_map(|entry| {
             entry.ok().and_then(|e| {
                 let path = e.path();
-                if path.is_file() {
-                    Some(path)
-                } else {
-                    None
-                }
+                if path.is_file() { Some(path) } else { None }
             })
         })
         .expect("No keystore file found");
@@ -230,8 +249,11 @@ fn keyfile_wrong_password_fails_gracefully() {
 
     assert!(result.is_err(), "Should fail with wrong password");
     let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.to_lowercase().contains("decrypt") || error_msg.to_lowercase().contains("failed"), 
-            "Error should mention decryption or failure. Got: {}", error_msg);
+    assert!(
+        error_msg.to_lowercase().contains("decrypt") || error_msg.to_lowercase().contains("failed"),
+        "Error should mention decryption or failure. Got: {}",
+        error_msg
+    );
 
     let _ = fs::remove_dir_all(&test_dir);
 }
@@ -245,8 +267,10 @@ fn keyfile_missing_file_fails_gracefully() {
 
     assert!(result.is_err(), "Should fail for missing file");
     let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("read keyfile") || error_msg.contains("No such file"), 
-            "Error should mention file reading");
+    assert!(
+        error_msg.contains("read keyfile") || error_msg.contains("No such file"),
+        "Error should mention file reading"
+    );
 }
 
 #[test]
@@ -264,8 +288,13 @@ fn keyfile_corrupted_json_fails_gracefully() {
 
     assert!(result.is_err(), "Should fail for corrupted JSON");
     let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.to_lowercase().contains("keyfile") || error_msg.to_lowercase().contains("invalid") || error_msg.to_lowercase().contains("failed"),
-            "Error should mention keyfile, invalid format, or failure. Got: {}", error_msg);
+    assert!(
+        error_msg.to_lowercase().contains("keyfile")
+            || error_msg.to_lowercase().contains("invalid")
+            || error_msg.to_lowercase().contains("failed"),
+        "Error should mention keyfile, invalid format, or failure. Got: {}",
+        error_msg
+    );
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -292,7 +321,8 @@ async fn keyfile_roundtrip_preserves_functionality() {
     let _ = fs::remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("failed to create test dir");
 
-    wallet_orig.to_keyfile(&test_dir, TEST_PASSWORD, Some("wallet3".to_string()))
+    wallet_orig
+        .to_keyfile(&test_dir, TEST_PASSWORD, Some("wallet3".to_string()))
         .expect("failed to export keyfile");
 
     let actual_file = fs::read_dir(&test_dir)
@@ -300,22 +330,21 @@ async fn keyfile_roundtrip_preserves_functionality() {
         .find_map(|entry| {
             entry.ok().and_then(|e| {
                 let path = e.path();
-                if path.is_file() {
-                    Some(path)
-                } else {
-                    None
-                }
+                if path.is_file() { Some(path) } else { None }
             })
         })
         .expect("No keystore file found");
 
-    let wallet_reimport = WalletManager::from_keyfile(&actual_file, TEST_PASSWORD)
-        .expect("failed to import keyfile");
+    let wallet_reimport =
+        WalletManager::from_keyfile(&actual_file, TEST_PASSWORD).expect("failed to import keyfile");
 
     let sig_reimport = wallet_reimport.sign_transaction(&tx).await.unwrap();
 
-    assert_eq!(sig_orig.to_string(), sig_reimport.to_string(), 
-               "Reimported wallet produces different signature");
+    assert_eq!(
+        sig_orig.to_string(),
+        sig_reimport.to_string(),
+        "Reimported wallet produces different signature"
+    );
 
     let _ = fs::remove_dir_all(&test_dir);
 }
