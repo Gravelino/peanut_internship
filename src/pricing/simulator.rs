@@ -325,6 +325,12 @@ impl ForkSimulator {
         is_eth_in: bool,
         is_eth_out: bool,
     ) -> PricingResult<(Bytes, U256)> {
+        if route.is_v3_route() {
+            return Err(PricingError::AbiDecode(
+                "V3 route simulation not yet supported".into(),
+            ));
+        }
+
         let path_addresses: Vec<H160> = route
             .path
             .iter()
@@ -468,6 +474,7 @@ mod tests {
     use crate::core::types::{Address, Token};
     use crate::pricing::UniswapV2Pair;
     use crate::pricing::router::Route;
+    use crate::pricing::router::PoolRef;
 
     #[test]
     fn test_decode_amount_out_uniswap_v2_array() {
@@ -640,7 +647,7 @@ mod tests {
         .unwrap();
 
         let route = Route::new(
-            vec![pool_ab, pool_bc],
+            vec![PoolRef::V2(pool_ab), PoolRef::V2(pool_bc)],
             vec![token_a.clone(), token_b.clone(), token_c.clone()],
         );
         let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
@@ -678,7 +685,7 @@ mod tests {
         )
         .unwrap();
 
-        let route = Route::new(vec![pool_weth_b], vec![weth, token_b]);
+        let route = Route::new(vec![PoolRef::V2(pool_weth_b)], vec![weth, token_b]);
         let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
         let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
 
@@ -713,7 +720,7 @@ mod tests {
         )
         .unwrap();
 
-        let route = Route::new(vec![pool_a_weth], vec![token_a, weth]);
+        let route = Route::new(vec![PoolRef::V2(pool_a_weth)], vec![token_a, weth]);
         let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
         let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
 

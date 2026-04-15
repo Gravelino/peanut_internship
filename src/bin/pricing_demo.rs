@@ -92,9 +92,9 @@ async fn run_best_route() -> Result<(), Box<dyn std::error::Error>> {
         .map(|a| Address::new(*a))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut pools = Vec::with_capacity(pool_addrs.len());
+    let mut pools: Vec<peanut_internship_rust::PoolRef> = Vec::with_capacity(pool_addrs.len());
     for addr in pool_addrs {
-        pools.push(UniswapV2Pair::from_chain(addr, &client).await?);
+        pools.push(peanut_internship_rust::PoolRef::V2(UniswapV2Pair::from_chain(addr, &client).await?));
     }
 
     let finder = RouteFinder::new(pools);

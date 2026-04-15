@@ -7,9 +7,11 @@ use crate::chain::client::ChainClient;
 use crate::core::types::{Address, Token};
 use crate::pricing::UniswapV2Pair;
 use crate::pricing::errors::PricingError;
+use crate::pricing::feed::{PriceFeed, PriceTick};
 use crate::pricing::mempool::{MempoolMonitor, ParsedSwap};
-use crate::pricing::router::{Route, RouteFinder};
+use crate::pricing::router::{PoolRef, Route, RouteFinder};
 use crate::pricing::simulator::ForkSimulator;
+use crate::pricing::v3::pool::UniswapV3Pool;
 
 /// Default number of hops considered by route search.
 const DEFAULT_MAX_HOPS: usize = 3;
@@ -89,6 +91,7 @@ pub struct PricingEngine {
     simulator: ForkSimulator,
     monitor: MempoolMonitor,
     pools: HashMap<Address, UniswapV2Pair>,
+    v3_pools: HashMap<Address, UniswapV3Pool>,
     router: Option<RouteFinder>,
     max_hops: usize,
 }
@@ -105,6 +108,7 @@ impl PricingEngine {
             simulator: ForkSimulator::new(fork_url)?,
             monitor: MempoolMonitor::new(ws_url),
             pools: HashMap::new(),
+            v3_pools: HashMap::new(),
             router: None,
             max_hops: DEFAULT_MAX_HOPS,
         })
@@ -115,9 +119,19 @@ impl PricingEngine {
         &self.pools
     }
 
+    /// Returns a reference to the loaded V3 pools.
+    pub fn v3_pools(&self) -> &HashMap<Address, UniswapV3Pool> {
+        &self.v3_pools
+    }
+
     /// Returns the configured maximum hop count.
     pub fn max_hops(&self) -> usize {
         self.max_hops
+    }
+
+    /// Returns a reference to the route finder, if initialized.
+    pub fn router(&self) -> Option<&RouteFinder> {
+        self.router.as_ref()
     }
 
     /// Load pool data from chain and build a route graph.
@@ -140,6 +154,29 @@ impl PricingEngine {
     pub fn load_pools_sync(&mut self, pools: Vec<UniswapV2Pair>) {
         for pair in pools {
             self.pools.insert(pair.address.clone(), pair);
+        }
+        self.rebuild_router();
+    }
+
+    /// Load V3 pool data from chain and rebuild the route graph.
+    pub async fn load_v3_pools(&mut self, pool_addresses: &[Address]) -> QuoteResult<()> {
+        for address in pool_addresses {
+            let pool = UniswapV3Pool::from_chain(address.clone(), &self.client)
+                .await
+                .map_err(|e| QuoteError::PoolLoadFailed {
+                    address: address.to_string(),
+                    reason: e.to_string(),
+                })?;
+            self.v3_pools.insert(address.clone(), pool);
+        }
+        self.rebuild_router();
+        Ok(())
+    }
+
+    /// Load pre-constructed V3 pools directly and rebuild the route graph.
+    pub fn load_v3_pools_sync(&mut self, pools: Vec<UniswapV3Pool>) {
+        for pool in pools {
+            self.v3_pools.insert(pool.address.clone(), pool);
         }
         self.rebuild_router();
     }
@@ -230,8 +267,36 @@ impl PricingEngine {
         })
     }
 
+    /// Starts a real-time price feed for all loaded pools.
+    ///
+    /// Returns a receiver that yields [`PriceTick`] values on each new block.
+    /// Requires a WebSocket URL for block subscriptions and uses the engine's
+    /// `ChainClient` for reserve-fetching calls.
+    pub async fn start_price_feed(
+        &self,
+        ws_url: impl Into<String>,
+    ) -> QuoteResult<tokio::sync::mpsc::Receiver<PriceTick>> {
+        let pairs: Vec<UniswapV2Pair> = self.pools.values().cloned().collect();
+        let feed = PriceFeed::new(ws_url, pairs);
+        feed.start(self.client.clone())
+            .await
+            .map_err(|e| QuoteError::Mempool(e.to_string()))
+    }
+
     fn rebuild_router(&mut self) {
-        self.router = Some(RouteFinder::new(self.pools.values().cloned().collect()));
+        let mut refs: Vec<PoolRef> = self
+            .pools
+            .values()
+            .cloned()
+            .map(PoolRef::V2)
+            .collect();
+        refs.extend(
+            self.v3_pools
+                .values()
+                .cloned()
+                .map(PoolRef::V3),
+        );
+        self.router = Some(RouteFinder::new(refs));
     }
 }
 

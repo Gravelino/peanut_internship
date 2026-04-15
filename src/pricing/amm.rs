@@ -327,10 +327,42 @@ impl UniswapV2Pair {
 
         Self::new(address, token0, token1, reserve0, reserve1, DEFAULT_FEE_BPS)
     }
+
+    /// Fetches only the current reserves from an on-chain Uniswap V2 pair contract.
+    ///
+    /// This is cheaper than [`from_chain`] when token metadata is already known
+    /// (e.g., refreshing prices on a pool that was previously loaded).
+    pub async fn fetch_reserves(
+        address: &Address,
+        client: &ChainClient,
+    ) -> PricingResult<(u128, u128)> {
+        let call = TransactionRequest::contract_call(
+            address.clone(),
+            GET_RESERVES_SELECTOR.to_vec(),
+            MAINNET_CHAIN_ID,
+        );
+
+        let reserves_raw = client
+            .call(&call, BlockId::Latest)
+            .await
+            .map_err(|e| PricingError::ChainCall(e.to_string()))?;
+
+        if reserves_raw.len() < GET_RESERVES_RETURN_MIN {
+            return Err(PricingError::AbiDecode(format!(
+                "getReserves returned {} bytes, expected {GET_RESERVES_RETURN_MIN}",
+                reserves_raw.len()
+            )));
+        }
+
+        let reserve0 = decode_u128_from_slot(&reserves_raw[0..EVM_WORD_LEN])?;
+        let reserve1 = decode_u128_from_slot(&reserves_raw[EVM_WORD_LEN..EVM_WORD_LEN * 2])?;
+
+        Ok((reserve0, reserve1))
+    }
 }
 
 /// Decodes a `uint256` (or smaller) from a 32-byte ABI slot into `u128`.
-fn decode_u128_from_slot(slot: &[u8]) -> PricingResult<u128> {
+pub fn decode_u128_from_slot(slot: &[u8]) -> PricingResult<u128> {
     if slot.len() < EVM_WORD_LEN {
         return Err(PricingError::AbiDecode("slot too short".into()));
     }
@@ -340,7 +372,7 @@ fn decode_u128_from_slot(slot: &[u8]) -> PricingResult<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
-fn decode_address_from_slot(slot: &[u8]) -> PricingResult<Address> {
+pub fn decode_address_from_slot(slot: &[u8]) -> PricingResult<Address> {
     if slot.len() < EVM_WORD_LEN {
         return Err(PricingError::AbiDecode("slot too short".into()));
     }
@@ -349,7 +381,7 @@ fn decode_address_from_slot(slot: &[u8]) -> PricingResult<Address> {
 }
 
 /// Decodes a `uint8` from a 32-byte ABI slot.
-fn decode_u8_from_slot(slot: &[u8]) -> Option<u8> {
+pub fn decode_u8_from_slot(slot: &[u8]) -> Option<u8> {
     if slot.len() < EVM_WORD_LEN {
         return None;
     }
@@ -359,7 +391,7 @@ fn decode_u8_from_slot(slot: &[u8]) -> Option<u8> {
 }
 
 /// Fetches `symbol()` and `decimals()` from an ERC-20 token contract.
-async fn fetch_token_metadata(
+pub async fn fetch_token_metadata(
     addr: &Address,
     client: &ChainClient,
     _zero_value: TokenAmount,
@@ -387,7 +419,7 @@ async fn fetch_token_metadata(
 }
 
 /// Decodes an ABI-encoded `string` (dynamic type) from a raw byte slice.
-fn decode_string_from_abi(raw: &[u8]) -> Option<String> {
+pub fn decode_string_from_abi(raw: &[u8]) -> Option<String> {
     if raw.len() < ABI_STRING_MIN {
         return None;
     }
