@@ -6,16 +6,23 @@ use super::errors::{PricingError, PricingResult};
 use super::v3::pool::{UniswapV3Pool, v3_base_gas, v3_gas_per_hop};
 use crate::core::types::{Address, DECIMAL_BASE, ETH_DECIMALS, Token, WEI_PER_GWEI};
 
+/// Base gas cost for a V2 swap execution (transfer + approval overhead).
+/// Source: empirical measurement on Ethereum mainnet.
 const BASE_GAS_COST: u128 = 150_000;
+/// Additional gas per intermediate hop in a multi-hop route.
 const GAS_PER_HOP: u128 = 100_000;
 
+/// Enum holding either a V2 or V3 pool reference for route building.
 #[derive(Debug, Clone)]
 pub enum PoolRef {
+    /// Uniswap V2 pair.
     V2(UniswapV2Pair),
+    /// Uniswap V3 pool.
     V3(UniswapV3Pool),
 }
 
 impl PoolRef {
+    /// Returns the on-chain address of the pool.
     pub fn address(&self) -> &Address {
         match self {
             PoolRef::V2(p) => &p.address,
@@ -23,6 +30,7 @@ impl PoolRef {
         }
     }
 
+    /// Returns the lower-address token in the pool.
     pub fn token0(&self) -> &Token {
         match self {
             PoolRef::V2(p) => &p.token0,
@@ -30,6 +38,7 @@ impl PoolRef {
         }
     }
 
+    /// Returns the higher-address token in the pool.
     pub fn token1(&self) -> &Token {
         match self {
             PoolRef::V2(p) => &p.token1,
@@ -37,6 +46,7 @@ impl PoolRef {
         }
     }
 
+    /// Computes the output amount for a given input using the pool's AMM math.
     pub fn get_amount_out(&self, amount_in: u128, token_in: &Token) -> PricingResult<u128> {
         match self {
             PoolRef::V2(p) => p.get_amount_out(amount_in, token_in),
@@ -44,6 +54,7 @@ impl PoolRef {
         }
     }
 
+    /// Returns the estimated gas cost per hop for this pool type.
     pub fn gas_per_hop(&self) -> u128 {
         match self {
             PoolRef::V2(_) => GAS_PER_HOP,
@@ -51,26 +62,33 @@ impl PoolRef {
         }
     }
 
+    /// Returns `true` if this pool is a Uniswap V3 pool.
     pub fn is_v3(&self) -> bool {
         matches!(self, PoolRef::V3(_))
     }
 }
 
+/// A multi-hop swap route through one or more pools.
 #[derive(Debug, Clone)]
 pub struct Route {
+    /// Pools traversed by the route, in execution order.
     pub pools: Vec<PoolRef>,
+    /// Token path from input to output (length = pools + 1).
     pub path: Vec<Token>,
 }
 
 impl Route {
+    /// Creates a new route from the given pools and token path.
     pub fn new(pools: Vec<PoolRef>, path: Vec<Token>) -> Self {
         Self { pools, path }
     }
 
+    /// Returns the number of hops (pools) in this route.
     pub fn num_hops(&self) -> usize {
         self.pools.len()
     }
 
+    /// Simulates the route end-to-end and returns the final output amount.
     pub fn get_output(&self, amount_in: u128) -> PricingResult<u128> {
         let mut current_amount = amount_in;
         for (i, pool) in self.pools.iter().enumerate() {
@@ -80,6 +98,7 @@ impl Route {
         Ok(current_amount)
     }
 
+    /// Returns intermediate amounts at each hop, including input and final output.
     pub fn get_intermediate_amounts(&self, amount_in: u128) -> PricingResult<Vec<u128>> {
         let mut amounts = Vec::with_capacity(self.num_hops() + 1);
         amounts.push(amount_in);
@@ -93,23 +112,31 @@ impl Route {
         Ok(amounts)
     }
 
+    /// Estimates total gas units required to execute this route.
     pub fn estimate_gas(&self) -> u128 {
         let base = BASE_GAS_COST.min(v3_base_gas());
         let hop_gas: u128 = self.pools.iter().map(|p| p.gas_per_hop()).sum();
         base + hop_gas
     }
 
+    /// Returns `true` if the route includes at least one V3 pool.
     pub fn is_v3_route(&self) -> bool {
         self.pools.iter().any(|p| p.is_v3())
     }
 }
 
+/// Gas-adjusted comparison of a single route's output.
 #[derive(Debug, Clone)]
 pub struct RouteComparison {
+    /// The evaluated route.
     pub route: Route,
+    /// Output before gas deduction.
     pub gross_output: u128,
+    /// Estimated gas units for execution.
     pub gas_estimate: u128,
+    /// Gas cost in ETH wei.
     pub gas_cost_eth: u128,
+    /// Output after deducting gas cost (converted to output token units).
     pub net_output: u128,
 }
 
@@ -122,6 +149,7 @@ struct DfsContext<'a> {
     all_routes: &'a mut Vec<Route>,
 }
 
+/// Finds routes between tokens using a graph of V2 and V3 pools.
 #[derive(Debug, Clone)]
 pub struct RouteFinder {
     pools: Vec<PoolRef>,
@@ -129,11 +157,13 @@ pub struct RouteFinder {
 }
 
 impl RouteFinder {
+    /// Creates a new route finder from the given pool references.
     pub fn new(pools: Vec<PoolRef>) -> Self {
         let graph = Self::build_graph(&pools);
         Self { pools, graph }
     }
 
+    /// Returns the pool references used by this finder.
     pub fn pools(&self) -> &[PoolRef] {
         &self.pools
     }
@@ -155,6 +185,7 @@ impl RouteFinder {
         graph
     }
 
+    /// Finds all routes from `token_in` to `token_out` with at most `max_hops` hops.
     pub fn find_all_routes(
         &self,
         token_in: &Token,
@@ -213,6 +244,7 @@ impl RouteFinder {
         }
     }
 
+    /// Compares all routes by gas-adjusted net output.
     pub fn compare_routes(
         &self,
         token_in: &Token,
@@ -255,6 +287,7 @@ impl RouteFinder {
         comparisons
     }
 
+    /// Returns the route with the highest gas-adjusted net output.
     pub fn find_best_route(
         &self,
         token_in: &Token,

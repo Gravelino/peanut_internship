@@ -66,6 +66,78 @@ pub const ETH_DECIMALS: u8 = 18;
 /// Ticker symbol for the native ETH token.
 pub const ETH_SYMBOL: &str = "ETH";
 
+/// Default HTTP client timeout in seconds for exchange API calls.
+pub const HTTP_TIMEOUT_SECS: u64 = 10;
+
+/// Binance API recvWindow parameter in milliseconds.
+/// See: https://binance-docs.github.io/apidocs/spot/en/#recvwindow
+pub const BINANCE_RECV_WINDOW_MS: u64 = 60_000;
+
+/// Binance API error code: Too many requests (rate limit exceeded).
+pub const BINANCE_ERR_RATE_LIMIT: i64 = -1015;
+/// Binance API error code: Insufficient account balance.
+pub const BINANCE_ERR_INSUFFICIENT_FUNDS: i64 = -2010;
+/// Binance API error code: Invalid symbol.
+pub const BINANCE_ERR_INVALID_SYMBOL: i64 = -1121;
+/// Binance API error code: Invalid quantity / filter failure.
+pub const BINANCE_ERR_INVALID_QUANTITY: i64 = -1013;
+
+/// Binance endpoint weight: ticker/price (1 weight per minute).
+pub const BINANCE_WEIGHT_TICKER_PRICE: u32 = 1;
+/// Binance endpoint weight: server time / connectivity check (1 weight).
+pub const BINANCE_WEIGHT_SERVER_TIME: u32 = 1;
+/// Binance endpoint weight: exchange info (1 weight).
+pub const BINANCE_WEIGHT_EXCHANGE_INFO: u32 = 1;
+/// Binance endpoint weight: order book depth limit ≤ 100 (1 weight).
+pub const BINANCE_WEIGHT_DEPTH_100: u32 = 1;
+/// Binance endpoint weight: order book depth limit ≤ 500 (5 weight).
+pub const BINANCE_WEIGHT_DEPTH_500: u32 = 5;
+/// Binance endpoint weight: order book depth limit ≤ 1000 (10 weight).
+pub const BINANCE_WEIGHT_DEPTH_1000: u32 = 10;
+/// Binance endpoint weight: order book depth limit ≤ 5000 (50 weight).
+pub const BINANCE_WEIGHT_DEPTH_5000: u32 = 50;
+/// Binance endpoint weight: account information (10 weight).
+pub const BINANCE_WEIGHT_ACCOUNT: u32 = 10;
+/// Binance endpoint weight: place/cancel order (1 weight, also counts toward order limit).
+pub const BINANCE_WEIGHT_ORDER: u32 = 1;
+/// Binance endpoint weight: query order status (2 weight).
+pub const BINANCE_WEIGHT_ORDER_STATUS: u32 = 2;
+/// Binance endpoint weight: my trades (5 weight).
+pub const BINANCE_WEIGHT_MY_TRADES: u32 = 5;
+/// Binance endpoint weight: trading fee (1 weight).
+pub const BINANCE_WEIGHT_TRADE_FEE: u32 = 1;
+
+/// Default inventory deviation threshold (in percent) that triggers a rebalance recommendation.
+pub const REBALANCE_DEVIATION_THRESHOLD_PCT: f64 = 30.0;
+
+/// Minimum amount in wei for cross-DEX arb detection (1 ETH).
+pub const MIN_CROSS_DEX_AMOUNT_WEI: u128 = 1_000_000_000_000_000_000;
+
+/// Minimum total hops for a triangular arb to be considered non-trivial.
+pub const MIN_TRIANGULAR_ARB_HOPS: usize = 3;
+
+/// Default retry-after duration in seconds when the server does not provide one.
+pub const DEFAULT_RETRY_AFTER_SECS: u64 = 10;
+
+/// Estimated bid/ask spread used to derive best_bid/best_ask from mid_price (1 bps = 0.01%).
+pub const ESTIMATED_SPREAD_BPS: &str = "0.0001";
+
+/// Default RPC client timeout in seconds for on-chain queries.
+pub const RPC_TIMEOUT_SECS: u64 = 30;
+
+/// Default number of RPC retry attempts for transient failures.
+pub const RPC_RETRIES: usize = 2;
+
+/// Default estimated transfer time in minutes when fee info is unavailable.
+pub const DEFAULT_TRANSFER_TIME_MIN: u32 = 15;
+
+/// Ethereum standard block confirmations for finality (12 blocks ≈ 3 minutes).
+pub const ETH_CONFIRMATIONS: u32 = 12;
+
+/// Precision multiplier for V3 spot price calculation (10^18).
+/// Used to avoid precision loss when converting sqrtPriceX96 to a Decimal ratio.
+pub const V3_PRICE_PRECISION: u128 = 1_000_000_000_000_000_000;
+
 /// Status of an Ethereum transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionStatus {

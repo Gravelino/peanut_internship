@@ -6,6 +6,7 @@ use super::tick;
 use crate::chain::client::ChainClient;
 use crate::core::types::{
     Address, BlockId, DECIMAL_BASE, MAINNET_CHAIN_ID, Token, TokenAmount, TransactionRequest,
+    V3_PRICE_PRECISION,
 };
 use crate::pricing::amm::{decode_address_from_slot, decode_u128_from_slot, fetch_token_metadata};
 use crate::pricing::errors::{PricingError, PricingResult};
@@ -20,42 +21,66 @@ const TOKEN1_SELECTOR: [u8; 4] = [0xd2, 0x12, 0x20, 0xa7];
 
 const SLOT0_RETURN_MIN: usize = EVM_WORD_LEN * 3;
 
+/// Maximum iterations in the V3 swap step loop.
+/// 2 steps covers most in-range swaps; ticks that require more are rare.
 const MAX_SWAP_STEPS: usize = 2;
 
+/// Base gas cost for a V3 swap (pool entry + exit overhead).
+/// Source: Uniswap V3 audit / empirical measurement.
 const V3_BASE_GAS: u128 = 80_000;
+/// Additional gas per tick-crossing hop in a V3 swap.
 const V3_GAS_PER_HOP: u128 = 60_000;
 
+/// Returns the base gas cost for a V3 swap execution.
 pub fn v3_base_gas() -> u128 {
     V3_BASE_GAS
 }
 
+/// Returns the additional gas cost per tick-crossing hop in a V3 swap.
 pub fn v3_gas_per_hop() -> u128 {
     V3_GAS_PER_HOP
 }
 
+/// Uniswap V3 concentrated-liquidity pool. Swap quoting uses tick math.
 #[derive(Debug, Clone)]
 pub struct UniswapV3Pool {
+    /// On-chain address of the pool contract.
     pub address: Address,
+    /// The lower-address token in the pool.
     pub token0: Token,
+    /// The higher-address token in the pool.
     pub token1: Token,
+    /// Pool fee in basis points (e.g. 3000 = 0.3%).
     pub fee_bps: u32,
+    /// Tick spacing for this fee tier.
     pub tick_spacing: i32,
+    /// Current sqrt price as a Q64.96 fixed-point value.
     pub sqrt_price_x96: U256,
+    /// Current active liquidity in the pool.
     pub liquidity: u128,
+    /// Current active tick index.
     pub tick: i32,
 }
 
+/// Result of a V3 swap quote simulation.
 #[derive(Debug, Clone)]
 pub struct V3SwapQuote {
+    /// Input amount consumed (may be less than requested on partial fill).
     pub amount_in: u128,
+    /// Output amount produced in raw token units.
     pub amount_out: u128,
+    /// Sqrt price after the swap (Q64.96).
     pub sqrt_price_after: U256,
+    /// Tick index after the swap.
     pub tick_after: i32,
+    /// Estimated gas units for the swap.
     pub gas_estimate: u64,
+    /// `true` when the swap could not be fully filled within step limits.
     pub is_partial: bool,
 }
 
 impl UniswapV3Pool {
+    /// Creates a new V3 pool. Computes tick spacing from the fee tier.
     pub fn new(
         address: Address,
         token0: Token,
@@ -78,6 +103,7 @@ impl UniswapV3Pool {
         })
     }
 
+    /// Returns the output token for a given input token.
     pub fn token_out_for<'a>(&'a self, token_in: &Token) -> PricingResult<&'a Token> {
         if *token_in == self.token0 {
             Ok(&self.token1)
@@ -88,15 +114,16 @@ impl UniswapV3Pool {
         }
     }
 
+    /// Returns the spot price of `token_in` in terms of the other token (display-only).
     pub fn get_spot_price(&self, token_in: &Token) -> PricingResult<Decimal> {
         let token_out = self.token_out_for(token_in)?;
 
         let sqrt_price = self.sqrt_price_x96;
         let q96 = math::q96();
-        let prec = U256::from(10_000_000_000_000_000_000u128);
+        let prec = U256::from(V3_PRICE_PRECISION);
 
         let ratio_scaled = (sqrt_price * prec / q96).as_u128();
-        let ratio = Decimal::from(ratio_scaled) / Decimal::from(10_000_000_000_000_000_000u128);
+        let ratio = Decimal::from(ratio_scaled) / Decimal::from(V3_PRICE_PRECISION);
         let price_human = ratio * ratio;
 
         let scale_in = Decimal::from(DECIMAL_BASE.pow(token_in.decimals as u32));
@@ -111,6 +138,7 @@ impl UniswapV3Pool {
         }
     }
 
+    /// Quotes a single-direction swap, simulating tick crossings up to `MAX_SWAP_STEPS`.
     pub fn quote_swap(&self, amount_in: u128, token_in: &Token) -> PricingResult<V3SwapQuote> {
         if amount_in == 0 {
             return Err(PricingError::ZeroAmountIn);
@@ -195,10 +223,12 @@ impl UniswapV3Pool {
         })
     }
 
+    /// Estimates gas units for a V3 swap with the given number of hops.
     pub fn estimate_gas(num_hops: usize) -> u128 {
         V3_BASE_GAS + V3_GAS_PER_HOP * (num_hops as u128)
     }
 
+    /// Fetches full pool state and token metadata from an on-chain V3 contract.
     pub async fn from_chain(address: Address, client: &ChainClient) -> PricingResult<Self> {
         let call = |data: Vec<u8>| {
             TransactionRequest::contract_call(address.clone(), data, MAINNET_CHAIN_ID)
@@ -228,7 +258,10 @@ impl UniswapV3Pool {
         let liquidity = if liquidity_raw.len() >= EVM_WORD_LEN {
             decode_u128_from_slot(&liquidity_raw[0..EVM_WORD_LEN])?
         } else {
-            0
+            return Err(PricingError::AbiDecode(format!(
+                "liquidity returned {} bytes, expected {EVM_WORD_LEN}",
+                liquidity_raw.len()
+            )));
         };
 
         let fee_raw = client
@@ -242,7 +275,10 @@ impl UniswapV3Pool {
                 .map_err(|_| PricingError::AbiDecode("fee slot conversion".into()))?;
             U256::from_big_endian(&bytes).as_u64() as u32
         } else {
-            3000
+            return Err(PricingError::AbiDecode(format!(
+                "fee returned {} bytes, expected {EVM_WORD_LEN}",
+                fee_raw.len()
+            )));
         };
         let fee_bps = fee_24bit;
 
@@ -273,6 +309,7 @@ impl UniswapV3Pool {
         )
     }
 
+    /// Fetches only `(sqrt_price_x96, liquidity, tick)` from an on-chain V3 pool.
     pub async fn fetch_state(
         address: &Address,
         client: &ChainClient,
@@ -427,5 +464,59 @@ mod tests {
 
         let result = UniswapV3Pool::from_chain(addr, &client).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_v3_pool_new_computes_tick_spacing() {
+        let pool = mock_v3_pool(0, 1_000_000, 3000);
+        assert_eq!(pool.tick_spacing, 60);
+    }
+
+    #[test]
+    fn test_v3_pool_new_tick_spacing_500() {
+        let pool = mock_v3_pool(0, 1_000_000, 500);
+        assert_eq!(pool.tick_spacing, 10);
+    }
+
+    #[test]
+    fn test_v3_pool_new_tick_spacing_10000() {
+        let pool = mock_v3_pool(0, 1_000_000, 10000);
+        assert_eq!(pool.tick_spacing, 200);
+    }
+
+    #[test]
+    fn test_v3_pool_quote_swap_zero_liquidity_returns_zero() {
+        let pool = mock_v3_pool(0, 0, 3000);
+        let quote = pool.quote_swap(1_000_000, &pool.token0).unwrap();
+        assert_eq!(quote.amount_out, 0);
+    }
+
+    #[test]
+    fn test_v3_pool_token_out_for_returns_correct_token() {
+        let pool = mock_v3_pool(0, 1_000_000, 3000);
+        assert_eq!(*pool.token_out_for(&pool.token0).unwrap(), pool.token1);
+        assert_eq!(*pool.token_out_for(&pool.token1).unwrap(), pool.token0);
+    }
+
+    #[test]
+    fn test_v3_pool_token_out_for_unknown_returns_error() {
+        let pool = mock_v3_pool(0, 1_000_000, 3000);
+        let unknown = mock_token("FOO", "0x00000000000000000000000000000000000000ff", 18);
+        assert!(pool.token_out_for(&unknown).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_v3_fetch_state_fails_without_node() {
+        let client = ChainClient::new(vec!["http://127.0.0.1:1".to_string()], 1, 0).unwrap();
+        let addr = Address::new("0x0000000000000000000000000000000000000001").unwrap();
+        let result = UniswapV3Pool::fetch_state(&addr, &client).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_v3_gas_estimate_increases_with_hops() {
+        let gas1 = UniswapV3Pool::estimate_gas(1);
+        let gas2 = UniswapV3Pool::estimate_gas(2);
+        assert!(gas2 > gas1);
     }
 }

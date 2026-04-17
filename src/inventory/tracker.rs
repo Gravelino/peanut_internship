@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::core::types::REBALANCE_DEVIATION_THRESHOLD_PCT;
 use crate::exchange::types::{
     CanExecuteResult, NormalizedBalance, PortfolioSnapshot, SkewResult, VenueSkew,
 };
@@ -16,6 +17,7 @@ struct VenueBalance {
     locked: Decimal,
 }
 
+/// Tracks asset balances across multiple venues and provides skew/rebalance analysis.
 #[derive(Debug, Clone)]
 pub struct InventoryTracker {
     balances: HashMap<(Venue, String), VenueBalance>,
@@ -23,6 +25,7 @@ pub struct InventoryTracker {
 }
 
 impl InventoryTracker {
+    /// Creates a new tracker for the given list of venues.
     pub fn new(venues: Vec<Venue>) -> Self {
         Self {
             balances: HashMap::new(),
@@ -30,10 +33,12 @@ impl InventoryTracker {
         }
     }
 
+    /// Returns the list of venues this tracker monitors.
     pub fn venues(&self) -> &[Venue] {
         &self.venues
     }
 
+    /// Replaces all balances for a CEX venue with fresh data.
     pub fn update_from_cex(&mut self, venue: Venue, balances: HashMap<String, NormalizedBalance>) {
         let keys_to_remove: Vec<(Venue, String)> = self
             .balances
@@ -58,6 +63,7 @@ impl InventoryTracker {
         debug!(venue = %venue, "Updated CEX balances");
     }
 
+    /// Replaces all balances for a wallet venue with fresh data (no locked amounts).
     pub fn update_from_wallet(&mut self, venue: Venue, balances: HashMap<String, Decimal>) {
         let keys_to_remove: Vec<(Venue, String)> = self
             .balances
@@ -82,6 +88,7 @@ impl InventoryTracker {
         debug!(venue = %venue, "Updated wallet balances");
     }
 
+    /// Produces a portfolio snapshot with per-venue breakdowns and a USD total.
     pub fn snapshot(&self, prices: &HashMap<String, Decimal>) -> PortfolioSnapshot {
         let timestamp = chrono::Utc::now();
         let mut venues_map: HashMap<String, HashMap<String, NormalizedBalance>> = HashMap::new();
@@ -125,20 +132,21 @@ impl InventoryTracker {
         }
     }
 
-    pub fn get_available(&self, venue: Venue, asset: &str) -> Decimal {
+    /// Returns the free (unlocked) balance for an asset at a venue, if known.
+    pub fn get_available(&self, venue: Venue, asset: &str) -> Option<Decimal> {
         self.balances
             .get(&(venue, asset.to_string()))
             .map(|b| b.free)
-            .unwrap_or(Decimal::ZERO)
     }
 
-    pub fn get_total(&self, venue: Venue, asset: &str) -> Decimal {
+    /// Returns the total (free + locked) balance for an asset at a venue, if known.
+    pub fn get_total(&self, venue: Venue, asset: &str) -> Option<Decimal> {
         self.balances
             .get(&(venue, asset.to_string()))
             .map(|b| b.free + b.locked)
-            .unwrap_or(Decimal::ZERO)
     }
 
+    /// Checks whether an arb trade can be executed given available balances on both venues.
     pub fn can_execute(
         &self,
         buy_venue: Venue,
@@ -148,8 +156,14 @@ impl InventoryTracker {
         sell_asset: &str,
         sell_amount: Decimal,
     ) -> CanExecuteResult {
-        let buy_available = self.get_available(buy_venue, buy_asset);
-        let sell_available = self.get_available(sell_venue, sell_asset);
+        let buy_available = self.get_available(buy_venue, buy_asset).unwrap_or_else(|| {
+            warn!(venue = %buy_venue, asset = buy_asset, "No balance data loaded, treating available as zero");
+            Decimal::ZERO
+        });
+        let sell_available = self.get_available(sell_venue, sell_asset).unwrap_or_else(|| {
+            warn!(venue = %sell_venue, asset = sell_asset, "No balance data loaded, treating available as zero");
+            Decimal::ZERO
+        });
 
         let buy_ok = buy_available >= buy_amount;
         let sell_ok = sell_available >= sell_amount;
@@ -183,6 +197,7 @@ impl InventoryTracker {
         }
     }
 
+    /// Adjusts balances to reflect a completed trade (buy or sell) and its fee.
     #[allow(clippy::too_many_arguments)]
     pub fn record_trade(
         &mut self,
@@ -245,11 +260,15 @@ impl InventoryTracker {
         Ok(())
     }
 
+    /// Computes per-venue distribution skew for a single asset.
     pub fn skew(&self, asset: &str) -> SkewResult {
         let mut venue_amounts: HashMap<String, Decimal> = HashMap::new();
 
         for venue in &self.venues {
-            let total = self.get_total(*venue, asset);
+            let total = self.get_total(*venue, asset).unwrap_or_else(|| {
+                warn!(venue = %venue, asset, "No balance data loaded, treating total as zero");
+                Decimal::ZERO
+            });
             venue_amounts.insert(venue.to_string(), total);
         }
 
@@ -288,7 +307,7 @@ impl InventoryTracker {
             );
         }
 
-        let needs_rebalance = max_deviation > 30.0;
+        let needs_rebalance = max_deviation > REBALANCE_DEVIATION_THRESHOLD_PCT;
 
         SkewResult {
             asset: asset.to_string(),
@@ -299,6 +318,7 @@ impl InventoryTracker {
         }
     }
 
+    /// Returns skew results for every tracked asset, sorted by asset name.
     pub fn get_skews(&self) -> Vec<SkewResult> {
         let mut assets = std::collections::HashSet::new();
         for (_, asset) in self.balances.keys() {
@@ -443,11 +463,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            tracker.get_available(Venue::Binance, "ETH"),
+            tracker.get_available(Venue::Binance, "ETH").unwrap(),
             Decimal::from(12)
         );
         assert_eq!(
-            tracker.get_available(Venue::Binance, "USDT"),
+            tracker.get_available(Venue::Binance, "USDT").unwrap(),
             Decimal::from(15996)
         );
     }
@@ -508,5 +528,170 @@ mod tests {
         let assets: Vec<&str> = skews.iter().map(|s| s.asset.as_str()).collect();
         assert!(assets.contains(&"ETH"));
         assert!(assets.contains(&"USDT"));
+    }
+
+    #[test]
+    fn test_record_trade_unknown_side_returns_error() {
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut bals = HashMap::new();
+        bals.insert(
+            "ETH".into(),
+            NormalizedBalance {
+                free: Decimal::from(10),
+                locked: Decimal::ZERO,
+                total: Decimal::from(10),
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, bals);
+
+        let result = tracker.record_trade(
+            Venue::Binance,
+            "short",
+            "ETH",
+            "USDT",
+            Decimal::from(1),
+            Decimal::from(2000),
+            Decimal::ZERO,
+            "USDT",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown side"));
+    }
+
+    #[test]
+    fn test_adjust_balance_negative_returns_error() {
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut bals = HashMap::new();
+        bals.insert(
+            "ETH".into(),
+            NormalizedBalance {
+                free: Decimal::from(1),
+                locked: Decimal::ZERO,
+                total: Decimal::from(1),
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, bals);
+
+        let result = tracker.record_trade(
+            Venue::Binance,
+            "sell",
+            "ETH",
+            "USDT",
+            Decimal::from(5),
+            Decimal::from(10000),
+            Decimal::ZERO,
+            "USDT",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("negative") || msg.contains("Negative"));
+    }
+
+    #[test]
+    fn test_get_available_returns_none_for_unknown() {
+        let tracker = InventoryTracker::new(vec![Venue::Binance]);
+        assert!(tracker.get_available(Venue::Binance, "ETH").is_none());
+    }
+
+    #[test]
+    fn test_get_total_returns_none_for_unknown() {
+        let tracker = InventoryTracker::new(vec![Venue::Binance]);
+        assert!(tracker.get_total(Venue::Binance, "ETH").is_none());
+    }
+
+    #[test]
+    fn test_get_available_returns_some_for_known() {
+        let tracker = setup_tracker();
+        assert!(tracker.get_available(Venue::Binance, "ETH").is_some());
+        assert_eq!(
+            tracker.get_available(Venue::Binance, "ETH").unwrap(),
+            Decimal::from(5)
+        );
+    }
+
+    #[test]
+    fn test_get_total_includes_locked() {
+        let tracker = setup_tracker();
+        let total = tracker.get_total(Venue::Binance, "USDT").unwrap();
+        assert_eq!(total, Decimal::from(20500));
+    }
+
+    #[test]
+    fn test_can_execute_no_balance_data_returns_zero_available() {
+        let tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let result = tracker.can_execute(
+            Venue::Binance,
+            "ETH",
+            Decimal::from(1),
+            Venue::Wallet,
+            "ETH",
+            Decimal::from(1),
+        );
+        assert!(!result.can_execute);
+        assert!(result.reason.is_some());
+        assert_eq!(result.buy_venue_available, Decimal::ZERO);
+        assert_eq!(result.sell_venue_available, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_can_execute_insufficient_on_both_venues() {
+        let tracker = setup_tracker();
+        let result = tracker.can_execute(
+            Venue::Binance,
+            "USDT",
+            Decimal::from(50000),
+            Venue::Wallet,
+            "ETH",
+            Decimal::from(100),
+        );
+        assert!(!result.can_execute);
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("both venues"));
+    }
+
+    #[test]
+    fn test_record_trade_sell_adjusts_correctly() {
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut bals = HashMap::new();
+        bals.insert(
+            "ETH".into(),
+            NormalizedBalance {
+                free: Decimal::from(10),
+                locked: Decimal::ZERO,
+                total: Decimal::from(10),
+            },
+        );
+        bals.insert(
+            "USDT".into(),
+            NormalizedBalance {
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+                total: Decimal::ZERO,
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, bals);
+
+        tracker
+            .record_trade(
+                Venue::Binance,
+                "sell",
+                "ETH",
+                "USDT",
+                Decimal::from(2),
+                Decimal::from(4000),
+                Decimal::from(4),
+                "USDT",
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker.get_available(Venue::Binance, "ETH").unwrap(),
+            Decimal::from(8)
+        );
+        assert_eq!(
+            tracker.get_available(Venue::Binance, "USDT").unwrap(),
+            Decimal::from(3996)
+        );
     }
 }

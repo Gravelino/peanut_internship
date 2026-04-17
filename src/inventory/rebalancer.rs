@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
-use rust_decimal::Decimal;
-use tracing::info;
-
+use crate::core::types::DEFAULT_TRANSFER_TIME_MIN;
 use crate::inventory::tracker::InventoryTracker;
 use crate::inventory::types::{
-    min_operating_balance, transfer_fees, CostEstimate, TransferPlan, Venue,
+    CostEstimate, TransferPlan, Venue, min_operating_balance, transfer_fees,
 };
+use rust_decimal::Decimal;
+use tracing::{info, warn};
 
+/// Plans asset transfers to rebalance inventory across venues.
 #[derive(Debug, Clone)]
 pub struct RebalancePlanner {
     tracker: InventoryTracker,
@@ -18,6 +19,7 @@ pub struct RebalancePlanner {
 }
 
 impl RebalancePlanner {
+    /// Creates a planner with equal target ratios across all tracked venues.
     pub fn new(tracker: InventoryTracker, threshold_pct: f64) -> Self {
         let num_venues = tracker.venues().len().max(1) as f64;
         let target_ratio = tracker
@@ -33,10 +35,12 @@ impl RebalancePlanner {
         }
     }
 
+    /// Returns a reference to the underlying inventory tracker.
     pub fn tracker(&self) -> &InventoryTracker {
         &self.tracker
     }
 
+    /// Creates a planner with custom per-venue target ratios.
     pub fn with_target_ratio(
         tracker: InventoryTracker,
         threshold_pct: f64,
@@ -49,6 +53,7 @@ impl RebalancePlanner {
         }
     }
 
+    /// Returns a JSON-like summary of skew status for every tracked asset.
     pub fn check_all(&self) -> Vec<HashMap<String, serde_json::Value>> {
         let skews = self.tracker.get_skews();
         skews
@@ -69,6 +74,7 @@ impl RebalancePlanner {
             .collect()
     }
 
+    /// Generates transfer plans to rebalance a single asset across venues.
     pub fn plan(&self, asset: &str) -> Vec<TransferPlan> {
         let skew = self.tracker.skew(asset);
 
@@ -80,11 +86,22 @@ impl RebalancePlanner {
         let min_op = min_operating_balance();
 
         let fee_info = fees.get(asset);
-        let min_withdrawal = fee_info.map(|f| f.min_withdrawal).unwrap_or(Decimal::ZERO);
-        let withdrawal_fee = fee_info.map(|f| f.withdrawal_fee).unwrap_or(Decimal::ZERO);
-        let est_time = fee_info.map(|f| f.estimated_time_min).unwrap_or(15);
+        let min_withdrawal = fee_info.map(|f| f.min_withdrawal).unwrap_or_else(|| {
+            warn!(asset, "No transfer fee info, assuming zero min_withdrawal");
+            Decimal::ZERO
+        });
+        let withdrawal_fee = fee_info.map(|f| f.withdrawal_fee).unwrap_or_else(|| {
+            warn!(asset, "No transfer fee info, assuming zero withdrawal_fee");
+            Decimal::ZERO
+        });
+        let est_time = fee_info
+            .map(|f| f.estimated_time_min)
+            .unwrap_or(DEFAULT_TRANSFER_TIME_MIN);
 
-        let min_balance = min_op.get(asset).copied().unwrap_or(Decimal::ZERO);
+        let min_balance = min_op.get(asset).copied().unwrap_or_else(|| {
+            warn!(asset, "No min operating balance configured, assuming zero");
+            Decimal::ZERO
+        });
 
         let total = skew.total;
         if total <= Decimal::ZERO {
@@ -111,7 +128,10 @@ impl RebalancePlanner {
         let mut plans = Vec::new();
 
         for (from_venue, surplus) in &surplus_venues {
-            let from_current = self.tracker.get_total(*from_venue, asset);
+            let from_current = self.tracker.get_total(*from_venue, asset).unwrap_or_else(|| {
+                warn!(venue = %from_venue, asset, "No balance data for source venue, treating total as zero");
+                Decimal::ZERO
+            });
             let max_without_min = from_current - min_balance;
             if max_without_min <= Decimal::ZERO {
                 continue;
@@ -135,7 +155,10 @@ impl RebalancePlanner {
                     continue;
                 }
 
-                let from_current = self.tracker.get_total(*from_venue, asset);
+                let from_current = self.tracker.get_total(*from_venue, asset).unwrap_or_else(|| {
+                    warn!(venue = %from_venue, asset, "No balance data for source venue, treating total as zero");
+                    Decimal::ZERO
+                });
                 if from_current - amount < min_balance {
                     continue;
                 }
@@ -164,6 +187,7 @@ impl RebalancePlanner {
         plans
     }
 
+    /// Generates transfer plans for every asset that needs rebalancing.
     pub fn plan_all(&self) -> HashMap<String, Vec<TransferPlan>> {
         let skews = self.tracker.get_skews();
         let mut result = HashMap::new();
@@ -180,6 +204,7 @@ impl RebalancePlanner {
         result
     }
 
+    /// Estimates total fees, time, and affected assets for a set of transfer plans.
     pub fn estimate_cost(
         &self,
         plans: &[TransferPlan],
@@ -192,7 +217,13 @@ impl RebalancePlanner {
 
         for plan in plans {
             assets.insert(plan.asset.clone());
-            let price = prices.get(&plan.asset).copied().unwrap_or(Decimal::ZERO);
+            let price = match prices.get(&plan.asset).copied() {
+                Some(p) => p,
+                None => {
+                    warn!(asset = %plan.asset, "Missing price for cost estimation, skipping");
+                    continue;
+                }
+            };
             total_fees_usd += plan.estimated_fee * price;
             max_time = max_time.max(plan.estimated_time_min);
         }
@@ -339,6 +370,67 @@ mod tests {
             let cost = planner.estimate_cost(&plans, &prices);
             assert_eq!(cost.total_transfers, plans.len());
             assert!(cost.total_fees_usd > Decimal::ZERO);
+        }
+    }
+
+    #[test]
+    fn test_estimate_cost_skips_missing_prices() {
+        let planner = setup_imbalanced();
+        let plans = planner.plan("ETH");
+        if !plans.is_empty() {
+            let prices: HashMap<String, Decimal> = HashMap::new();
+            let cost = planner.estimate_cost(&plans, &prices);
+            assert_eq!(cost.total_fees_usd, Decimal::ZERO);
+        }
+    }
+
+    #[test]
+    fn test_plan_empty_when_total_zero() {
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut binance_bals = HashMap::new();
+        binance_bals.insert(
+            "ETH".into(),
+            NormalizedBalance {
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+                total: Decimal::ZERO,
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, binance_bals);
+        let mut wallet_bals = HashMap::new();
+        wallet_bals.insert("ETH".into(), Decimal::ZERO);
+        tracker.update_from_wallet(Venue::Wallet, wallet_bals);
+
+        let planner = RebalancePlanner::new(tracker, 30.0);
+        let plans = planner.plan("ETH");
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn test_check_all_returns_entries_for_all_assets() {
+        let planner = setup_imbalanced();
+        let checks = planner.check_all();
+        assert!(checks.len() >= 2);
+    }
+
+    #[test]
+    fn test_plan_all_returns_only_skewed() {
+        let planner = setup_imbalanced();
+        let plans = planner.plan_all();
+        let eth_plans = plans.get("ETH");
+        assert!(eth_plans.is_some());
+    }
+
+    #[test]
+    fn test_estimate_cost_partial_prices() {
+        let planner = setup_imbalanced();
+        let plans = planner.plan("ETH");
+        if !plans.is_empty() {
+            let mut prices = HashMap::new();
+            prices.insert("ETH".into(), Decimal::from(2000));
+            let cost_with = planner.estimate_cost(&plans, &prices);
+            let cost_without = planner.estimate_cost(&plans, &HashMap::new());
+            assert!(cost_with.total_fees_usd > cost_without.total_fees_usd);
         }
     }
 }

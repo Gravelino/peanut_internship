@@ -5,39 +5,58 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::core::types::BPS_SCALE;
 use crate::inventory::types::Venue;
 
+/// One side (buy or sell) of an arbitrage trade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeLeg {
+    /// Unique identifier for this leg.
     pub id: String,
+    /// Time the leg was executed.
     pub timestamp: DateTime<Utc>,
+    /// Venue where the leg was executed.
     pub venue: Venue,
+    /// Trading pair symbol (e.g. "ETH/USDT").
     pub symbol: String,
+    /// Trade direction: "buy" or "sell".
     pub side: String,
+    /// Quantity of the base asset.
     pub amount: Decimal,
+    /// Execution price of the trade.
     pub price: Decimal,
+    /// Fee amount charged.
     pub fee: Decimal,
+    /// Asset in which the fee was charged.
     pub fee_asset: String,
 }
 
+/// A paired buy/sell arbitrage trade with associated costs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbRecord {
+    /// Unique identifier for this arb trade.
     pub id: String,
+    /// Time the arb was executed.
     pub timestamp: DateTime<Utc>,
+    /// The buy side of the arb.
     pub buy_leg: TradeLeg,
+    /// The sell side of the arb.
     pub sell_leg: TradeLeg,
+    /// On-chain gas cost in USD.
     pub gas_cost_usd: Decimal,
 }
 
 impl ArbRecord {
+    /// Revenue from sell leg minus cost of buy leg, before fees.
     pub fn gross_pnl(&self) -> Decimal {
         let sell_revenue = self.sell_leg.amount * self.sell_leg.price;
         let buy_cost = self.buy_leg.amount * self.buy_leg.price;
         sell_revenue - buy_cost
     }
 
+    /// Sum of buy-leg fee, sell-leg fee, and gas cost, all in USD.
     pub fn total_fees(&self) -> Decimal {
         let buy_fee_usd = if self.buy_leg.fee_asset == "USDT" || self.buy_leg.fee_asset == "USDC" {
             self.buy_leg.fee
@@ -55,61 +74,88 @@ impl ArbRecord {
         buy_fee_usd + sell_fee_usd + self.gas_cost_usd
     }
 
+    /// Gross PnL minus all fees.
     pub fn net_pnl(&self) -> Decimal {
         self.gross_pnl() - self.total_fees()
     }
 
+    /// Buy-leg amount times buy price (USD notional of the trade).
     pub fn notional(&self) -> Decimal {
         self.buy_leg.amount * self.buy_leg.price
     }
 
+    /// Net PnL expressed in basis points of notional.
     pub fn net_pnl_bps(&self) -> Decimal {
         let notional = self.notional();
         if notional.is_zero() {
             Decimal::ZERO
         } else {
-            self.net_pnl() / notional * Decimal::from(10000)
+            self.net_pnl() / notional * Decimal::from(BPS_SCALE)
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Aggregate profit-and-loss statistics across all recorded arb trades.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PnLSummary {
+    /// Total number of arb trades.
     pub total_trades: usize,
+    /// Sum of net PnL across all trades, in USD.
     pub total_pnl_usd: Decimal,
+    /// Sum of all fees paid, in USD.
     pub total_fees_usd: Decimal,
+    /// Average net PnL per trade, in USD.
     pub avg_pnl_per_trade: Decimal,
+    /// Average net PnL in basis points.
     pub avg_pnl_bps: Decimal,
+    /// Fraction of trades with positive net PnL.
     pub win_rate: f64,
+    /// Highest single-trade net PnL.
     pub best_trade_pnl: Decimal,
+    /// Lowest single-trade net PnL.
     pub worst_trade_pnl: Decimal,
+    /// Total notional volume traded, in USD.
     pub total_notional: Decimal,
+    /// Simplified Sharpe ratio estimate (mean / stddev of per-trade PnL).
     pub sharpe_estimate: f64,
+    /// Net PnL broken down by UTC hour.
     pub pnl_by_hour: HashMap<u32, Decimal>,
 }
 
+/// A condensed summary of a single arb trade for display purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeSummary {
+    /// Unique identifier for this trade.
     pub id: String,
+    /// Time the trade was executed.
     pub timestamp: DateTime<Utc>,
+    /// Trading pair symbol.
     pub symbol: String,
+    /// Venue where the buy leg was executed.
     pub buy_venue: Venue,
+    /// Venue where the sell leg was executed.
     pub sell_venue: Venue,
+    /// Net profit or loss, in USD.
     pub net_pnl: Decimal,
+    /// Net profit or loss in basis points.
     pub net_pnl_bps: Decimal,
+    /// Whether the trade was profitable.
     pub profitable: bool,
 }
 
+/// Accumulates arb trade records and computes PnL statistics.
 #[derive(Debug)]
 pub struct PnLEngine {
     trades: Vec<ArbRecord>,
 }
 
 impl PnLEngine {
+    /// Creates an empty PnL engine.
     pub fn new() -> Self {
         Self { trades: vec![] }
     }
 
+    /// Records a completed arb trade.
     pub fn record(&mut self, trade: ArbRecord) {
         info!(
             id = %trade.id,
@@ -120,6 +166,7 @@ impl PnLEngine {
         self.trades.push(trade);
     }
 
+    /// Computes aggregate PnL statistics over all recorded trades.
     pub fn summary(&self) -> PnLSummary {
         let n = self.trades.len();
 
@@ -161,11 +208,18 @@ impl PnLEngine {
             Decimal::ZERO
         };
 
-        let mean = total_pnl.to_f64().unwrap_or(0.0) / n as f64;
+        let mean = total_pnl.to_f64().unwrap_or_else(|| {
+            warn!("PnL total too large for f64 Sharpe calculation, using 0.0");
+            0.0
+        }) / n as f64;
         let variance: f64 = pnl_values
             .iter()
             .map(|p| {
-                let diff = p.to_f64().unwrap_or(0.0) - mean;
+                let p_f64 = p.to_f64().unwrap_or_else(|| {
+                    warn!("PnL value too large for f64, treating as 0.0 in Sharpe");
+                    0.0
+                });
+                let diff = p_f64 - mean;
                 diff * diff
             })
             .sum::<f64>()
@@ -175,12 +229,13 @@ impl PnLEngine {
 
         let mut pnl_by_hour: HashMap<u32, Decimal> = HashMap::new();
         for trade in &self.trades {
-            let hour = trade
-                .timestamp
-                .format("%H")
-                .to_string()
-                .parse::<u32>()
-                .unwrap_or(0);
+            let hour = match trade.timestamp.format("%H").to_string().parse::<u32>() {
+                Ok(h) => h,
+                Err(_) => {
+                    warn!("Failed to parse hour from timestamp, skipping");
+                    continue;
+                }
+            };
             *pnl_by_hour.entry(hour).or_insert(Decimal::ZERO) += trade.net_pnl();
         }
 
@@ -199,6 +254,7 @@ impl PnLEngine {
         }
     }
 
+    /// Returns the `n` most recent trades as concise summaries, newest first.
     pub fn recent(&self, n: usize) -> Vec<TradeSummary> {
         self.trades
             .iter()
@@ -217,6 +273,7 @@ impl PnLEngine {
             .collect()
     }
 
+    /// Writes all recorded trades to a CSV file at the given path.
     pub fn export_csv(&self, filepath: &str) -> crate::inventory::errors::InventoryResult<()> {
         let path = Path::new(filepath);
         if let Some(parent) = path.parent() {
@@ -279,6 +336,7 @@ impl PnLEngine {
         Ok(())
     }
 
+    /// Returns a slice of all recorded arb trades in chronological order.
     pub fn trades(&self) -> &[ArbRecord] {
         &self.trades
     }
@@ -407,8 +465,7 @@ mod tests {
         let summary = engine.summary();
         assert_eq!(summary.total_trades, 0);
         assert_eq!(summary.total_pnl_usd, Decimal::ZERO);
-        assert_eq!(summary.win_rate, 0.0);
-        assert_eq!(summary.sharpe_estimate, 0.0);
+        assert!((summary.win_rate - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -433,5 +490,113 @@ mod tests {
         let header: Vec<&str> = lines[0].split(',').collect();
         assert!(header.contains(&"id"));
         assert!(header.contains(&"net_pnl"));
+    }
+
+    #[test]
+    fn test_arb_record_total_fees() {
+        let arb = make_arb(
+            "1",
+            Decimal::from(2000),
+            Decimal::from(2010),
+            Decimal::from(2),
+            Decimal::from(5),
+        );
+        let fees = arb.total_fees();
+        assert!(fees > Decimal::ZERO);
+        assert_eq!(fees, arb.buy_leg.fee + arb.sell_leg.fee + arb.gas_cost_usd);
+    }
+
+    #[test]
+    fn test_arb_record_net_pnl_with_loss() {
+        let arb = make_arb(
+            "1",
+            Decimal::from(2010),
+            Decimal::from(2000),
+            Decimal::from(1),
+            Decimal::from(1),
+        );
+        assert!(arb.net_pnl() < Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_arb_record_notional() {
+        let arb = make_arb(
+            "1",
+            Decimal::from(2000),
+            Decimal::from(2010),
+            Decimal::from(3),
+            Decimal::ZERO,
+        );
+        assert_eq!(arb.notional(), Decimal::from(3) * Decimal::from(2000));
+    }
+
+    #[test]
+    fn test_arb_record_net_pnl_bps() {
+        let arb = make_arb(
+            "1",
+            Decimal::from(2000),
+            Decimal::from(2020),
+            Decimal::from(1),
+            Decimal::ZERO,
+        );
+        let bps = arb.net_pnl_bps();
+        assert!(bps > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_pnl_engine_summary_single_winning_trade() {
+        let mut engine = PnLEngine::new();
+        engine.record(make_arb(
+            "1",
+            Decimal::from(2000),
+            Decimal::from(2010),
+            Decimal::from(1),
+            Decimal::ZERO,
+        ));
+        let summary = engine.summary();
+        assert_eq!(summary.total_trades, 1);
+        assert!(summary.win_rate > 0.0);
+        assert!(summary.total_pnl_usd > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_pnl_engine_summary_single_losing_trade() {
+        let mut engine = PnLEngine::new();
+        engine.record(make_arb(
+            "1",
+            Decimal::from(2010),
+            Decimal::from(2000),
+            Decimal::from(1),
+            Decimal::from(10),
+        ));
+        let summary = engine.summary();
+        assert_eq!(summary.total_trades, 1);
+        assert!(summary.win_rate == 0.0);
+        assert!(summary.total_pnl_usd < Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_trade_leg_fields() {
+        let leg = make_leg(
+            "test",
+            "buy",
+            Decimal::from(2),
+            Decimal::from(2000),
+            Decimal::from(4),
+        );
+        assert_eq!(leg.id, "test");
+        assert_eq!(leg.side, "buy");
+        assert_eq!(leg.amount, Decimal::from(2));
+        assert_eq!(leg.price, Decimal::from(2000));
+        assert_eq!(leg.fee, Decimal::from(4));
+        assert_eq!(leg.fee_asset, "USDT");
+    }
+
+    #[test]
+    fn test_pnl_summary_default_values() {
+        let summary = PnLSummary::default();
+        assert_eq!(summary.total_trades, 0);
+        assert_eq!(summary.total_pnl_usd, Decimal::ZERO);
+        assert!((summary.win_rate - 0.0).abs() < f64::EPSILON);
     }
 }

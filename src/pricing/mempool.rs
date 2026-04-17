@@ -207,7 +207,10 @@ impl MempoolMonitor {
         let router = Address::from_eth_address(router_raw);
         let sender = Address::from_eth_address(tx.from);
 
-        let gas_price = tx.gas_price.unwrap_or_default();
+        let gas_price = tx.gas_price.unwrap_or_else(|| {
+            tracing::debug!(tx_hash = %format!("{:x}", tx.hash), "No gas_price (likely EIP-1559 tx), using zero for gas cost estimation");
+            U256::zero()
+        });
         let context = SwapContext {
             tx_hash,
             router,
@@ -555,5 +558,107 @@ mod tests {
         bad_data.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         let tx = tx_with_input(bad_data, Some(U256::from(1u64)));
         assert!(MempoolMonitor::parse_transaction(&tx).is_none());
+    }
+
+    #[test]
+    fn test_slippage_tolerance_returns_none_stub() {
+        let swap = ParsedSwap {
+            tx_hash: "0xabc".into(),
+            router: Address::new("0x0000000000000000000000000000000000000009").unwrap(),
+            dex: "UniswapV2".into(),
+            method: "swapExactTokensForTokens".into(),
+            token_in: Some(Address::new("0x0000000000000000000000000000000000000001").unwrap()),
+            token_out: Some(Address::new("0x0000000000000000000000000000000000000002").unwrap()),
+            amount_in: U256::from(1000u64),
+            min_amount_out: U256::from(900u64),
+            deadline: U256::from(1712690000u64),
+            sender: Address::new("0x0000000000000000000000000000000000000010").unwrap(),
+            gas_price: U256::from(20000000000u64),
+        };
+        assert!(swap.slippage_tolerance().is_none());
+    }
+
+    #[test]
+    fn test_decode_v2_eth_for_tokens() {
+        let amount_out_min = U256::from(900);
+        let token_out_addr = H160::from_low_u64_be(2);
+        let to_addr = H160::from_low_u64_be(3);
+        let deadline = U256::from(1712690000u64);
+
+        let path = [H160::from_low_u64_be(0), token_out_addr];
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&ethers::abi::encode(&[
+            ethers::abi::Token::Uint(amount_out_min),
+            ethers::abi::Token::Array(
+                path.iter()
+                    .map(|a| ethers::abi::Token::Address(*a))
+                    .collect(),
+            ),
+            ethers::abi::Token::Address(to_addr),
+            ethers::abi::Token::Uint(deadline),
+        ]));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&hex::decode("7ff36ab5").unwrap());
+        data.extend_from_slice(&payload);
+
+        let tx = Transaction {
+            hash: H256::random(),
+            to: Some(H160::random()),
+            from: H160::random(),
+            input: data.into(),
+            value: U256::from(1_000_000_000_000_000_000u64),
+            gas_price: Some(U256::from(20000000000u64)),
+            ..Default::default()
+        };
+
+        let parsed = MempoolMonitor::parse_transaction(&tx).unwrap();
+        assert_eq!(parsed.method, "swapExactETHForTokens");
+        assert_eq!(parsed.min_amount_out, amount_out_min);
+        assert_eq!(parsed.token_out.unwrap().as_eth_address(), token_out_addr);
+    }
+
+    #[test]
+    fn test_decode_v2_tokens_for_eth() {
+        let amount_in = U256::from(1000);
+        let amount_out_min = U256::from(900);
+        let token_in_addr = H160::from_low_u64_be(1);
+        let to_addr = H160::from_low_u64_be(3);
+        let deadline = U256::from(1712690000u64);
+
+        let path = [token_in_addr, H160::from_low_u64_be(0)];
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&ethers::abi::encode(&[
+            ethers::abi::Token::Uint(amount_in),
+            ethers::abi::Token::Uint(amount_out_min),
+            ethers::abi::Token::Array(
+                path.iter()
+                    .map(|a| ethers::abi::Token::Address(*a))
+                    .collect(),
+            ),
+            ethers::abi::Token::Address(to_addr),
+            ethers::abi::Token::Uint(deadline),
+        ]));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&hex::decode("18cbafe5").unwrap());
+        data.extend_from_slice(&payload);
+
+        let tx = Transaction {
+            hash: H256::random(),
+            to: Some(H160::random()),
+            from: H160::random(),
+            input: data.into(),
+            value: U256::zero(),
+            gas_price: Some(U256::from(20000000000u64)),
+            ..Default::default()
+        };
+
+        let parsed = MempoolMonitor::parse_transaction(&tx).unwrap();
+        assert_eq!(parsed.method, "swapExactTokensForETH");
+        assert_eq!(parsed.amount_in, amount_in);
+        assert_eq!(parsed.token_in.unwrap().as_eth_address(), token_in_addr);
     }
 }

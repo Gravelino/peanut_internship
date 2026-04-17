@@ -139,14 +139,17 @@ impl PriceFeed {
             };
 
             while let Some(block) = block_stream.next().await {
-                let block_number = block.number.map(|n: U64| n.as_u64()).unwrap_or(0);
+                let block_number = block.number.map(|n: U64| n.as_u64()).unwrap_or_else(|| {
+                    warn!("Block missing number in feed stream");
+                    0
+                });
                 let timestamp_secs = block.timestamp.as_u64();
                 let timestamp = timestamp_secs * 1000;
 
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                    .expect("system clock unavailable")
+                    .as_millis() as u64;
                 let ts = if timestamp > 0 { timestamp } else { now_ms };
 
                 for entry in &pools {
@@ -181,7 +184,7 @@ impl PriceFeed {
     /// Computes price ticks from known reserves (pure, no async, no chain access).
     ///
     /// Returns one tick per pricing direction (token0→token1, token1→token0).
-    /// Pools with zero reserves produce ticks with `price == Decimal::ZERO`.
+    /// Pools with zero reserves return an empty vec (no valid ticks).
     pub fn compute_tick(
         entry: &PoolEntry,
         reserve0: u128,
@@ -189,6 +192,10 @@ impl PriceFeed {
         block_number: u64,
         timestamp: u64,
     ) -> Vec<PriceTick> {
+        if reserve0 == 0 || reserve1 == 0 {
+            return vec![];
+        }
+
         let scale0 = Decimal::from(DECIMAL_BASE.pow(entry.token0.decimals as u32));
         let scale1 = Decimal::from(DECIMAL_BASE.pow(entry.token1.decimals as u32));
 
@@ -196,13 +203,13 @@ impl PriceFeed {
         let human1 = Decimal::from(reserve1) / scale1;
 
         let price_0_to_1 = if human0.is_zero() {
-            Decimal::ZERO
+            return vec![];
         } else {
             human1 / human0
         };
 
         let price_1_to_0 = if human1.is_zero() {
-            Decimal::ZERO
+            return vec![];
         } else {
             human0 / human1
         };
@@ -345,11 +352,7 @@ mod tests {
 
         let ticks = PriceFeed::compute_tick(&entry, 0, 0, 0, 0);
 
-        assert_eq!(ticks.len(), 2);
-        assert_eq!(ticks[0].price, Decimal::ZERO);
-        assert_eq!(ticks[1].price, Decimal::ZERO);
-        assert_eq!(ticks[0].reserve_in, 0);
-        assert_eq!(ticks[0].reserve_out, 0);
+        assert_eq!(ticks.len(), 0, "zero-reserve pools should produce no ticks");
     }
 
     #[test]
@@ -361,16 +364,10 @@ mod tests {
         let reserve0: u128 = 1_000 * DECIMAL_BASE.pow(18);
         let ticks = PriceFeed::compute_tick(&entry, reserve0, 0, 0, 0);
 
-        assert_eq!(ticks.len(), 2);
         assert_eq!(
-            ticks[0].price,
-            Decimal::ZERO,
-            "0→1 price should be zero when reserve1 is zero"
-        );
-        assert_eq!(
-            ticks[1].price,
-            Decimal::ZERO,
-            "1→0 price should be zero when reserve1 is zero (untradeable)"
+            ticks.len(),
+            0,
+            "one-side-zero pools should produce no ticks"
         );
     }
 

@@ -181,7 +181,7 @@ impl TransactionBuilder {
         Ok(TransactionRequest {
             to,
             value,
-            data: self.data.clone().unwrap_or_default(),
+            data: self.data.clone().expect("data always initialized in new()"),
             nonce,
             gas_limit: self.gas_limit,
             max_fee_per_gas: self.max_fee_per_gas,

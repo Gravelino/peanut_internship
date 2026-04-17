@@ -4,7 +4,10 @@ use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::chain::ChainClient;
-use crate::core::types::{Address, BlockId, DECIMAL_BASE, MAINNET_CHAIN_ID, TransactionRequest};
+use crate::core::types::{
+    Address, BlockId, DECIMAL_BASE, ETH_DECIMALS, MAINNET_CHAIN_ID, RPC_RETRIES, RPC_TIMEOUT_SECS,
+    TransactionRequest,
+};
 use crate::inventory::errors::{InventoryError, InventoryResult};
 
 const BALANCEOF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
@@ -22,6 +25,7 @@ const WELL_KNOWN_TOKENS: &[(&str, &str, u8)] = &[
     ("FDUSD", "0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409", 18),
 ];
 
+/// Fetches native and ERC-20 token balances for an on-chain wallet.
 #[derive(Clone)]
 pub struct WalletBalanceFetcher {
     chain_client: ChainClient,
@@ -39,15 +43,15 @@ impl std::fmt::Debug for WalletBalanceFetcher {
 }
 
 impl WalletBalanceFetcher {
+    /// Creates a new fetcher using the given RPC URL and wallet address.
     pub fn new(rpc_url: String, wallet_address: &str) -> InventoryResult<Self> {
         let chain_client =
-            ChainClient::new(vec![rpc_url], 30, 2).map_err(|e| InventoryError::AssetNotFound(
-                format!("failed to create chain client: {e}"),
-            ))?;
+            ChainClient::new(vec![rpc_url], RPC_TIMEOUT_SECS, RPC_RETRIES).map_err(|e| {
+                InventoryError::AssetNotFound(format!("failed to create chain client: {e}"))
+            })?;
 
-        let wallet_address = Address::new(wallet_address).map_err(|e| {
-            InventoryError::AssetNotFound(format!("invalid wallet address: {e}"))
-        })?;
+        let wallet_address = Address::new(wallet_address)
+            .map_err(|e| InventoryError::AssetNotFound(format!("invalid wallet address: {e}")))?;
 
         Ok(Self {
             chain_client,
@@ -56,15 +60,18 @@ impl WalletBalanceFetcher {
         })
     }
 
+    /// Replaces the default token list with a custom one (symbol, address, decimals).
     pub fn with_tokens(mut self, tokens: Vec<(&'static str, &'static str, u8)>) -> Self {
         self.tokens = tokens;
         self
     }
 
+    /// Returns the monitored wallet address.
     pub fn wallet_address(&self) -> &Address {
         &self.wallet_address
     }
 
+    /// Fetches all native and ERC-20 balances, returning non-zero amounts keyed by ticker.
     pub async fn fetch_balances(&self) -> InventoryResult<HashMap<String, Decimal>> {
         let mut balances = HashMap::new();
 
@@ -115,7 +122,7 @@ impl WalletBalanceFetcher {
             .map_err(|e| InventoryError::AssetNotFound(format!("native balance: {e}")))?;
 
         let wei = token_amount.raw.as_u128();
-        Ok(Decimal::from(wei) / Decimal::from(DECIMAL_BASE.pow(18u32)))
+        Ok(Decimal::from(wei) / Decimal::from(DECIMAL_BASE.pow(ETH_DECIMALS as u32)))
     }
 
     async fn fetch_erc20_balance(
@@ -123,9 +130,8 @@ impl WalletBalanceFetcher {
         token_address: &str,
         decimals: u8,
     ) -> InventoryResult<Decimal> {
-        let addr = Address::new(token_address).map_err(|e| {
-            InventoryError::AssetNotFound(format!("invalid token address: {e}"))
-        })?;
+        let addr = Address::new(token_address)
+            .map_err(|e| InventoryError::AssetNotFound(format!("invalid token address: {e}")))?;
 
         let mut calldata = BALANCEOF_SELECTOR.to_vec();
         calldata.resize(BALANCEOF_SELECTOR.len() + 12, 0);
@@ -174,10 +180,7 @@ mod tests {
 
     #[test]
     fn test_wallet_fetcher_rejects_bad_address() {
-        let fetcher = WalletBalanceFetcher::new(
-            "http://127.0.0.1:1".to_string(),
-            "0xinvalid",
-        );
+        let fetcher = WalletBalanceFetcher::new("http://127.0.0.1:1".to_string(), "0xinvalid");
         assert!(fetcher.is_err());
     }
 
@@ -202,7 +205,11 @@ mod tests {
             "0x0000000000000000000000000000000000000001",
         )
         .unwrap()
-        .with_tokens(vec![("FOO", "0x0000000000000000000000000000000000000002", 18)]);
+        .with_tokens(vec![(
+            "FOO",
+            "0x0000000000000000000000000000000000000002",
+            18,
+        )]);
 
         assert_eq!(fetcher.tokens.len(), 1);
         assert_eq!(fetcher.tokens[0].0, "FOO");

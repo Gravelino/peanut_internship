@@ -312,7 +312,7 @@ pub async fn analyze_transaction(
         None
     };
 
-    let gas_used = receipt.as_ref().map(|r| r.gas_used.unwrap_or_default());
+    let gas_used = receipt.as_ref().and_then(|r| r.gas_used);
     let effective_price = receipt.as_ref().and_then(|r| r.effective_gas_price);
     let tx_fee = gas_used.zip(effective_price).map(|(u, p)| u * p);
 
@@ -447,5 +447,80 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("invalid") || msg.contains("hash"));
+    }
+
+    #[test]
+    fn truncate_at_char_boundary() {
+        let s = "hello world";
+        assert_eq!(truncate(s, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte() {
+        let s = "café résumé";
+        let truncated = truncate(s, 5);
+        assert!(truncated.len() <= 5);
+        assert!(s.starts_with(truncated));
+    }
+
+    #[test]
+    fn truncate_returns_full_string_when_under_max() {
+        let s = "short";
+        assert_eq!(truncate(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn analysis_result_to_text_format() {
+        let result = AnalysisResult {
+            hash: "0xabc".into(),
+            block: Some(100),
+            timestamp: Some(1000),
+            status: TransactionStatus::Success,
+            from: "0x1".into(),
+            to: "0x2".into(),
+            value_eth: "1.0".into(),
+            gas_limit: "21000".into(),
+            gas_used: Some("21000".into()),
+            effective_gas_price: Some("1000000000".into()),
+            tx_fee_eth: Some("0.000021".into()),
+            selector: Some("0xa9059cbb".into()),
+            function_name: "transfer(address,uint256)".into(),
+            events: vec![],
+            revert_reason: None,
+        };
+        let text = result.to_text();
+        assert!(text.contains("0xabc"));
+        assert!(text.contains("SUCCESS"));
+        assert!(text.contains("transfer"));
+    }
+
+    #[test]
+    fn analysis_result_to_json_format() {
+        let result = AnalysisResult {
+            hash: "0xabc".into(),
+            block: Some(100),
+            timestamp: Some(1000),
+            status: TransactionStatus::Failed,
+            from: "0x1".into(),
+            to: "0x2".into(),
+            value_eth: "1.0".into(),
+            gas_limit: "21000".into(),
+            gas_used: Some("21000".into()),
+            effective_gas_price: None,
+            tx_fee_eth: None,
+            selector: None,
+            function_name: "ETH transfer (no input data)".into(),
+            events: vec!["event1".into()],
+            revert_reason: Some("out of gas".into()),
+        };
+        let json = result.to_json();
+        assert_eq!(json["hash"], "0xabc");
+        assert_eq!(json["events_count"], 1);
+        assert_eq!(json["revert_reason"], "out of gas");
     }
 }

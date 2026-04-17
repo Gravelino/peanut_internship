@@ -7,11 +7,11 @@ use peanut_internship_rust::core::types::Address;
 use peanut_internship_rust::exchange::orderbook::OrderBookAnalyzer;
 use peanut_internship_rust::exchange::types::{NormalizedBalance, OrderBookSnapshot};
 use peanut_internship_rust::integration::{CrossDexOpportunity, ForkSimInfo};
+use peanut_internship_rust::inventory::WalletBalanceFetcher;
 use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeLeg};
 use peanut_internship_rust::inventory::rebalancer::RebalancePlanner;
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
 use peanut_internship_rust::inventory::types::Venue;
-use peanut_internship_rust::inventory::WalletBalanceFetcher;
 use peanut_internship_rust::pricing::amm::UniswapV2Pair;
 use peanut_internship_rust::pricing::router::{PoolRef, RouteFinder};
 
@@ -38,8 +38,8 @@ fn make_orderbook() -> OrderBookSnapshot {
         asks,
         best_bid,
         best_ask,
-        mid_price,
-        spread_bps,
+        mid_price: Some(mid_price),
+        spread_bps: Some(spread_bps),
     }
 }
 
@@ -78,7 +78,12 @@ fn test_orderbook_analysis_with_spread() {
     let ob = make_orderbook();
     let analyzer = OrderBookAnalyzer::new(ob);
 
-    assert!(analyzer.orderbook().spread_bps > Decimal::ZERO);
+    assert!(
+        analyzer
+            .orderbook()
+            .spread_bps
+            .is_some_and(|s| s > Decimal::ZERO)
+    );
     assert!(analyzer.orderbook().best_bid.is_some());
     assert!(analyzer.orderbook().best_ask.is_some());
 }

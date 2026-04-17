@@ -1,3 +1,11 @@
+//! # Inventory Module
+//!
+//! Tracks balances across venues and manages rebalancing:
+//! - **Tracker**: Multi-venue balance tracking with skew detection ([`InventoryTracker`])
+//! - **Rebalancer**: Plans transfers to correct inventory imbalance ([`RebalancePlanner`])
+//! - **PnL**: Arbitrage trade recording and PnL computation ([`PnLEngine`])
+//! - **Wallet**: On-chain ERC-20 balance fetching ([`WalletBalanceFetcher`])
+
 pub mod errors;
 pub mod pnl;
 pub mod rebalancer;
