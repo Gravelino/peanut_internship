@@ -33,6 +33,9 @@
 
 pub mod chain;
 pub mod core;
+pub mod exchange;
+pub mod integration;
+pub mod inventory;
 pub mod pricing;
 
 pub use chain::{
@@ -47,11 +50,23 @@ pub use core::types::{
     TransactionStatus, WEI_PER_GWEI,
 };
 pub use core::wallet::{WalletError, WalletManager};
+pub use exchange::{
+    BINANCE_TESTNET_BASE_URL, BINANCE_TESTNET_WS_URL, AggregatedPrice, BinanceConfig,
+    CanExecuteResult, ExchangeClient, ExchangeError, ExchangeResult, FeeStructure, FillLevel,
+    MyTrade, NormalizedBalance, OrderBookAnalyzer, OrderBookSnapshot, OrderResult, PriceOracle,
+    PriceSource, PortfolioSnapshot, RateLimiter, SkewResult, VenueSkew, WalkResult,
+};
+pub use integration::{ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, DexPoolInfo};
+pub use inventory::{
+    ArbRecord, Balance, CostEstimate, InventoryError, InventoryResult, InventoryTracker, PnLEngine,
+    PnLSummary, RebalancePlanner, TradeLeg, TradeSummary, TransferFeeInfo, TransferPlan, Venue,
+    min_operating_balance, transfer_fees,
+};
 pub use pricing::{
-    ArbDetector, ArbKind, ArbOpportunity, AmountOutDecoder, ForkSimulation, ForkSimulator,
+    AmountOutDecoder, ArbDetector, ArbKind, ArbOpportunity, ForkSimulation, ForkSimulator,
     HistoricalImpactAnalyzer, HistoricalImpactPoint, ImpactRow, ImpactSummary, MempoolMonitor,
     ParsedSwap, PoolRef, PriceFeed, PriceImpactAnalyzer, PriceTick, PricingEngine, PricingError,
-    PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SizeImpact, SizeImpactAvg,
-    SimulationComparison, SimulationResult, SimulationVerdict, SwapParams, TradeCost,
+    PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SimulationComparison,
+    SimulationResult, SimulationVerdict, SizeImpact, SizeImpactAvg, SwapParams, TradeCost,
     UniswapV2Pair, UniswapV3Pool, V3SwapQuote,
 };
