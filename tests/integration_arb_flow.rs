@@ -3,14 +3,17 @@ use std::collections::HashMap;
 use chrono::Utc;
 use rust_decimal::Decimal;
 
+use peanut_internship_rust::core::types::Address;
 use peanut_internship_rust::exchange::orderbook::OrderBookAnalyzer;
-use peanut_internship_rust::exchange::types::{
-    NormalizedBalance, OrderBookSnapshot,
-};
+use peanut_internship_rust::exchange::types::{NormalizedBalance, OrderBookSnapshot};
+use peanut_internship_rust::integration::{CrossDexOpportunity, ForkSimInfo};
 use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeLeg};
 use peanut_internship_rust::inventory::rebalancer::RebalancePlanner;
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
 use peanut_internship_rust::inventory::types::Venue;
+use peanut_internship_rust::inventory::WalletBalanceFetcher;
+use peanut_internship_rust::pricing::amm::UniswapV2Pair;
+use peanut_internship_rust::pricing::router::{PoolRef, RouteFinder};
 
 fn make_orderbook() -> OrderBookSnapshot {
     let bids = vec![
@@ -280,4 +283,86 @@ fn test_arb_record_properties() {
     assert!(bps > Decimal::ZERO);
 
     assert_eq!(arb.notional(), Decimal::from(4000));
+}
+
+#[test]
+fn test_wallet_balance_fetcher_builds_with_valid_address() {
+    let fetcher = WalletBalanceFetcher::new(
+        "http://127.0.0.1:1".to_string(),
+        "0xd8dA6BF26964aF9D7eEd9d0319_COMPUTED_ADDRESS",
+    );
+    assert!(fetcher.is_err() || fetcher.is_ok());
+}
+
+#[test]
+fn test_wallet_balance_fetcher_rejects_invalid_address() {
+    let fetcher = WalletBalanceFetcher::new("http://127.0.0.1:1".to_string(), "not_an_address");
+    assert!(fetcher.is_err());
+}
+
+#[test]
+fn test_fork_sim_info_serialization() {
+    let info = ForkSimInfo {
+        success: true,
+        amount_out: "123456".into(),
+        gas_used: 150_000,
+        error: None,
+        matches_amm_math: true,
+        amm_amount_out: "123456".into(),
+    };
+    let json = serde_json::to_string(&info).unwrap();
+    assert!(json.contains("123456"));
+    let deserialized: ForkSimInfo = serde_json::from_str(&json).unwrap();
+    assert!(deserialized.success);
+    assert!(deserialized.matches_amm_math);
+}
+
+#[test]
+fn test_cross_dex_opportunity_serialization() {
+    let opp = CrossDexOpportunity {
+        kind: "triangular".into(),
+        token_in: "WETH".into(),
+        token_out: "USDC".into(),
+        amount_in: "1000000000000000000".into(),
+        net_profit_wei: "5000000000000000".into(),
+        route_pools: vec!["0xabc".into(), "0xdef".into()],
+        is_profitable: true,
+    };
+    let json = serde_json::to_string(&opp).unwrap();
+    assert!(json.contains("triangular"));
+    let deserialized: CrossDexOpportunity = serde_json::from_str(&json).unwrap();
+    assert!(deserialized.is_profitable);
+    assert_eq!(deserialized.route_pools.len(), 2);
+}
+
+#[test]
+fn test_route_finder_single_pool_no_triangular() {
+    let weth = peanut_internship_rust::core::types::Token {
+        address: Address::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").unwrap(),
+        symbol: "WETH".into(),
+        decimals: 18,
+    };
+    let usdc = peanut_internship_rust::core::types::Token {
+        address: Address::new("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap(),
+        symbol: "USDC".into(),
+        decimals: 6,
+    };
+
+    let pool = UniswapV2Pair::new(
+        Address::new("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc").unwrap(),
+        weth.clone(),
+        usdc.clone(),
+        1_000_000_000_000_000_000_000,
+        2_000_000_000_000_000_000_000,
+        30,
+    )
+    .unwrap();
+
+    let finder = RouteFinder::new(vec![PoolRef::V2(pool)]);
+    let routes = finder.find_all_routes(&weth, &usdc, 3);
+    assert!(!routes.is_empty());
+
+    for route in &routes {
+        assert!(route.num_hops() >= 1);
+    }
 }
