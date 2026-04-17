@@ -206,6 +206,42 @@ impl ExchangeClient {
         Ok(result)
     }
 
+    pub async fn create_limit_gtc_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        amount: f64,
+        price: f64,
+    ) -> ExchangeResult<OrderResult> {
+        self.check_rate_limit(1).await;
+
+        let query = format!(
+            "symbol={}&side={}&type=LIMIT&timeInForce=GTC&quantity={}&price={}&recvWindow=60000",
+            symbol.replace('/', ""),
+            side.to_uppercase(),
+            amount,
+            price,
+        );
+
+        let signed = self.sign_request(&query);
+        let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
+
+        debug!(symbol, side, amount, price, "Placing LIMIT GTC order");
+
+        let resp: serde_json::Value = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.config.api_key)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        self.check_api_error(&resp)?;
+
+        Self::parse_order_result(&resp)
+    }
+
     pub async fn create_limit_ioc_order(
         &self,
         symbol: &str,
