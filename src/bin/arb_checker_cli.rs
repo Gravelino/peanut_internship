@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use peanut_internship_rust::exchange::types::NormalizedBalance;
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient};
 use peanut_internship_rust::integration::{ArbCheckResult, ArbChecker};
-use peanut_internship_rust::inventory::{InventoryTracker, PnLEngine, Venue};
+use peanut_internship_rust::inventory::{InventoryTracker, PnLEngine, Venue, WalletBalanceFetcher};
 
 const WETH_USDC_V2: &str = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc";
 const WETH_USDT_V2: &str = "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852";
@@ -32,6 +32,12 @@ struct Cli {
 
     #[arg(long)]
     pool: Option<String>,
+
+    #[arg(long)]
+    wallet_address: Option<String>,
+
+    #[arg(long, default_value = "http://127.0.0.1:8545")]
+    rpc_url: String,
 }
 
 #[tokio::main]
@@ -76,10 +82,40 @@ async fn main() {
         }
     }
 
-    let mut wallet_bals = HashMap::new();
-    wallet_bals.insert("ETH".into(), Decimal::from(5));
-    wallet_bals.insert("USDT".into(), Decimal::from(15000));
-    tracker.update_from_wallet(Venue::Wallet, wallet_bals);
+    if let Some(wallet_addr) = cli.wallet_address.as_deref() {
+        println!("Fetching on-chain wallet balances for {}...", wallet_addr);
+        let rpc = if let Some(fork) = cli.fork_url.as_deref() {
+            fork.to_string()
+        } else {
+            cli.rpc_url.clone()
+        };
+
+        match WalletBalanceFetcher::new(rpc, wallet_addr) {
+            Ok(fetcher) => {
+                match fetcher.fetch_balances().await {
+                    Ok(balances) => {
+                        if balances.is_empty() {
+                            println!("  (no balances found or RPC unavailable)");
+                        }
+                        tracker.update_from_wallet(Venue::Wallet, balances);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Could not fetch wallet balances: {e}");
+                        set_demo_wallet(&mut tracker);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Invalid wallet address: {e}");
+                set_demo_wallet(&mut tracker);
+            }
+        }
+    } else {
+        let mut wallet_bals = HashMap::new();
+        wallet_bals.insert("ETH".into(), Decimal::from(5));
+        wallet_bals.insert("USDT".into(), Decimal::from(15000));
+        tracker.update_from_wallet(Venue::Wallet, wallet_bals);
+    }
 
     let pnl_engine = PnLEngine::new();
     let checker = ArbChecker::new(exchange_client, tracker, pnl_engine);
@@ -103,7 +139,7 @@ async fn main() {
                 eprintln!("Arb check failed: {e}");
                 eprintln!();
                 eprintln!("Make sure Anvil is running:");
-                eprintln!("  ETH_RPC_URL=https://your-mainnet-rpc ./scripts/start_fork.sh");
+                eprintln!("  ./scripts/start_fork.sh");
                 std::process::exit(1);
             }
         }
@@ -121,7 +157,7 @@ async fn main() {
                 eprintln!("Arb check failed: {e}");
                 eprintln!();
                 eprintln!("Make sure Anvil is running:");
-                eprintln!("  ETH_RPC_URL=https://your-mainnet-rpc ./scripts/start_fork.sh");
+                eprintln!("  ./scripts/start_fork.sh");
                 std::process::exit(1);
             }
         }
@@ -141,6 +177,13 @@ async fn main() {
     }
 }
 
+fn set_demo_wallet(tracker: &mut InventoryTracker) {
+    let mut wallet_bals = HashMap::new();
+    wallet_bals.insert("ETH".into(), Decimal::from(5));
+    wallet_bals.insert("USDT".into(), Decimal::from(15000));
+    tracker.update_from_wallet(Venue::Wallet, wallet_bals);
+}
+
 fn display_result(result: ArbCheckResult) {
     println!();
 
@@ -153,6 +196,35 @@ fn display_result(result: ArbCheckResult) {
         println!("  Spot price:  ${:.2}", pool_info.spot_price);
         println!("  Exec price:  ${:.2}", pool_info.execution_price);
         println!("  Impact:      {} bps", pool_info.price_impact_bps.round());
+        println!();
+    }
+
+    if let Some(fork_sim) = &result.fork_simulation {
+        println!("Fork Simulation:");
+        println!("  Success:     {}", if fork_sim.success { "YES" } else { "NO" });
+        println!("  Sim amount:  {}", fork_sim.amount_out);
+        println!("  AMM amount:  {}", fork_sim.amm_amount_out);
+        println!("  Gas used:    {}", fork_sim.gas_used);
+        println!("  Matches AMM: {}", if fork_sim.matches_amm_math { "YES" } else { "NO" });
+        if let Some(err) = &fork_sim.error {
+            println!("  Error:       {}", err);
+        }
+        println!();
+    }
+
+    if !result.cross_dex_opportunities.is_empty() {
+        println!("Cross-DEX Arb Opportunities (from ArbDetector):");
+        for opp in &result.cross_dex_opportunities {
+            println!(
+                "  [{}] {} -> {} | amount_in={} | net_profit={}wei | pools={}",
+                opp.kind,
+                opp.token_in,
+                opp.token_out,
+                opp.amount_in,
+                opp.net_profit_wei,
+                opp.route_pools.join(" -> ")
+            );
+        }
         println!();
     }
 
@@ -188,6 +260,8 @@ fn display_result(result: ArbCheckResult) {
         " (profitable but insufficient inventory)"
     } else if result.inventory_ok && result.estimated_net_pnl_bps <= Decimal::ZERO {
         " (costs exceed gap)"
+    } else if result.fork_simulation.as_ref().is_some_and(|s| !s.success) {
+        " (fork simulation reverted)"
     } else {
         ""
     };
