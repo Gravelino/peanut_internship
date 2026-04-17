@@ -1,19 +1,19 @@
 # Peanut Internship - Rust Project
 
-Week 1 introduces the core Ethereum foundation in Rust:
-- `core`: addresses, token amounts, deterministic serialization, wallet signing
-- `chain`: RPC client, receipt parsing, transaction helpers
+An arbitrage detection and execution system spanning DEX (Uniswap) and CEX (Binance) venues, built entirely in Rust.
 
 ### Quick Start
 1. `cp .env.example .env`
-2. `make run`
-3. `make test`
-4. `cargo run --bin check_env_and_rpc`
+2. Fill in API keys in `.env`
+3. `make run`
+4. `make test`
 
 ### Environment
 - `PRIVATE_KEY`: hex-encoded Ethereum private key for local/testnet use
 - `SEPOLIA_RPC_URL`: Sepolia RPC endpoint for integration work
 - `MAINNET_RPC_URL`: optional mainnet RPC endpoint for analysis tooling
+- `BINANCE_TESTNET_API_KEY`: Binance testnet API key (Week 3)
+- `BINANCE_TESTNET_SECRET`: Binance testnet API secret (Week 3)
 
 ### Health Check
 Run the environment and RPC checker before integration work:
@@ -42,61 +42,115 @@ The wallet must hold at least **0.001 Sepolia ETH** (use https://sepoliafaucet.c
 Analyze any Ethereum transaction hash:
 
 ```sh
-# text output (default)
 cargo run --bin analyzer -- <tx_hash> --rpc <url>
-
-# JSON output for programmatic use
 cargo run --bin analyzer -- <tx_hash> --format json
-
-# or rely on MAINNET_RPC_URL from .env
-cargo run --bin analyzer -- <tx_hash>
 ```
 
-Features:
-- Decodes ERC-20 (`transfer`, `approve`, `transferFrom`) and Uniswap V2/V3 function calls
-- Parses event logs (Transfer, Swap, Sync events)
-- Shows revert reason for failed transactions
-- Supports `--format json` for programmatic output
-```
-
-### Generating Documentation
-The project is fully documented using `rustdoc`. You can generate and view the technical documentation (including all core types and chain logic) locally:
+### Week 3: Exchange & Inventory CLIs
 
 ```sh
-# Generate and open documentation for the project and all its dependencies
-cargo doc --open
+# Fetch and analyze order book
+cargo run --bin orderbook_cli -- ETH/USDT --depth 20
 
-# Generate documentation for this crate ONLY (much faster)
-cargo doc --no-deps --open
+# Check inventory skew and rebalance plans
+cargo run --bin rebalancer_cli -- check
+cargo run --bin rebalancer_cli -- plan ETH
+
+# PnL summary dashboard
+cargo run --bin pnl_cli
+
+# End-to-end arbitrage check
+cargo run --bin arb_checker_cli -- ETH/USDT --size 2.0
+```
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph Week1 [Week 1: Core + Chain]
+        A[core/types] --> B[core/wallet]
+        C[chain/client] --> D[chain/builder]
+    end
+
+    subgraph Week2 [Week 2: Pricing]
+        E[pricing/amm] --> F[pricing/router]
+        F --> G[pricing/engine]
+        H[pricing/mempool] --> G
+        I[pricing/simulator] --> G
+        J[pricing/feed] --> G
+    end
+
+    subgraph Week3 [Week 3: Exchange + Inventory]
+        K[exchange/config] --> L[exchange/client]
+        L --> M[exchange/orderbook]
+        N[exchange/rate_limiter] --> L
+        O[inventory/tracker] --> P[inventory/rebalancer]
+        Q[inventory/pnl] --> R[integration/arb_checker]
+        M --> R
+        L --> R
+        O --> R
+    end
+
+    Week1 --> Week2
+    Week2 --> Week3
+```
+
+Data flow for arbitrage checking:
+```mermaid
+flowchart LR
+    A[PricingEngine<br/>DEX price] --> E[ArbChecker]
+    B[ExchangeClient<br/>CEX order book] --> C[OrderBookAnalyzer<br/>spread/slippage] --> E
+    D[InventoryTracker<br/>balances] --> E
+    E --> F{gap > costs?}
+    F -->|Yes| G[Executable opportunity]
+    F -->|No| H[Skip]
+    G --> I[PnLEngine<br/>record trade]
+    D --> J[RebalancePlanner<br/>skew detection]
 ```
 
 ### Repository Architecture
 - `src/core/`: Base types (Address, TokenAmount, Token), WalletManager, CanonicalSerializer
 - `src/chain/`: ChainClient (RPC + retry), TransactionBuilder, TransactionAnalyzer
 - `src/pricing/`: AMM math, router, mempool monitor, fork simulator, and pricing engine
-- `src/bin/`: CLI binaries (analyzer, check_env_and_rpc, integration_test)
+- `src/exchange/`: Binance testnet client, order book analyzer, rate limiter
+- `src/inventory/`: Position tracker, rebalance planner, PnL engine
+- `src/integration/`: ArbChecker — end-to-end arbitrage pipeline
+- `src/bin/`: CLI binaries
 - `tests/`: Unit and integration tests
 - `scripts/`: Automation scripts
 - `configs/`: Non-secret configuration
 - `docs/`: Module technical guides
 
-### Week 2 Pricing Architecture
+### Module Details
 
-```mermaid
-flowchart LR
-    A[ChainClient] --> B[UniswapV2Pair.from_chain]
-    B --> C[RouteFinder]
-    C --> D[PricingEngine.get_quote]
-    D --> E[ForkSimulator.simulate_route]
-    F[MempoolMonitor] --> G[ParsedSwap]
-    G --> H[PricingEngine.on_mempool_swap]
-    E --> I[Quote]
-```
+#### exchange/
+| File | Purpose |
+|------|---------|
+| `config.rs` | Binance testnet config from env vars |
+| `client.rs` | REST API client (order book, balance, orders, fees) |
+| `orderbook.rs` | Walk-the-book, depth analysis, spread, imbalance |
+| `rate_limiter.rs` | Token-bucket rate limiter (1200 weight/min) |
+| `types.rs` | OrderBookSnapshot, OrderResult, NormalizedBalance, etc. |
+| `errors.rs` | ExchangeError enum |
 
-### Fork Setup (Anvil)
+#### inventory/
+| File | Purpose |
+|------|---------|
+| `tracker.rs` | Multi-venue position tracking, can_execute, skew detection |
+| `rebalancer.rs` | Threshold-based rebalance planning with fee accounting |
+| `pnl.rs` | Per-trade and aggregate PnL tracking, CSV export |
+| `types.rs` | Venue enum, TransferPlan, fee constants |
+| `errors.rs` | InventoryError enum |
+
+#### integration/
+| File | Purpose |
+|------|---------|
+| `arb_checker.rs` | End-to-end arb check: DEX price + CEX book + inventory + costs |
+
+### Generating Documentation
 
 ```sh
-ETH_RPC_URL=https://your-rpc.example ./scripts/start_fork.sh
+cargo doc --no-deps --open
 ```
 
 ### PricingEngine Example
@@ -154,9 +208,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 make test
 
 # specific test suites
-cargo test --test unit_core         # base types + serializer + wallet
-cargo test --test unit_analyzer     # analyzer selectors, events, errors
-cargo test --test unit_client       # RPC error classification + retry
-cargo test --test unit_builder      # transaction builder
-cargo test --test integration_wallet_security  # keyfile + signing security
+cargo test --test unit_core
+cargo test --test unit_analyzer
+cargo test --test unit_client
+cargo test --test unit_builder
+cargo test --test integration_wallet_security
+cargo test --test integration_arb_flow   # Week 3 integration tests
 ```
+
+### Test Coverage
+
+Week 3 modules include **52 tests** covering:
+- Order book parsing, sort order, spread calculation
+- Walk-the-book with various sizes (exact, multi-level, insufficient liquidity)
+- Rate limiter blocking when exhausted
+- Inventory update after trades (buy/sell/fee deductions)
+- Skew calculation with various distributions
+- Rebalance plan generation with fee accounting and min balances
+- PnL calculation (gross, net, bps, win rate, CSV export)
+- Integration: profitable arb accepted, unprofitable rejected, inventory validation
