@@ -1,31 +1,34 @@
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use tracing::warn;
 
+use crate::core::types::BPS_SCALE;
+use crate::exchange::errors::{ExchangeError, ExchangeResult};
 use crate::exchange::types::{FillLevel, OrderBookSnapshot, WalkResult};
 
+/// Analyzes an order book snapshot to compute fill simulations, depth, and spread metrics.
 #[derive(Debug, Clone)]
 pub struct OrderBookAnalyzer {
     orderbook: OrderBookSnapshot,
 }
 
 impl OrderBookAnalyzer {
+    /// Creates a new analyzer wrapping the given order book snapshot.
     pub fn new(orderbook: OrderBookSnapshot) -> Self {
         Self { orderbook }
     }
 
-    pub fn walk_the_book(&self, side: &str, qty: Decimal) -> WalkResult {
+    /// Simulates filling `qty` on `side` ("buy"/"sell") through successive book levels,
+    /// returning average price, slippage in BPS, and fill details.
+    /// Returns `ExchangeError::OrderRejected` if `side` is invalid.
+    pub fn walk_the_book(&self, side: &str, qty: Decimal) -> ExchangeResult<WalkResult> {
         let levels = match side {
             "buy" => &self.orderbook.asks,
             "sell" => &self.orderbook.bids,
             _ => {
-                return WalkResult {
-                    avg_price: Decimal::ZERO,
-                    total_cost: Decimal::ZERO,
-                    slippage_bps: Decimal::ZERO,
-                    levels_consumed: 0,
-                    fully_filled: false,
-                    fills: vec![],
-                };
+                return Err(ExchangeError::OrderRejected(format!(
+                    "invalid side: {side}"
+                )));
             }
         };
 
@@ -67,53 +70,59 @@ impl OrderBookAnalyzer {
 
         let slippage_bps = match best_price {
             Some(bp) if bp > Decimal::ZERO && side == "buy" => {
-                (avg_price - bp) / bp * Decimal::from(10000)
+                (avg_price - bp) / bp * Decimal::from(BPS_SCALE)
             }
             Some(bp) if bp > Decimal::ZERO && side == "sell" => {
-                (bp - avg_price) / bp * Decimal::from(10000)
+                (bp - avg_price) / bp * Decimal::from(BPS_SCALE)
             }
             _ => Decimal::ZERO,
         };
 
-        WalkResult {
+        Ok(WalkResult {
             avg_price,
             total_cost,
             slippage_bps: slippage_bps.max(Decimal::ZERO),
             levels_consumed,
             fully_filled,
             fills,
-        }
+        })
     }
 
-    pub fn depth_at_bps(&self, side: &str, bps: Decimal) -> Decimal {
+    /// Computes the total quantity available within `bps` basis points of the best price on `side` ("bid"/"ask").
+    /// Returns `ExchangeError::OrderRejected` if `side` is invalid.
+    pub fn depth_at_bps(&self, side: &str, bps: Decimal) -> ExchangeResult<Decimal> {
         let levels = match side {
             "bid" => &self.orderbook.bids,
             "ask" => &self.orderbook.asks,
-            _ => return Decimal::ZERO,
+            _ => {
+                return Err(ExchangeError::OrderRejected(format!(
+                    "invalid side: {side}"
+                )));
+            }
         };
 
         let best = match side {
             "bid" => self.orderbook.best_bid.map(|(p, _)| p),
             "ask" => self.orderbook.best_ask.map(|(p, _)| p),
-            _ => None,
+            _ => unreachable!(),
         };
 
         let Some(best_price) = best else {
-            return Decimal::ZERO;
+            return Ok(Decimal::ZERO);
         };
 
         if best_price <= Decimal::ZERO {
-            return Decimal::ZERO;
+            return Ok(Decimal::ZERO);
         }
 
-        let threshold = best_price * bps / Decimal::from(10000);
+        let threshold = best_price * bps / Decimal::from(BPS_SCALE);
 
         let mut total_qty = Decimal::ZERO;
         for (price, qty) in levels {
             let diff = match side {
                 "bid" => best_price - price,
                 "ask" => price - best_price,
-                _ => Decimal::ZERO,
+                _ => unreachable!(),
             };
             if diff <= threshold {
                 total_qty += qty;
@@ -122,9 +131,10 @@ impl OrderBookAnalyzer {
             }
         }
 
-        total_qty
+        Ok(total_qty)
     }
 
+    /// Returns the bid/ask imbalance over the top `levels` as a value in [-1.0, 1.0] (positive = buy pressure).
     pub fn imbalance(&self, levels: usize) -> f64 {
         let bid_levels: Vec<(Decimal, Decimal)> =
             self.orderbook.bids.iter().take(levels).copied().collect();
@@ -140,26 +150,32 @@ impl OrderBookAnalyzer {
         }
 
         let imbalance = (bid_total - ask_total) / total;
-        imbalance.to_f64().unwrap_or(0.0).clamp(-1.0, 1.0)
+        let imbalance_f64 = imbalance.to_f64();
+        if imbalance_f64.is_none() {
+            warn!("Imbalance value too large for f64, clamping");
+        }
+        imbalance_f64.unwrap_or(0.0).clamp(-1.0, 1.0)
     }
 
-    pub fn effective_spread(&self, qty: Decimal) -> Decimal {
-        let buy_walk = self.walk_the_book("buy", qty);
-        let sell_walk = self.walk_the_book("sell", qty);
+    /// Computes the effective spread in BPS for a given `qty` by walking both sides of the book.
+    /// Returns `Err` if either walk fails; returns zero if mid price is unavailable.
+    pub fn effective_spread(&self, qty: Decimal) -> ExchangeResult<Decimal> {
+        let buy_walk = self.walk_the_book("buy", qty)?;
+        let sell_walk = self.walk_the_book("sell", qty)?;
 
         let avg_ask = buy_walk.avg_price;
         let avg_bid = sell_walk.avg_price;
+        let mid_price = self.orderbook.mid_price;
 
-        if self.orderbook.mid_price <= Decimal::ZERO
-            || avg_ask <= Decimal::ZERO
-            || avg_bid <= Decimal::ZERO
-        {
-            return Decimal::ZERO;
-        }
+        let mid = match mid_price {
+            Some(m) if m > Decimal::ZERO && avg_ask > Decimal::ZERO && avg_bid > Decimal::ZERO => m,
+            _ => return Ok(Decimal::ZERO),
+        };
 
-        (avg_ask - avg_bid) / self.orderbook.mid_price * Decimal::from(10000)
+        Ok((avg_ask - avg_bid) / mid * Decimal::from(BPS_SCALE))
     }
 
+    /// Returns a reference to the underlying order book snapshot.
     pub fn orderbook(&self) -> &OrderBookSnapshot {
         &self.orderbook
     }
@@ -187,8 +203,8 @@ mod tests {
         ];
         let best_bid = bids.first().copied();
         let best_ask = asks.first().copied();
-        let mid_price = (Decimal::from(2009) + Decimal::from(2010)) / Decimal::TWO;
-        let spread_bps = Decimal::ONE / mid_price * Decimal::from(10000);
+        let mid_price = Some((Decimal::from(2009) + Decimal::from(2010)) / Decimal::TWO);
+        let spread_bps = mid_price.map(|m| Decimal::ONE / m * Decimal::from(BPS_SCALE));
 
         OrderBookSnapshot {
             symbol: "ETH/USDT".into(),
@@ -205,7 +221,7 @@ mod tests {
     #[test]
     fn test_walk_the_book_exact_fill() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let result = analyzer.walk_the_book("buy", Decimal::from(5));
+        let result = analyzer.walk_the_book("buy", Decimal::from(5)).unwrap();
         assert!(result.fully_filled);
         assert_eq!(result.levels_consumed, 1);
         assert_eq!(result.avg_price, Decimal::from(2010));
@@ -214,7 +230,7 @@ mod tests {
     #[test]
     fn test_walk_the_book_multiple_levels() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let result = analyzer.walk_the_book("buy", Decimal::from(12));
+        let result = analyzer.walk_the_book("buy", Decimal::from(12)).unwrap();
         assert!(result.fully_filled);
         assert_eq!(result.levels_consumed, 2);
         let expected_avg = (Decimal::from(5) * Decimal::from(2010)
@@ -226,17 +242,23 @@ mod tests {
     #[test]
     fn test_walk_the_book_insufficient_liquidity() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let result = analyzer.walk_the_book("buy", Decimal::from(1000));
+        let result = analyzer.walk_the_book("buy", Decimal::from(1000)).unwrap();
         assert!(!result.fully_filled);
         assert!(result.avg_price > Decimal::ZERO);
     }
 
     #[test]
+    fn test_walk_the_book_invalid_side() {
+        let analyzer = OrderBookAnalyzer::new(make_book());
+        assert!(analyzer.walk_the_book("byu", Decimal::from(1)).is_err());
+    }
+
+    #[test]
     fn test_depth_at_bps_correct() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let depth = analyzer.depth_at_bps("ask", Decimal::from(10));
+        let depth = analyzer.depth_at_bps("ask", Decimal::from(10)).unwrap();
         let best_ask = Decimal::from(2010);
-        let threshold = best_ask * Decimal::from(10) / Decimal::from(10000);
+        let threshold = best_ask * Decimal::from(10) / Decimal::from(BPS_SCALE);
         let mut expected = Decimal::ZERO;
         for (price, qty) in &analyzer.orderbook.asks {
             if *price - best_ask <= threshold {
@@ -253,20 +275,21 @@ mod tests {
     fn test_imbalance_range() {
         let analyzer = OrderBookAnalyzer::new(make_book());
         let imb = analyzer.imbalance(10);
-        assert!(imb >= -1.0 && imb <= 1.0);
+        assert!((-1.0..=1.0).contains(&imb));
     }
 
     #[test]
     fn test_effective_spread_greater_than_quoted() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let eff_spread = analyzer.effective_spread(Decimal::from(2));
-        assert!(eff_spread >= analyzer.orderbook.spread_bps);
+        let eff_spread = analyzer.effective_spread(Decimal::from(2)).unwrap();
+        let spread_bps = analyzer.orderbook.spread_bps.unwrap();
+        assert!(eff_spread >= spread_bps);
     }
 
     #[test]
     fn test_sell_walk() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let result = analyzer.walk_the_book("sell", Decimal::from(12));
+        let result = analyzer.walk_the_book("sell", Decimal::from(12)).unwrap();
         assert!(result.fully_filled);
         assert_eq!(result.levels_consumed, 1);
         assert_eq!(result.avg_price, Decimal::from(2009));
@@ -275,7 +298,7 @@ mod tests {
     #[test]
     fn test_walk_the_book_sell_multiple_levels() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let result = analyzer.walk_the_book("sell", Decimal::from(20));
+        let result = analyzer.walk_the_book("sell", Decimal::from(20)).unwrap();
         assert!(result.fully_filled);
         assert!(result.levels_consumed > 1);
         assert!(result.avg_price < Decimal::from(2009));
@@ -284,8 +307,14 @@ mod tests {
     #[test]
     fn test_depth_at_bps_bid_side() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let depth = analyzer.depth_at_bps("bid", Decimal::from(10));
+        let depth = analyzer.depth_at_bps("bid", Decimal::from(10)).unwrap();
         assert!(depth > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_depth_at_bps_invalid_side() {
+        let analyzer = OrderBookAnalyzer::new(make_book());
+        assert!(analyzer.depth_at_bps("byd", Decimal::from(10)).is_err());
     }
 
     #[test]
@@ -307,8 +336,8 @@ mod tests {
     #[test]
     fn test_effective_spread_increases_with_size() {
         let analyzer = OrderBookAnalyzer::new(make_book());
-        let small = analyzer.effective_spread(Decimal::from(1));
-        let large = analyzer.effective_spread(Decimal::from(10));
+        let small = analyzer.effective_spread(Decimal::from(1)).unwrap();
+        let large = analyzer.effective_spread(Decimal::from(10)).unwrap();
         assert!(large >= small);
     }
 
@@ -321,15 +350,15 @@ mod tests {
             asks: vec![],
             best_bid: None,
             best_ask: None,
-            mid_price: Decimal::ZERO,
-            spread_bps: Decimal::ZERO,
+            mid_price: None,
+            spread_bps: None,
         };
         let analyzer = OrderBookAnalyzer::new(book);
-        let walk = analyzer.walk_the_book("buy", Decimal::from(1));
+        let walk = analyzer.walk_the_book("buy", Decimal::from(1)).unwrap();
         assert!(!walk.fully_filled);
         assert_eq!(walk.levels_consumed, 0);
         assert_eq!(
-            analyzer.depth_at_bps("bid", Decimal::from(10)),
+            analyzer.depth_at_bps("bid", Decimal::from(10)).unwrap(),
             Decimal::ZERO
         );
         assert_eq!(analyzer.imbalance(10), 0.0);

@@ -77,20 +77,33 @@ async fn main() {
         ),
         None => println!("║  Best Ask:    N/A"),
     }
-    println!("║  Mid Price:   ${}", fmt_dec(ob.mid_price));
+    match ob.mid_price {
+        Some(mp) => println!("║  Mid Price:   ${}", fmt_dec(mp)),
+        None => println!("║  Mid Price:   N/A"),
+    }
     println!(
         "║  Spread:      {} ({} bps)",
-        fmt_spread(
-            ob.best_ask.map(|(p, _)| p).unwrap_or(Decimal::ZERO)
-                - ob.best_bid.map(|(p, _)| p).unwrap_or(Decimal::ZERO)
-        ),
-        fmt_dec(ob.spread_bps)
+        match (ob.best_bid, ob.best_ask) {
+            (Some((bid, _)), Some((ask, _))) => fmt_spread(ask - bid),
+            _ => "N/A".into(),
+        },
+        ob.spread_bps.map(fmt_dec).unwrap_or_else(|| "N/A".into())
     );
 
     println!("╠══════════════════════════════════════════════════════╣");
 
-    let bid_depth = analyzer.depth_at_bps("bid", Decimal::from(10));
-    let ask_depth = analyzer.depth_at_bps("ask", Decimal::from(10));
+    let bid_depth = analyzer
+        .depth_at_bps("bid", Decimal::from(10))
+        .unwrap_or_else(|e| {
+            eprintln!("  Warning: bid depth calculation failed: {e}");
+            Decimal::ZERO
+        });
+    let ask_depth = analyzer
+        .depth_at_bps("ask", Decimal::from(10))
+        .unwrap_or_else(|e| {
+            eprintln!("  Warning: ask depth calculation failed: {e}");
+            Decimal::ZERO
+        });
     println!("║  Depth (within 10 bps):");
     println!(
         "║    Bids: {} {}",
@@ -116,7 +129,7 @@ async fn main() {
     println!("╠══════════════════════════════════════════════════════╣");
 
     for size in [Decimal::from(2), Decimal::from(10)] {
-        let walk = analyzer.walk_the_book("buy", size);
+        let walk = analyzer.walk_the_book("buy", size).unwrap();
         println!(
             "║  Walk-the-book ({} {} buy):",
             fmt_dec(size),
@@ -130,7 +143,12 @@ async fn main() {
         }
     }
 
-    let eff_spread = analyzer.effective_spread(Decimal::from(2));
+    let eff_spread = analyzer
+        .effective_spread(Decimal::from(2))
+        .unwrap_or_else(|e| {
+            eprintln!("  Warning: effective spread calculation failed: {e}");
+            Decimal::ZERO
+        });
     println!("╠══════════════════════════════════════════════════════╣");
     println!(
         "║  Effective spread (2 {} round-trip): {} bps",

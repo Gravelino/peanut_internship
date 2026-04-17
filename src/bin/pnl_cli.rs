@@ -47,11 +47,18 @@ async fn main() {
                 let oracle = PriceOracle::new(client.config().base_url.clone());
                 let eth_price = match oracle.fetch_binance_ticker("ETH/USDT").await {
                     Ok(p) => p,
-                    Err(_) => Decimal::from(2000),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Could not fetch ETH price from oracle: {e}, using 2000 as fallback"
+                        );
+                        Decimal::from(2000)
+                    }
                 };
 
-                let mut buy_legs: Vec<&peanut_internship_rust::exchange::types::MyTrade> = Vec::new();
-                let mut sell_legs: Vec<&peanut_internship_rust::exchange::types::MyTrade> = Vec::new();
+                let mut buy_legs: Vec<&peanut_internship_rust::exchange::types::MyTrade> =
+                    Vec::new();
+                let mut sell_legs: Vec<&peanut_internship_rust::exchange::types::MyTrade> =
+                    Vec::new();
 
                 for t in &trades {
                     match t.side.as_str() {
@@ -77,12 +84,20 @@ async fn main() {
                         sell.fee * eth_price
                     };
 
+                    let buy_ts = Utc
+                        .timestamp_millis_opt(buy.timestamp as i64)
+                        .single()
+                        .expect("valid buy timestamp from Binance");
+                    let sell_ts = Utc
+                        .timestamp_millis_opt(sell.timestamp as i64)
+                        .single()
+                        .expect("valid sell timestamp from Binance");
                     let trade = ArbRecord {
                         id: format!("{}_{}", pair.replace('/', ""), i),
-                        timestamp: Utc.timestamp_millis_opt(buy.timestamp as i64).single().unwrap_or_default(),
+                        timestamp: buy_ts,
                         buy_leg: TradeLeg {
                             id: buy.id.clone(),
-                            timestamp: Utc.timestamp_millis_opt(buy.timestamp as i64).single().unwrap_or_default(),
+                            timestamp: buy_ts,
                             venue: Venue::Binance,
                             symbol: pair.to_string(),
                             side: "buy".into(),
@@ -93,7 +108,7 @@ async fn main() {
                         },
                         sell_leg: TradeLeg {
                             id: sell.id.clone(),
-                            timestamp: Utc.timestamp_millis_opt(sell.timestamp as i64).single().unwrap_or_default(),
+                            timestamp: sell_ts,
                             venue: Venue::Binance,
                             symbol: pair.to_string(),
                             side: "sell".into(),
@@ -127,7 +142,10 @@ async fn main() {
         println!();
         println!("Fetched {} raw trades from API.", total_fetched);
     } else {
-        println!("Trades fetched:     {} raw / {} arb pairs", total_fetched, summary.total_trades);
+        println!(
+            "Trades fetched:     {} raw / {} arb pairs",
+            total_fetched, summary.total_trades
+        );
         println!("Win Rate:            {:.1}%", summary.win_rate * 100.0);
         println!("Total PnL:           ${:.2}", summary.total_pnl_usd);
         println!("Total Fees:          ${:.2}", summary.total_fees_usd);

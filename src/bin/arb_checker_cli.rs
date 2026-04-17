@@ -76,8 +76,22 @@ async fn main() {
         Err(e) => {
             eprintln!("Warning: Could not fetch Binance balance: {e}");
             let mut demo = HashMap::new();
-            demo.insert("ETH".into(), NormalizedBalance { free: Decimal::from(8), locked: Decimal::ZERO, total: Decimal::from(8) });
-            demo.insert("USDT".into(), NormalizedBalance { free: Decimal::from(20000), locked: Decimal::ZERO, total: Decimal::from(20000) });
+            demo.insert(
+                "ETH".into(),
+                NormalizedBalance {
+                    free: Decimal::from(8),
+                    locked: Decimal::ZERO,
+                    total: Decimal::from(8),
+                },
+            );
+            demo.insert(
+                "USDT".into(),
+                NormalizedBalance {
+                    free: Decimal::from(20000),
+                    locked: Decimal::ZERO,
+                    total: Decimal::from(20000),
+                },
+            );
             tracker.update_from_cex(Venue::Binance, demo);
         }
     }
@@ -91,20 +105,18 @@ async fn main() {
         };
 
         match WalletBalanceFetcher::new(rpc, wallet_addr) {
-            Ok(fetcher) => {
-                match fetcher.fetch_balances().await {
-                    Ok(balances) => {
-                        if balances.is_empty() {
-                            println!("  (no balances found or RPC unavailable)");
-                        }
-                        tracker.update_from_wallet(Venue::Wallet, balances);
+            Ok(fetcher) => match fetcher.fetch_balances().await {
+                Ok(balances) => {
+                    if balances.is_empty() {
+                        println!("  (no balances found or RPC unavailable)");
                     }
-                    Err(e) => {
-                        eprintln!("Warning: Could not fetch wallet balances: {e}");
-                        set_demo_wallet(&mut tracker);
-                    }
+                    tracker.update_from_wallet(Venue::Wallet, balances);
                 }
-            }
+                Err(e) => {
+                    eprintln!("Warning: Could not fetch wallet balances: {e}");
+                    set_demo_wallet(&mut tracker);
+                }
+            },
             Err(e) => {
                 eprintln!("Warning: Invalid wallet address: {e}");
                 set_demo_wallet(&mut tracker);
@@ -122,7 +134,12 @@ async fn main() {
 
     println!();
     println!("═══════════════════════════════════════════");
-    println!("  ARB CHECK: {} (size: {} {})", cli.pair, size, base_asset(&cli.pair));
+    println!(
+        "  ARB CHECK: {} (size: {} {})",
+        cli.pair,
+        size,
+        base_asset(&cli.pair)
+    );
     println!("═══════════════════════════════════════════");
     println!();
 
@@ -133,7 +150,10 @@ async fn main() {
         println!();
         println!("Fetching DEX price from Uniswap V2 pool...");
 
-        match checker.check_with_dex(&cli.pair, size, dex_fee_bps, gas_cost_usd, fork_url, pool).await {
+        match checker
+            .check_with_dex(&cli.pair, size, dex_fee_bps, gas_cost_usd, fork_url, pool)
+            .await
+        {
             Ok(result) => display_result(result),
             Err(e) => {
                 eprintln!("Arb check failed: {e}");
@@ -151,7 +171,10 @@ async fn main() {
         println!();
         println!("Fetching DEX price from Uniswap V2 pool...");
 
-        match checker.check_with_dex(&cli.pair, size, dex_fee_bps, gas_cost_usd, fork_url, pool).await {
+        match checker
+            .check_with_dex(&cli.pair, size, dex_fee_bps, gas_cost_usd, fork_url, pool)
+            .await
+        {
             Ok(result) => display_result(result),
             Err(e) => {
                 eprintln!("Arb check failed: {e}");
@@ -167,7 +190,10 @@ async fn main() {
         println!();
         println!("Fetching prices from multiple sources...");
 
-        match checker.check(&cli.pair, size, dex_fee_bps, gas_cost_usd).await {
+        match checker
+            .check(&cli.pair, size, dex_fee_bps, gas_cost_usd)
+            .await
+        {
             Ok(result) => display_result(result),
             Err(e) => {
                 eprintln!("Arb check failed: {e}");
@@ -201,11 +227,21 @@ fn display_result(result: ArbCheckResult) {
 
     if let Some(fork_sim) = &result.fork_simulation {
         println!("Fork Simulation:");
-        println!("  Success:     {}", if fork_sim.success { "YES" } else { "NO" });
+        println!(
+            "  Success:     {}",
+            if fork_sim.success { "YES" } else { "NO" }
+        );
         println!("  Sim amount:  {}", fork_sim.amount_out);
         println!("  AMM amount:  {}", fork_sim.amm_amount_out);
         println!("  Gas used:    {}", fork_sim.gas_used);
-        println!("  Matches AMM: {}", if fork_sim.matches_amm_math { "YES" } else { "NO" });
+        println!(
+            "  Matches AMM: {}",
+            if fork_sim.matches_amm_math {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
         if let Some(err) = &fork_sim.error {
             println!("  Error:       {}", err);
         }
@@ -237,7 +273,10 @@ fn display_result(result: ArbCheckResult) {
     }
 
     println!("Prices:");
-    println!("  DEX price:         ${:.2} ({})", result.dex_price, result.dex_price_source);
+    println!(
+        "  DEX price:         ${:.2} ({})",
+        result.dex_price, result.dex_price_source
+    );
     println!("  CEX bid:           ${:.2}", result.cex_bid);
     println!("  CEX ask:           ${:.2}", result.cex_ask);
     println!();
@@ -246,15 +285,31 @@ fn display_result(result: ArbCheckResult) {
     println!();
     println!("Costs:");
     println!("  DEX fee:           {} bps", result.details.dex_fee_bps);
-    println!("  DEX price impact:  {} bps", result.details.dex_price_impact_bps.round());
+    println!(
+        "  DEX price impact:  {} bps",
+        result.details.dex_price_impact_bps.round()
+    );
     println!("  CEX fee:           {} bps", result.details.cex_fee_bps);
-    println!("  CEX slippage:      {} bps", result.details.cex_slippage_bps.round());
-    println!("  Gas:               ${} (gas cost)", result.details.gas_cost_usd);
+    println!(
+        "  CEX slippage:      {} bps",
+        result.details.cex_slippage_bps.round()
+    );
+    println!(
+        "  Gas:               ${} (gas cost)",
+        result.details.gas_cost_usd
+    );
     println!("  ────────────────────────");
-    println!("  Total costs:       {} bps", result.estimated_costs_bps.round());
+    println!(
+        "  Total costs:       {} bps",
+        result.estimated_costs_bps.round()
+    );
     println!();
 
-    let pnl_label = if result.estimated_net_pnl_bps > Decimal::ZERO { "PROFITABLE" } else { "NOT PROFITABLE" };
+    let pnl_label = if result.estimated_net_pnl_bps > Decimal::ZERO {
+        "PROFITABLE"
+    } else {
+        "NOT PROFITABLE"
+    };
     let icon = if result.executable { "✅" } else { "❌" };
     let reason = if !result.inventory_ok && result.estimated_net_pnl_bps > Decimal::ZERO {
         " (profitable but insufficient inventory)"
@@ -265,10 +320,22 @@ fn display_result(result: ArbCheckResult) {
     } else {
         ""
     };
-    println!("Net PnL estimate: {} bps {} {}{}", result.estimated_net_pnl_bps.round(), icon, pnl_label, reason);
+    println!(
+        "Net PnL estimate: {} bps {} {}{}",
+        result.estimated_net_pnl_bps.round(),
+        icon,
+        pnl_label,
+        reason
+    );
     println!();
-    println!("Inventory OK: {}", if result.inventory_ok { "✅" } else { "❌" });
-    println!("Direction: {}", result.direction.as_deref().unwrap_or("N/A"));
+    println!(
+        "Inventory OK: {}",
+        if result.inventory_ok { "✅" } else { "❌" }
+    );
+    println!(
+        "Direction: {}",
+        result.direction.as_deref().unwrap_or("N/A")
+    );
     println!();
     println!("Verdict: {} {}", pnl_label, reason);
     println!("═══════════════════════════════════════════");

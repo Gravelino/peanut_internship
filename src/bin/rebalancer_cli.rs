@@ -4,7 +4,9 @@ use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient};
-use peanut_internship_rust::inventory::{InventoryTracker, RebalancePlanner, Venue, WalletBalanceFetcher};
+use peanut_internship_rust::inventory::{
+    InventoryTracker, RebalancePlanner, Venue, WalletBalanceFetcher,
+};
 
 #[derive(Parser)]
 #[command(name = "rebalancer")]
@@ -40,11 +42,15 @@ async fn main() {
 
     match cli.command {
         Commands::Check(shared) => {
-            let tracker = match build_tracker(shared.wallet_address.as_deref(), &shared.rpc_url).await {
+            let tracker = match build_tracker(shared.wallet_address.as_deref(), &shared.rpc_url)
+                .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Failed to fetch Binance balances: {e}");
-                    eprintln!("Check your .env has valid BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_SECRET");
+                    eprintln!(
+                        "Check your .env has valid BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_SECRET"
+                    );
                     std::process::exit(1);
                 }
             };
@@ -101,13 +107,14 @@ async fn main() {
             println!("═══════════════════════════════════════════");
         }
         Commands::Plan { asset, shared } => {
-            let tracker = match build_tracker(shared.wallet_address.as_deref(), &shared.rpc_url).await {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Failed to fetch Binance balances: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let tracker =
+                match build_tracker(shared.wallet_address.as_deref(), &shared.rpc_url).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Failed to fetch Binance balances: {e}");
+                        std::process::exit(1);
+                    }
+                };
             let planner = RebalancePlanner::new(tracker, 30.0);
 
             let plans = planner.plan(&asset);
@@ -156,20 +163,18 @@ async fn build_tracker(
     if let Some(addr) = wallet_address {
         println!("Fetching on-chain wallet balances for {}...", addr);
         match WalletBalanceFetcher::new(rpc_url.to_string(), addr) {
-            Ok(fetcher) => {
-                match fetcher.fetch_balances().await {
-                    Ok(wallet_bals) => {
-                        if wallet_bals.is_empty() {
-                            println!("  (no balances found or RPC unavailable)");
-                        }
-                        tracker.update_from_wallet(Venue::Wallet, wallet_bals);
+            Ok(fetcher) => match fetcher.fetch_balances().await {
+                Ok(wallet_bals) => {
+                    if wallet_bals.is_empty() {
+                        println!("  (no balances found or RPC unavailable)");
                     }
-                    Err(e) => {
-                        eprintln!("Warning: Could not fetch wallet balances: {e}");
-                        tracker.update_from_wallet(Venue::Wallet, default_wallet_bals());
-                    }
+                    tracker.update_from_wallet(Venue::Wallet, wallet_bals);
                 }
-            }
+                Err(e) => {
+                    eprintln!("Warning: Could not fetch wallet balances: {e}");
+                    tracker.update_from_wallet(Venue::Wallet, default_wallet_bals());
+                }
+            },
             Err(e) => {
                 eprintln!("Warning: Invalid wallet address: {e}");
                 tracker.update_from_wallet(Venue::Wallet, default_wallet_bals());

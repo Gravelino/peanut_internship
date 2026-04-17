@@ -15,69 +15,118 @@ use crate::pricing::amm::UniswapV2Pair;
 use crate::pricing::router::{PoolRef, Route};
 use crate::pricing::simulator::{ForkSimulator, SimulationResult};
 
+/// Result of an arbitrage opportunity check between DEX and CEX.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbCheckResult {
+    /// Trading pair (e.g. "ETH/USDT").
     pub pair: String,
+    /// ISO-8601 timestamp of the check.
     pub timestamp: String,
+    /// DEX price for the pair.
     pub dex_price: Decimal,
+    /// Origin of the DEX price (e.g. "oracle_median" or "uniswap_v2_fork").
     pub dex_price_source: String,
+    /// Best bid price on the CEX orderbook.
     pub cex_bid: Decimal,
+    /// Best ask price on the CEX orderbook.
     pub cex_ask: Decimal,
+    /// Price gap between DEX and CEX in basis points.
     pub gap_bps: Decimal,
+    /// Arbitrage direction, e.g. "buy_dex_sell_cex" or "buy_cex_sell_dex".
     pub direction: Option<String>,
+    /// Estimated total execution costs in basis points.
     pub estimated_costs_bps: Decimal,
+    /// Estimated net profit in basis points after costs.
     pub estimated_net_pnl_bps: Decimal,
+    /// Whether current inventory balances allow execution.
     pub inventory_ok: bool,
+    /// Whether the opportunity is executable (profitable, inventory OK, direction set).
     pub executable: bool,
+    /// Breakdown of individual cost components.
     pub details: ArbCheckDetails,
+    /// Aggregated price sources used for the check.
     pub price_sources: Option<AggregatedPrice>,
+    /// DEX pool reserve and pricing info.
     pub dex_pool_info: Option<DexPoolInfo>,
+    /// Fork simulation results.
     pub fork_simulation: Option<ForkSimInfo>,
+    /// Cross-DEX triangular arbitrage opportunities detected.
     pub cross_dex_opportunities: Vec<CrossDexOpportunity>,
 }
 
+/// Uniswap V2 pool state used for arb pricing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DexPoolInfo {
+    /// Address of the liquidity pool.
     pub pool_address: String,
+    /// Reserve amount of token0 (raw).
     pub reserve0: String,
+    /// Reserve amount of token1 (raw).
     pub reserve1: String,
+    /// Symbol of token0.
     pub token0: String,
+    /// Symbol of token1.
     pub token1: String,
+    /// Spot price from AMM math.
     pub spot_price: Decimal,
+    /// Execution price for the given trade size.
     pub execution_price: Decimal,
+    /// Price impact of the trade in basis points.
     pub price_impact_bps: Decimal,
 }
 
+/// Results from a fork-based swap simulation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkSimInfo {
+    /// Whether the simulation succeeded.
     pub success: bool,
+    /// Token amount received from the simulated swap (raw).
     pub amount_out: String,
+    /// Gas consumed by the simulated swap.
     pub gas_used: u64,
+    /// Error message if the simulation failed.
     pub error: Option<String>,
+    /// Whether the fork result matches pure AMM math output.
     pub matches_amm_math: bool,
+    /// Expected amount out from AMM math (raw).
     pub amm_amount_out: String,
 }
 
+/// A cross-DEX (triangular) arbitrage opportunity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossDexOpportunity {
+    /// Type of opportunity (e.g. "triangular").
     pub kind: String,
+    /// Input token symbol.
     pub token_in: String,
+    /// Output token symbol.
     pub token_out: String,
+    /// Input amount in wei.
     pub amount_in: String,
+    /// Net profit in wei after estimated gas.
     pub net_profit_wei: String,
+    /// Pool addresses traversed by the route.
     pub route_pools: Vec<String>,
+    /// Whether the opportunity is profitable after costs.
     pub is_profitable: bool,
 }
 
+/// Breakdown of individual cost components for an arb check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbCheckDetails {
+    /// DEX price impact in basis points.
     pub dex_price_impact_bps: Decimal,
+    /// CEX orderbook slippage in basis points.
     pub cex_slippage_bps: Decimal,
+    /// CEX trading fee in basis points.
     pub cex_fee_bps: Decimal,
+    /// DEX fee in basis points.
     pub dex_fee_bps: Decimal,
+    /// On-chain gas cost in USD.
     pub gas_cost_usd: Decimal,
 }
 
+/// Checks for arbitrage opportunities between DEX and CEX venues.
 #[derive(Debug)]
 pub struct ArbChecker {
     exchange_client: ExchangeClient,
@@ -88,6 +137,7 @@ pub struct ArbChecker {
 }
 
 impl ArbChecker {
+    /// Creates a new `ArbChecker` from the given exchange client, inventory tracker, and PnL engine.
     pub fn new(
         exchange_client: ExchangeClient,
         inventory_tracker: InventoryTracker,
@@ -104,6 +154,7 @@ impl ArbChecker {
         }
     }
 
+    /// Runs an arb check using a live DEX fork for on-chain pricing.
     pub async fn check_with_dex(
         &self,
         pair: &str,
@@ -118,8 +169,8 @@ impl ArbChecker {
         let chain_client = ChainClient::new(vec![fork_url.to_string()], 20, 2)
             .map_err(|e| ArbCheckError::DexError(e.to_string()))?;
 
-        let pool_addr = Address::new(pool_address)
-            .map_err(|e| ArbCheckError::DexError(e.to_string()))?;
+        let pool_addr =
+            Address::new(pool_address).map_err(|e| ArbCheckError::DexError(e.to_string()))?;
 
         let pool = UniswapV2Pair::from_chain(pool_addr, &chain_client)
             .await
@@ -157,10 +208,10 @@ impl ArbChecker {
             .map_err(|e| ArbCheckError::DexError(e.to_string()))?;
 
         let dex_price = if amount_in > 0 && amm_amount_out > 0 {
-            let base_units = Decimal::from(amount_in)
-                / Decimal::from(10u64.pow(token_in.decimals as u32));
-            let quote_units = Decimal::from(amm_amount_out)
-                / Decimal::from(10u64.pow(token_out.decimals as u32));
+            let base_units =
+                Decimal::from(amount_in) / Decimal::from(10u64.pow(token_in.decimals as u32));
+            let quote_units =
+                Decimal::from(amm_amount_out) / Decimal::from(10u64.pow(token_out.decimals as u32));
             if base_units > Decimal::ZERO {
                 quote_units / base_units
             } else {
@@ -174,9 +225,9 @@ impl ArbChecker {
             .get_execution_price(amount_in, &token_in)
             .unwrap_or(dex_price);
 
-        let price_impact = pool
-            .get_price_impact(amount_in, &token_in)
-            .unwrap_or(Decimal::ZERO);
+        let price_impact = pool.get_price_impact(amount_in, &token_in).map_err(|e| {
+            ArbCheckError::DexError(format!("price impact calculation failed: {e}"))
+        })?;
         let price_impact_bps = price_impact * Decimal::from(10000);
 
         let dex_pool_info = DexPoolInfo {
@@ -198,14 +249,16 @@ impl ArbChecker {
             "DEX price from Uniswap V2 fork"
         );
 
-        let fork_simulation = self.run_fork_simulation(
-            fork_url,
-            &pool,
-            &token_in,
-            &token_out,
-            amount_in,
-            amm_amount_out,
-        ).await;
+        let fork_simulation = self
+            .run_fork_simulation(
+                fork_url,
+                &pool,
+                &token_in,
+                &token_out,
+                amount_in,
+                amm_amount_out,
+            )
+            .await;
 
         let cross_dex_opportunities = self.detect_cross_dex_arb(&pool);
 
@@ -221,12 +274,18 @@ impl ArbChecker {
             .orderbook()
             .best_bid
             .map(|(p, _)| p)
-            .unwrap_or(Decimal::ZERO);
+            .unwrap_or_else(|| {
+                warn!("Orderbook has no best bid, using zero");
+                Decimal::ZERO
+            });
         let cex_ask = analyzer
             .orderbook()
             .best_ask
             .map(|(p, _)| p)
-            .unwrap_or(Decimal::ZERO);
+            .unwrap_or_else(|| {
+                warn!("Orderbook has no best ask, using zero");
+                Decimal::ZERO
+            });
 
         let buy_dex_sell_cex_gap = if dex_price > Decimal::ZERO && cex_bid > Decimal::ZERO {
             (cex_bid - dex_price) / dex_price * Decimal::from(10000)
@@ -249,15 +308,19 @@ impl ArbChecker {
         };
 
         let cex_fee_bps = Decimal::from(10);
-        let walk_buy = analyzer.walk_the_book("buy", size);
-        let walk_sell = analyzer.walk_the_book("sell", size);
+        let walk_buy = analyzer.walk_the_book("buy", size)?;
+        let walk_sell = analyzer.walk_the_book("sell", size)?;
         let cex_slippage_bps = walk_buy.slippage_bps.max(walk_sell.slippage_bps);
 
         let mid_price = analyzer.orderbook().mid_price;
-        let gas_cost_bps = if mid_price > Decimal::ZERO && size > Decimal::ZERO {
-            gas_cost_usd / (size * mid_price) * Decimal::from(10000)
-        } else {
-            Decimal::ZERO
+        let gas_cost_bps = match mid_price {
+            Some(m) if m > Decimal::ZERO && size > Decimal::ZERO => {
+                gas_cost_usd / (size * m) * Decimal::from(10000)
+            }
+            _ => {
+                warn!("Cannot compute gas_cost_bps: mid_price unavailable");
+                Decimal::ZERO
+            }
         };
 
         let estimated_costs_bps =
@@ -270,21 +333,32 @@ impl ArbChecker {
         let inventory_ok = match direction.as_deref() {
             Some("buy_dex_sell_cex") => {
                 self.inventory_tracker
-                    .can_execute(Venue::Wallet, quote_asset, quote_needed, Venue::Binance, base_asset, size)
+                    .can_execute(
+                        Venue::Wallet,
+                        quote_asset,
+                        quote_needed,
+                        Venue::Binance,
+                        base_asset,
+                        size,
+                    )
                     .can_execute
             }
             Some("buy_cex_sell_dex") => {
                 self.inventory_tracker
-                    .can_execute(Venue::Binance, quote_asset, quote_needed, Venue::Wallet, base_asset, size)
+                    .can_execute(
+                        Venue::Binance,
+                        quote_asset,
+                        quote_needed,
+                        Venue::Wallet,
+                        base_asset,
+                        size,
+                    )
                     .can_execute
             }
             _ => false,
         };
 
-        let fork_confirms = fork_simulation
-            .as_ref()
-            .map(|s| s.success)
-            .unwrap_or(true);
+        let fork_confirms = fork_simulation.as_ref().map(|s| s.success).unwrap_or(true);
 
         let executable = estimated_net_pnl_bps > Decimal::ZERO
             && inventory_ok
@@ -337,7 +411,14 @@ impl ArbChecker {
 
         let route = Route::new(
             vec![PoolRef::V2(pool.clone())],
-            vec![token_in.clone(), if *token_in == pool.token0 { pool.token1.clone() } else { pool.token0.clone() }],
+            vec![
+                token_in.clone(),
+                if *token_in == pool.token0 {
+                    pool.token1.clone()
+                } else {
+                    pool.token0.clone()
+                },
+            ],
         );
 
         let sender = match Address::new("0x0000000000000000000000000000000000000001") {
@@ -345,20 +426,21 @@ impl ArbChecker {
             Err(_) => return None,
         };
 
-        let sim_result: SimulationResult = match simulator.simulate_route(&route, amount_in, sender).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Fork simulation failed: {e}");
-                return Some(ForkSimInfo {
-                    success: false,
-                    amount_out: "0".into(),
-                    gas_used: 0,
-                    error: Some(e.to_string()),
-                    matches_amm_math: false,
-                    amm_amount_out: amm_amount_out.to_string(),
-                });
-            }
-        };
+        let sim_result: SimulationResult =
+            match simulator.simulate_route(&route, amount_in, sender).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Fork simulation failed: {e}");
+                    return Some(ForkSimInfo {
+                        success: false,
+                        amount_out: "0".into(),
+                        gas_used: 0,
+                        error: Some(e.to_string()),
+                        matches_amm_math: false,
+                        amm_amount_out: amm_amount_out.to_string(),
+                    });
+                }
+            };
 
         let matches_amm = sim_result.success && sim_result.amount_out == amm_amount_out;
 
@@ -434,12 +516,16 @@ impl ArbChecker {
         if opportunities.is_empty() {
             info!("No cross-DEX arb opportunities detected for this pool");
         } else {
-            info!(count = opportunities.len(), "Cross-DEX arb opportunities found");
+            info!(
+                count = opportunities.len(),
+                "Cross-DEX arb opportunities found"
+            );
         }
 
         opportunities
     }
 
+    /// Runs an arb check using the price oracle for DEX pricing (no fork).
     pub async fn check(
         &self,
         pair: &str,
@@ -450,7 +536,7 @@ impl ArbChecker {
         info!(pair, size = %size, "Running arb check");
 
         let orderbook = self.exchange_client.fetch_order_book(pair, 20).await?;
-        let cex_mid = Some(orderbook.mid_price);
+        let cex_mid = orderbook.mid_price;
         let analyzer = OrderBookAnalyzer::new(orderbook);
 
         let agg_price = self.price_oracle.fetch_aggregated(pair, cex_mid).await?;
@@ -460,12 +546,18 @@ impl ArbChecker {
             .orderbook()
             .best_bid
             .map(|(p, _)| p)
-            .unwrap_or(Decimal::ZERO);
+            .unwrap_or_else(|| {
+                warn!("Orderbook has no best bid, using zero");
+                Decimal::ZERO
+            });
         let cex_ask = analyzer
             .orderbook()
             .best_ask
             .map(|(p, _)| p)
-            .unwrap_or(Decimal::ZERO);
+            .unwrap_or_else(|| {
+                warn!("Orderbook has no best ask, using zero");
+                Decimal::ZERO
+            });
 
         let buy_dex_sell_cex_gap = if dex_price > Decimal::ZERO && cex_bid > Decimal::ZERO {
             (cex_bid - dex_price) / dex_price * Decimal::from(10000)
@@ -488,8 +580,8 @@ impl ArbChecker {
         };
 
         let cex_fee_bps = Decimal::from(10);
-        let walk_buy = analyzer.walk_the_book("buy", size);
-        let walk_sell = analyzer.walk_the_book("sell", size);
+        let walk_buy = analyzer.walk_the_book("buy", size)?;
+        let walk_sell = analyzer.walk_the_book("sell", size)?;
         let cex_slippage_bps = walk_buy.slippage_bps.max(walk_sell.slippage_bps);
 
         let dex_price_impact_bps = Decimal::from(5);
@@ -497,10 +589,14 @@ impl ArbChecker {
         let total_cost_bps = dex_fee_bps + dex_price_impact_bps + cex_fee_bps + cex_slippage_bps;
 
         let mid_price = analyzer.orderbook().mid_price;
-        let gas_cost_bps = if mid_price > Decimal::ZERO && size > Decimal::ZERO {
-            gas_cost_usd / (size * mid_price) * Decimal::from(10000)
-        } else {
-            Decimal::ZERO
+        let gas_cost_bps = match mid_price {
+            Some(m) if m > Decimal::ZERO && size > Decimal::ZERO => {
+                gas_cost_usd / (size * m) * Decimal::from(10000)
+            }
+            _ => {
+                warn!("Cannot compute gas_cost_bps: mid_price unavailable");
+                Decimal::ZERO
+            }
         };
 
         let estimated_costs_bps = total_cost_bps + gas_cost_bps;
@@ -567,9 +663,12 @@ impl ArbChecker {
     }
 }
 
+/// Errors that can occur during an arbitrage check.
 #[derive(Debug)]
 pub enum ArbCheckError {
+    /// An exchange API error.
     Exchange(crate::exchange::errors::ExchangeError),
+    /// A DEX/on-chain error with a description.
     DexError(String),
 }
 
@@ -583,3 +682,9 @@ impl std::fmt::Display for ArbCheckError {
 }
 
 impl std::error::Error for ArbCheckError {}
+
+impl From<crate::exchange::errors::ExchangeError> for ArbCheckError {
+    fn from(e: crate::exchange::errors::ExchangeError) -> Self {
+        ArbCheckError::Exchange(e)
+    }
+}

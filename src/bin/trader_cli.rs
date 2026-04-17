@@ -76,7 +76,12 @@ async fn main() {
     }
 
     match cli.command {
-        Commands::Buy { symbol, amount, price, gtc } => {
+        Commands::Buy {
+            symbol,
+            amount,
+            price,
+            gtc,
+        } => {
             let qty: f64 = amount.parse().unwrap_or(0.0);
             if qty <= 0.0 {
                 eprintln!("Amount must be positive");
@@ -108,7 +113,12 @@ async fn main() {
                 }
             }
         }
-        Commands::Sell { symbol, amount, price, gtc } => {
+        Commands::Sell {
+            symbol,
+            amount,
+            price,
+            gtc,
+        } => {
             let qty: f64 = amount.parse().unwrap_or(0.0);
             if qty <= 0.0 {
                 eprintln!("Amount must be positive");
@@ -119,13 +129,19 @@ async fn main() {
                     let px: f64 = p.parse().unwrap_or(0.0);
                     if gtc {
                         println!("Placing LIMIT GTC SELL {} @ ${}", symbol, px);
-                        match client.create_limit_gtc_order(&symbol, "SELL", qty, px).await {
+                        match client
+                            .create_limit_gtc_order(&symbol, "SELL", qty, px)
+                            .await
+                        {
                             Ok(result) => display_order(result),
                             Err(e) => eprintln!("Order failed: {e}"),
                         }
                     } else {
                         println!("Placing LIMIT IOC SELL {} @ ${}", symbol, px);
-                        match client.create_limit_ioc_order(&symbol, "SELL", qty, px).await {
+                        match client
+                            .create_limit_ioc_order(&symbol, "SELL", qty, px)
+                            .await
+                        {
                             Ok(result) => display_order(result),
                             Err(e) => eprintln!("Order failed: {e}"),
                         }
@@ -154,16 +170,14 @@ async fn main() {
                 Err(e) => eprintln!("Cancel failed: {e}"),
             }
         }
-        Commands::Fees { symbol } => {
-            match client.get_trading_fees(&symbol).await {
-                Ok(fees) => {
-                    println!("Trading fees for {}:", symbol);
-                    println!("  Maker: {}%", fees.maker * Decimal::from(100));
-                    println!("  Taker: {}%", fees.taker * Decimal::from(100));
-                }
-                Err(e) => eprintln!("Fee check failed: {e}"),
+        Commands::Fees { symbol } => match client.get_trading_fees(&symbol).await {
+            Ok(fees) => {
+                println!("Trading fees for {}:", symbol);
+                println!("  Maker: {}%", fees.maker * Decimal::from(100));
+                println!("  Taker: {}%", fees.taker * Decimal::from(100));
             }
-        }
+            Err(e) => eprintln!("Fee check failed: {e}"),
+        },
     }
 }
 
