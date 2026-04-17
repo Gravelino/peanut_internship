@@ -1,18 +1,40 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
 use rust_decimal::Decimal;
 use sha2::Sha256;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::core::types::{
+    BINANCE_ERR_INSUFFICIENT_FUNDS, BINANCE_ERR_INVALID_QUANTITY, BINANCE_ERR_INVALID_SYMBOL,
+    BINANCE_ERR_RATE_LIMIT, BINANCE_RECV_WINDOW_MS, BINANCE_WEIGHT_ACCOUNT,
+    BINANCE_WEIGHT_DEPTH_100, BINANCE_WEIGHT_DEPTH_500, BINANCE_WEIGHT_DEPTH_1000,
+    BINANCE_WEIGHT_DEPTH_5000, BINANCE_WEIGHT_EXCHANGE_INFO, BINANCE_WEIGHT_MY_TRADES,
+    BINANCE_WEIGHT_ORDER, BINANCE_WEIGHT_ORDER_STATUS, BINANCE_WEIGHT_SERVER_TIME,
+    BINANCE_WEIGHT_TRADE_FEE,
+};
 use crate::exchange::config::BinanceConfig;
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
-use crate::exchange::rate_limiter::RateLimiter;
-use crate::exchange::types::{FeeStructure, MyTrade, NormalizedBalance, OrderBookSnapshot, OrderResult};
+use crate::exchange::http_client::{HttpClient, RetryConfig};
+use crate::exchange::rate_limiter::{LimitInterval, LimitKey, LimitType};
+use crate::exchange::types::{
+    FeeStructure, MyTrade, NormalizedBalance, OrderBookSnapshot, OrderResult,
+};
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn missing_field_err(field: &str) -> ExchangeError {
+    ExchangeError::JsonParse(
+        serde_json::from_str::<serde_json::Value>(&format!("missing field: {field}")).unwrap_err(),
+    )
+}
+
+fn expected_array_err(context: &str) -> ExchangeError {
+    ExchangeError::JsonParse(
+        serde_json::from_str::<serde_json::Value>(&format!("expected array in {context}"))
+            .unwrap_err(),
+    )
+}
 
 fn sign_query(query: &str, secret: &str) -> String {
     let mut mac =
@@ -21,39 +43,60 @@ fn sign_query(query: &str, secret: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Client for interacting with the Binance exchange REST API.
+///
+/// Delegates all HTTP transport, rate-limit tracking, and retry logic
+/// to an [`HttpClient`] instance.
 #[derive(Debug)]
 pub struct ExchangeClient {
     config: BinanceConfig,
-    http: reqwest::Client,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
+    http: HttpClient,
 }
 
 impl ExchangeClient {
+    /// Creates a new `ExchangeClient` from the given Binance configuration.
     pub fn new(config: BinanceConfig) -> ExchangeResult<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(ExchangeError::Http)?;
+        let http = HttpClient::new(RetryConfig::default(), config.enable_rate_limit)?;
 
-        Ok(Self {
-            config,
-            http,
-            rate_limiter: Arc::new(Mutex::new(RateLimiter::default())),
-        })
+        Ok(Self { config, http })
     }
 
+    /// Sends a GET request and deserializes the JSON body.
+    async fn get_json(&self, url: &str, weight: u32) -> ExchangeResult<serde_json::Value> {
+        let response = self
+            .http
+            .get(url, Some(&self.config.api_key), weight)
+            .await?;
+        let resp: serde_json::Value = response.json().await?;
+        Ok(resp)
+    }
+
+    /// Sends a POST request and deserializes the JSON body.
+    async fn post_json(&self, url: &str, weight: u32) -> ExchangeResult<serde_json::Value> {
+        let response = self
+            .http
+            .post(url, Some(&self.config.api_key), weight)
+            .await?;
+        let resp: serde_json::Value = response.json().await?;
+        Ok(resp)
+    }
+
+    /// Sends a DELETE request and deserializes the JSON body.
+    async fn delete_json(&self, url: &str, weight: u32) -> ExchangeResult<serde_json::Value> {
+        let response = self
+            .http
+            .delete(url, Some(&self.config.api_key), weight)
+            .await?;
+        let resp: serde_json::Value = response.json().await?;
+        Ok(resp)
+    }
+
+    /// Checks connectivity by fetching the Binance server time.
     pub async fn health_check(&self) -> ExchangeResult<u64> {
         let url = format!("{}/api/v3/time", self.config.base_url);
         debug!(url = %url, "Health check: fetching server time");
 
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let resp = self.get_json(&url, BINANCE_WEIGHT_SERVER_TIME).await?;
 
         let server_time = resp["serverTime"]
             .as_u64()
@@ -63,20 +106,50 @@ impl ExchangeClient {
         Ok(server_time)
     }
 
+    /// Fetches and applies exchange rate-limit quotas from the exchangeInfo endpoint.
+    ///
+    /// Registers all three Binance bucket types (REQUEST_WEIGHT, ORDERS, RAW_REQUESTS)
+    /// with their respective intervals and limits.
+    pub async fn fetch_rate_limits(&self) -> ExchangeResult<()> {
+        let url = format!("{}/api/v3/exchangeInfo", self.config.base_url);
+        debug!(url = %url, "Fetching rate limits from exchangeInfo");
+
+        let resp = self.get_json(&url, BINANCE_WEIGHT_EXCHANGE_INFO).await?;
+        self.check_api_error(&resp)?;
+
+        let rate_limits = resp["rateLimits"]
+            .as_array()
+            .ok_or_else(|| missing_field_err("rateLimits"))?;
+
+        let mut limiter = self.http.rate_limiter().lock().await;
+
+        for rl in rate_limits {
+            let limit_type_str = rl["rateLimitType"].as_str().unwrap_or("");
+            let interval_str = rl["interval"].as_str().unwrap_or("");
+            let limit = rl["limit"].as_u64().unwrap_or(0) as u32;
+
+            let Some(limit_type) = LimitType::from_binance_str(limit_type_str) else {
+                continue;
+            };
+            let Some(interval) = LimitInterval::from_binance_str(interval_str) else {
+                continue;
+            };
+
+            if limit > 0 {
+                let key = LimitKey::new(limit_type, interval);
+                limiter.register_bucket(key, limit);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetches the order book snapshot for the given symbol and depth limit.
     pub async fn fetch_order_book(
         &self,
         symbol: &str,
         limit: u32,
     ) -> ExchangeResult<OrderBookSnapshot> {
-        let weight = if limit <= 100 {
-            5
-        } else if limit <= 500 {
-            10
-        } else {
-            50
-        };
-        self.check_rate_limit(weight).await;
-
         let url = format!(
             "{}/api/v3/depth?symbol={}&limit={}",
             self.config.base_url,
@@ -86,27 +159,22 @@ impl ExchangeClient {
 
         debug!(url = %url, symbol, limit, "Fetching order book");
 
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let weight = match limit {
+            ..=100 => BINANCE_WEIGHT_DEPTH_100,
+            101..=500 => BINANCE_WEIGHT_DEPTH_500,
+            501..=1000 => BINANCE_WEIGHT_DEPTH_1000,
+            _ => BINANCE_WEIGHT_DEPTH_5000,
+        };
 
+        let resp = self.get_json(&url, weight).await?;
         self.check_api_error(&resp)?;
 
-        let bids_raw = resp["bids"].as_array().ok_or_else(|| {
-            ExchangeError::JsonParse(
-                serde_json::from_str::<serde_json::Value>("\"missing bids\"").unwrap_err(),
-            )
-        })?;
-        let asks_raw = resp["asks"].as_array().ok_or_else(|| {
-            ExchangeError::JsonParse(
-                serde_json::from_str::<serde_json::Value>("\"missing asks\"").unwrap_err(),
-            )
-        })?;
+        let bids_raw = resp["bids"]
+            .as_array()
+            .ok_or_else(|| missing_field_err("bids"))?;
+        let asks_raw = resp["asks"]
+            .as_array()
+            .ok_or_else(|| missing_field_err("asks"))?;
 
         let mut bids: Vec<(Decimal, Decimal)> = Vec::with_capacity(bids_raw.len());
         for level in bids_raw {
@@ -132,16 +200,22 @@ impl ExchangeClient {
                 let mid = (bid_p + ask_p) / Decimal::TWO;
                 let spread = ask_p - bid_p;
                 let bps = if mid.is_zero() {
-                    Decimal::ZERO
+                    None
                 } else {
-                    spread / mid * Decimal::from(10000)
+                    Some(spread / mid * Decimal::from(10000))
                 };
-                (mid, bps)
+                (Some(mid), bps)
             }
-            _ => (Decimal::ZERO, Decimal::ZERO),
+            _ => (None, None),
         };
 
-        let timestamp = resp["lastUpdateId"].as_u64().unwrap_or(0);
+        let timestamp = resp["lastUpdateId"].as_u64().unwrap_or_else(|| {
+            warn!(
+                symbol,
+                "Missing lastUpdateId in orderbook response, defaulting to 0"
+            );
+            0
+        });
 
         Ok(OrderBookSnapshot {
             symbol: symbol.to_string(),
@@ -155,11 +229,10 @@ impl ExchangeClient {
         })
     }
 
+    /// Fetches the account balance for all non-zero assets.
     pub async fn fetch_balance(&self) -> ExchangeResult<HashMap<String, NormalizedBalance>> {
-        self.check_rate_limit(10).await;
-
-        let query = "recvWindow=60000";
-        let signed = self.sign_request(query);
+        let query = format!("recvWindow={}", BINANCE_RECV_WINDOW_MS);
+        let signed = self.sign_request(&query)?;
 
         let url = format!(
             "{}/api/v3/account?{}&{}",
@@ -168,22 +241,12 @@ impl ExchangeClient {
 
         debug!(url = %url, "Fetching account balance");
 
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.get_json(&url, BINANCE_WEIGHT_ACCOUNT).await?;
         self.check_api_error(&resp)?;
 
-        let balances_raw = resp["balances"].as_array().ok_or_else(|| {
-            ExchangeError::JsonParse(
-                serde_json::from_str::<serde_json::Value>("\"missing balances\"").unwrap_err(),
-            )
-        })?;
+        let balances_raw = resp["balances"]
+            .as_array()
+            .ok_or_else(|| missing_field_err("balances"))?;
 
         let mut result = HashMap::new();
         for b in balances_raw {
@@ -206,6 +269,7 @@ impl ExchangeClient {
         Ok(result)
     }
 
+    /// Places a LIMIT GTC (good-til-cancelled) order.
     pub async fn create_limit_gtc_order(
         &self,
         symbol: &str,
@@ -213,35 +277,27 @@ impl ExchangeClient {
         amount: f64,
         price: f64,
     ) -> ExchangeResult<OrderResult> {
-        self.check_rate_limit(1).await;
-
         let query = format!(
-            "symbol={}&side={}&type=LIMIT&timeInForce=GTC&quantity={}&price={}&recvWindow=60000",
+            "symbol={}&side={}&type=LIMIT&timeInForce=GTC&quantity={}&price={}&recvWindow={}",
             symbol.replace('/', ""),
             side.to_uppercase(),
             amount,
             price,
+            BINANCE_RECV_WINDOW_MS,
         );
 
-        let signed = self.sign_request(&query);
+        let signed = self.sign_request(&query)?;
         let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
 
         debug!(symbol, side, amount, price, "Placing LIMIT GTC order");
 
-        let resp: serde_json::Value = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
     }
 
+    /// Places a LIMIT IOC (immediate-or-cancel) order.
     pub async fn create_limit_ioc_order(
         &self,
         symbol: &str,
@@ -249,134 +305,104 @@ impl ExchangeClient {
         amount: f64,
         price: f64,
     ) -> ExchangeResult<OrderResult> {
-        self.check_rate_limit(1).await;
-
         let query = format!(
-            "symbol={}&side={}&type=LIMIT&timeInForce=IOC&quantity={}&price={}&recvWindow=60000",
+            "symbol={}&side={}&type=LIMIT&timeInForce=IOC&quantity={}&price={}&recvWindow={}",
             symbol.replace('/', ""),
             side.to_uppercase(),
             amount,
             price,
+            BINANCE_RECV_WINDOW_MS,
         );
 
-        let signed = self.sign_request(&query);
+        let signed = self.sign_request(&query)?;
         let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
 
         debug!(symbol, side, amount, price, "Placing LIMIT IOC order");
 
-        let resp: serde_json::Value = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
     }
 
+    /// Places a MARKET order.
     pub async fn create_market_order(
         &self,
         symbol: &str,
         side: &str,
         amount: f64,
     ) -> ExchangeResult<OrderResult> {
-        self.check_rate_limit(1).await;
-
         let query = format!(
-            "symbol={}&side={}&type=MARKET&quantity={}&recvWindow=60000",
+            "symbol={}&side={}&type=MARKET&quantity={}&recvWindow={}",
             symbol.replace('/', ""),
             side.to_uppercase(),
             amount,
+            BINANCE_RECV_WINDOW_MS,
         );
 
-        let signed = self.sign_request(&query);
+        let signed = self.sign_request(&query)?;
         let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
 
         debug!(symbol, side, amount, "Placing MARKET order");
 
-        let resp: serde_json::Value = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
     }
 
+    /// Cancels an existing order by its ID and symbol.
     pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> ExchangeResult<OrderResult> {
-        self.check_rate_limit(1).await;
-
         let query = format!(
-            "symbol={}&orderId={}&recvWindow=60000",
+            "symbol={}&orderId={}&recvWindow={}",
             symbol.replace('/', ""),
             order_id,
+            BINANCE_RECV_WINDOW_MS,
         );
 
-        let signed = self.sign_request(&query);
+        let signed = self.sign_request(&query)?;
         let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
 
         debug!(order_id, symbol, "Cancelling order");
 
-        let resp: serde_json::Value = self
-            .http
-            .delete(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.delete_json(&url, BINANCE_WEIGHT_ORDER).await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
     }
 
+    /// Fetches the current status of an order by its ID and symbol.
     pub async fn fetch_order_status(
         &self,
         order_id: &str,
         symbol: &str,
     ) -> ExchangeResult<OrderResult> {
-        self.check_rate_limit(2).await;
-
         let query = format!(
-            "symbol={}&orderId={}&recvWindow=60000",
+            "symbol={}&orderId={}&recvWindow={}",
             symbol.replace('/', ""),
             order_id,
+            BINANCE_RECV_WINDOW_MS,
         );
 
-        let signed = self.sign_request(&query);
+        let signed = self.sign_request(&query)?;
         let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
 
         debug!(order_id, symbol, "Fetching order status");
 
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.get_json(&url, BINANCE_WEIGHT_ORDER_STATUS).await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
     }
 
+    /// Fetches the maker and taker trading fees for a symbol.
     pub async fn get_trading_fees(&self, symbol: &str) -> ExchangeResult<FeeStructure> {
-        self.check_rate_limit(1).await;
-
-        let query = format!("symbol={}&recvWindow=60000", symbol.replace('/', ""));
-        let signed = self.sign_request(&query);
+        let query = format!(
+            "symbol={}&recvWindow={}",
+            symbol.replace('/', ""),
+            BINANCE_RECV_WINDOW_MS
+        );
+        let signed = self.sign_request(&query)?;
         let url = format!(
             "{}/sapi/v1/asset/tradeFee?{}&{}",
             self.config.base_url, query, signed
@@ -384,22 +410,12 @@ impl ExchangeClient {
 
         debug!(symbol, "Fetching trading fees");
 
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.get_json(&url, BINANCE_WEIGHT_TRADE_FEE).await?;
         self.check_api_error(&resp)?;
 
-        let arr = resp.as_array().ok_or_else(|| {
-            ExchangeError::JsonParse(
-                serde_json::from_str::<serde_json::Value>("\"expected array\"").unwrap_err(),
-            )
-        })?;
+        let arr = resp
+            .as_array()
+            .ok_or_else(|| expected_array_err("tradeFee"))?;
 
         let first = arr.first().ok_or_else(|| ExchangeError::Api {
             code: -1,
@@ -412,19 +428,15 @@ impl ExchangeClient {
         Ok(FeeStructure { maker, taker })
     }
 
-    pub async fn fetch_my_trades(
-        &self,
-        symbol: &str,
-        limit: u32,
-    ) -> ExchangeResult<Vec<MyTrade>> {
-        self.check_rate_limit(5).await;
-
+    /// Fetches recent trades for the given symbol.
+    pub async fn fetch_my_trades(&self, symbol: &str, limit: u32) -> ExchangeResult<Vec<MyTrade>> {
         let query = format!(
-            "symbol={}&limit={}&recvWindow=60000",
+            "symbol={}&limit={}&recvWindow={}",
             symbol.replace('/', ""),
             limit,
+            BINANCE_RECV_WINDOW_MS,
         );
-        let signed = self.sign_request(&query);
+        let signed = self.sign_request(&query)?;
         let url = format!(
             "{}/api/v3/myTrades?{}&{}",
             self.config.base_url, query, signed
@@ -432,33 +444,35 @@ impl ExchangeClient {
 
         debug!(symbol, limit, "Fetching my trades");
 
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.config.api_key)
-            .send()
-            .await?
-            .json()
-            .await?;
-
+        let resp = self.get_json(&url, BINANCE_WEIGHT_MY_TRADES).await?;
         self.check_api_error(&resp)?;
 
-        let arr = resp.as_array().ok_or_else(|| {
-            ExchangeError::JsonParse(
-                serde_json::from_str::<serde_json::Value>("\"expected array\"").unwrap_err(),
-            )
-        })?;
+        let arr = resp
+            .as_array()
+            .ok_or_else(|| expected_array_err("myTrades"))?;
 
         let mut trades = Vec::new();
         for t in arr {
-            let id = t["id"].as_u64().unwrap_or(0).to_string();
-            let order_id = t["orderId"].as_u64().unwrap_or(0).to_string();
-            let side = t["isBuyer"].as_bool().map(|b| if b { "buy" } else { "sell" }).unwrap_or("unknown");
+            let id = t["id"]
+                .as_u64()
+                .ok_or_else(|| missing_field_err("trade id"))?
+                .to_string();
+            let order_id = t["orderId"]
+                .as_u64()
+                .ok_or_else(|| missing_field_err("orderId in trade"))?
+                .to_string();
+            let side = t["isBuyer"]
+                .as_bool()
+                .map(|b| if b { "buy" } else { "sell" })
+                .unwrap_or("unknown");
             let price = Self::parse_decimal(&t["price"])?;
             let qty = Self::parse_decimal(&t["qty"])?;
             let fee = Self::parse_decimal(&t["commission"])?;
             let fee_asset = t["commissionAsset"].as_str().unwrap_or("").to_string();
-            let timestamp = t["time"].as_u64().unwrap_or(0);
+            let timestamp = t["time"].as_u64().unwrap_or_else(|| {
+                warn!(id, "Missing timestamp in trade, defaulting to 0");
+                0
+            });
 
             trades.push(MyTrade {
                 id,
@@ -476,15 +490,15 @@ impl ExchangeClient {
         Ok(trades)
     }
 
-    fn sign_request(&self, query: &str) -> String {
+    fn sign_request(&self, query: &str) -> ExchangeResult<String> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_err(|_| ExchangeError::Config("system clock unavailable".into()))?
+            .as_millis() as u64;
 
         let query_with_ts = format!("{}&timestamp={}", query, timestamp);
         let signature = sign_query(&query_with_ts, &self.config.secret);
-        format!("timestamp={}&signature={}", timestamp, signature)
+        Ok(format!("timestamp={}&signature={}", timestamp, signature))
     }
 
     fn check_api_error(&self, resp: &serde_json::Value) -> ExchangeResult<()> {
@@ -493,9 +507,13 @@ impl ExchangeClient {
         {
             let msg = resp["msg"].as_str().unwrap_or("unknown error");
             match code {
-                -1015 => return Err(ExchangeError::RateLimit(msg.to_string())),
-                -2010 => return Err(ExchangeError::InsufficientFunds(msg.to_string())),
-                -1121 | -1013 => return Err(ExchangeError::InvalidSymbol(msg.to_string())),
+                BINANCE_ERR_RATE_LIMIT => return Err(ExchangeError::RateLimit(msg.to_string())),
+                BINANCE_ERR_INSUFFICIENT_FUNDS => {
+                    return Err(ExchangeError::InsufficientFunds(msg.to_string()));
+                }
+                BINANCE_ERR_INVALID_SYMBOL | BINANCE_ERR_INVALID_QUANTITY => {
+                    return Err(ExchangeError::InvalidSymbol(msg.to_string()));
+                }
                 _ => {
                     return Err(ExchangeError::Api {
                         code: code as i32,
@@ -516,11 +534,26 @@ impl ExchangeClient {
     }
 
     fn parse_order_result(resp: &serde_json::Value) -> ExchangeResult<OrderResult> {
-        let id = resp["orderId"].as_u64().unwrap_or(0).to_string();
-        let symbol = resp["symbol"].as_str().unwrap_or("").to_string();
-        let side = resp["side"].as_str().unwrap_or("").to_string();
-        let order_type = resp["type"].as_str().unwrap_or("").to_string();
-        let time_in_force = resp["timeInForce"].as_str().unwrap_or("").to_string();
+        let id = resp["orderId"]
+            .as_u64()
+            .ok_or_else(|| missing_field_err("orderId"))?
+            .to_string();
+        let symbol = resp["symbol"]
+            .as_str()
+            .ok_or_else(|| missing_field_err("symbol"))?
+            .to_string();
+        let side = resp["side"]
+            .as_str()
+            .ok_or_else(|| missing_field_err("side"))?
+            .to_string();
+        let order_type = resp["type"]
+            .as_str()
+            .ok_or_else(|| missing_field_err("type"))?
+            .to_string();
+        let time_in_force = resp["timeInForce"]
+            .as_str()
+            .ok_or_else(|| missing_field_err("timeInForce"))?
+            .to_string();
 
         let amount_requested = Self::parse_decimal(&resp["origQty"])?;
         let amount_filled = Self::parse_decimal(&resp["executedQty"])?;
@@ -538,7 +571,14 @@ impl ExchangeClient {
             .map(|fills| {
                 fills
                     .iter()
-                    .filter_map(|f| Self::parse_decimal(&f["commission"]).ok())
+                    .filter_map(|f| {
+                        Self::parse_decimal(&f["commission"])
+                            .map_err(|e| {
+                                warn!(error = %e, "Failed to parse fill commission, skipping");
+                                e
+                            })
+                            .ok()
+                    })
                     .fold(Decimal::ZERO, |acc, x| acc + x)
             })
             .unwrap_or(Decimal::ZERO);
@@ -556,7 +596,10 @@ impl ExchangeClient {
         let timestamp = resp["transactTime"]
             .as_u64()
             .or(resp["updateTime"].as_u64())
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                warn!(symbol = %symbol, "Missing transactTime/updateTime in order response, defaulting to 0");
+                0
+            });
 
         Ok(OrderResult {
             id,
@@ -574,16 +617,7 @@ impl ExchangeClient {
         })
     }
 
-    async fn check_rate_limit(&self, weight: u32) {
-        let limiter = self.rate_limiter.lock().await;
-        if !limiter.acquire(weight) {
-            warn!(weight, "Rate limit reached, waiting");
-            drop(limiter);
-            let limiter = self.rate_limiter.lock().await;
-            limiter.wait_and_acquire(weight);
-        }
-    }
-
+    /// Returns a reference to the underlying Binance configuration.
     pub fn config(&self) -> &BinanceConfig {
         &self.config
     }
@@ -626,5 +660,218 @@ mod tests {
     fn test_parse_decimal_invalid() {
         let val = serde_json::Value::String("not_a_number".to_string());
         assert!(ExchangeClient::parse_decimal(&val).is_err());
+    }
+
+    #[test]
+    fn test_parse_decimal_non_string_type() {
+        let val = serde_json::Value::Number(123.into());
+        assert!(ExchangeClient::parse_decimal(&val).is_err());
+    }
+
+    #[test]
+    fn test_parse_decimal_null() {
+        let val = serde_json::Value::Null;
+        assert!(ExchangeClient::parse_decimal(&val).is_err());
+    }
+
+    fn make_config() -> BinanceConfig {
+        BinanceConfig::with_custom_url(
+            "test_key".into(),
+            "test_secret".into(),
+            "https://testnet.binance.vision".into(),
+        )
+    }
+
+    #[test]
+    fn test_check_api_error_rate_limit() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp = serde_json::json!({"code": BINANCE_ERR_RATE_LIMIT, "msg": "Too many requests"});
+        let err = client.check_api_error(&resp).unwrap_err();
+        assert!(matches!(err, ExchangeError::RateLimit(_)));
+    }
+
+    #[test]
+    fn test_check_api_error_insufficient_funds() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp = serde_json::json!({"code": BINANCE_ERR_INSUFFICIENT_FUNDS, "msg": "Not enough balance"});
+        let err = client.check_api_error(&resp).unwrap_err();
+        assert!(matches!(err, ExchangeError::InsufficientFunds(_)));
+    }
+
+    #[test]
+    fn test_check_api_error_invalid_symbol() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp = serde_json::json!({"code": BINANCE_ERR_INVALID_SYMBOL, "msg": "Invalid symbol"});
+        let err = client.check_api_error(&resp).unwrap_err();
+        assert!(matches!(err, ExchangeError::InvalidSymbol(_)));
+    }
+
+    #[test]
+    fn test_check_api_error_invalid_quantity() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp =
+            serde_json::json!({"code": BINANCE_ERR_INVALID_QUANTITY, "msg": "Invalid quantity"});
+        let err = client.check_api_error(&resp).unwrap_err();
+        assert!(matches!(err, ExchangeError::InvalidSymbol(_)));
+    }
+
+    #[test]
+    fn test_check_api_error_generic_api_error() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp = serde_json::json!({"code": -9999, "msg": "Something went wrong"});
+        let err = client.check_api_error(&resp).unwrap_err();
+        assert!(matches!(err, ExchangeError::Api { code, .. } if code == -9999));
+    }
+
+    #[test]
+    fn test_check_api_error_positive_code_is_ok() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp = serde_json::json!({"code": 200, "msg": "OK"});
+        assert!(client.check_api_error(&resp).is_ok());
+    }
+
+    #[test]
+    fn test_check_api_error_no_code_field_is_ok() {
+        let client = ExchangeClient::new(make_config()).unwrap();
+        let resp = serde_json::json!({"symbol": "ETHUSDT", "price": "2000"});
+        assert!(client.check_api_error(&resp).is_ok());
+    }
+
+    #[test]
+    fn test_parse_order_result_missing_order_id() {
+        let resp = serde_json::json!({
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "origQty": "1.0",
+            "executedQty": "0.0"
+        });
+        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_order_result_missing_symbol() {
+        let resp = serde_json::json!({
+            "orderId": 123,
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "origQty": "1.0",
+            "executedQty": "0.0"
+        });
+        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_order_result_missing_side() {
+        let resp = serde_json::json!({
+            "orderId": 123,
+            "symbol": "ETHUSDT",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "origQty": "1.0",
+            "executedQty": "0.0"
+        });
+        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_order_result_missing_type() {
+        let resp = serde_json::json!({
+            "orderId": 123,
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "timeInForce": "GTC",
+            "origQty": "1.0",
+            "executedQty": "0.0"
+        });
+        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_order_result_missing_time_in_force() {
+        let resp = serde_json::json!({
+            "orderId": 123,
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "origQty": "1.0",
+            "executedQty": "0.0"
+        });
+        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_order_result_valid_no_fills() {
+        let resp = serde_json::json!({
+            "orderId": 123,
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "origQty": "1.00000000",
+            "executedQty": "0.00000000",
+            "status": "NEW",
+            "transactTime": 1700000000000u64
+        });
+        let result = ExchangeClient::parse_order_result(&resp).unwrap();
+        assert_eq!(result.id, "123");
+        assert_eq!(result.symbol, "ETHUSDT");
+        assert_eq!(result.side, "BUY");
+        assert_eq!(result.order_type, "LIMIT");
+        assert_eq!(result.time_in_force, "GTC");
+        assert_eq!(result.amount_requested, Decimal::ONE);
+        assert_eq!(result.amount_filled, Decimal::ZERO);
+        assert_eq!(result.avg_fill_price, Decimal::ZERO);
+        assert_eq!(result.fee, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_parse_order_result_with_fills() {
+        let resp = serde_json::json!({
+            "orderId": 456,
+            "symbol": "ETHUSDT",
+            "side": "SELL",
+            "type": "MARKET",
+            "timeInForce": "GTC",
+            "origQty": "1.00000000",
+            "executedQty": "1.00000000",
+            "cummulativeQuoteQty": "2000.50000000",
+            "status": "FILLED",
+            "transactTime": 1700000000000u64,
+            "fills": [
+                {"commission": "2.00000000", "commissionAsset": "USDT"},
+                {"commission": "0.50000000", "commissionAsset": "BNB"}
+            ]
+        });
+        let result = ExchangeClient::parse_order_result(&resp).unwrap();
+        assert_eq!(
+            result.avg_fill_price,
+            Decimal::from_str_exact("2000.5").unwrap()
+        );
+        assert_eq!(result.fee, Decimal::from_str_exact("2.5").unwrap());
+        assert_eq!(result.fee_asset, "USDT");
+    }
+
+    #[test]
+    fn test_parse_order_result_bad_decimal_in_orig_qty() {
+        let resp = serde_json::json!({
+            "orderId": 123,
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "origQty": "not_a_number",
+            "executedQty": "0.00000000"
+        });
+        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_exchange_client_new_builds_http() {
+        let config = make_config();
+        let client = ExchangeClient::new(config).unwrap();
+        assert_eq!(client.config.api_key, "test_key");
     }
 }

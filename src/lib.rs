@@ -51,10 +51,11 @@ pub use core::types::{
 };
 pub use core::wallet::{WalletError, WalletManager};
 pub use exchange::{
-    BINANCE_TESTNET_BASE_URL, BINANCE_TESTNET_WS_URL, AggregatedPrice, BinanceConfig,
+    AggregatedPrice, BINANCE_TESTNET_BASE_URL, BINANCE_TESTNET_WS_URL, BinanceConfig,
     CanExecuteResult, ExchangeClient, ExchangeError, ExchangeResult, FeeStructure, FillLevel,
-    MyTrade, NormalizedBalance, OrderBookAnalyzer, OrderBookSnapshot, OrderResult, PriceOracle,
-    PriceSource, PortfolioSnapshot, RateLimiter, SkewResult, VenueSkew, WalkResult,
+    HttpClient, LimitInterval, LimitKey, LimitType, MyTrade, NormalizedBalance, OrderBookAnalyzer,
+    OrderBookSnapshot, OrderResult, PortfolioSnapshot, PriceOracle, PriceSource, RateLimiter,
+    RetryConfig, SkewResult, VenueSkew, WalkResult,
 };
 pub use integration::{
     ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, CrossDexOpportunity, DexPoolInfo,
