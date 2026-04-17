@@ -226,7 +226,10 @@ fn multihop_fee_accumulation_reasonable() {
         30,
     );
 
-    let route = Route::new(vec![PoolRef::V2(pair1), PoolRef::V2(pair2)], vec![usdc(), dai(), weth()]);
+    let route = Route::new(
+        vec![PoolRef::V2(pair1), PoolRef::V2(pair2)],
+        vec![usdc(), dai(), weth()],
+    );
 
     let input_amount = 100_000 * 10u128.pow(6);
 

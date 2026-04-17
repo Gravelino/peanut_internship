@@ -43,8 +43,7 @@ pub struct PoolEntry {
     token1: Token,
 }
 
-impl PoolEntry {
-}
+impl PoolEntry {}
 
 /// Streams real-time price ticks for tracked Uniswap V2 pools.
 ///
@@ -103,10 +102,7 @@ impl PriceFeed {
     /// 1. Fetches fresh reserves for every tracked pool via `ChainClient::call`
     /// 2. Computes spot prices using sync [`compute_tick`]
     /// 3. Emits ticks through the channel
-    pub async fn start(
-        &self,
-        client: ChainClient,
-    ) -> PricingResult<mpsc::Receiver<PriceTick>> {
+    pub async fn start(&self, client: ChainClient) -> PricingResult<mpsc::Receiver<PriceTick>> {
         let (tx, rx) = mpsc::channel(Self::TICK_CHANNEL_SIZE);
 
         let probe = Provider::<Ws>::connect(&self.ws_url)
@@ -249,11 +245,7 @@ mod tests {
         }
     }
 
-    fn mock_entry(
-        addr_hex: &str,
-        t0: Token,
-        t1: Token,
-    ) -> PoolEntry {
+    fn mock_entry(addr_hex: &str, t0: Token, t1: Token) -> PoolEntry {
         PoolEntry {
             address: Address::new(addr_hex).unwrap(),
             token0: t0,
@@ -265,16 +257,13 @@ mod tests {
     fn test_compute_tick_both_directions() {
         let weth = mock_token("WETH", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", 18);
         let usdc = mock_token("USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6);
-        let entry = mock_entry(
-            "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
-            weth,
-            usdc,
-        );
+        let entry = mock_entry("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc", weth, usdc);
 
         let reserve0: u128 = 1_000 * DECIMAL_BASE.pow(18);
         let reserve1: u128 = 2_000_000 * DECIMAL_BASE.pow(6);
 
-        let ticks = PriceFeed::compute_tick(&entry, reserve0, reserve1, 18_000_000, 1_700_000_000_000);
+        let ticks =
+            PriceFeed::compute_tick(&entry, reserve0, reserve1, 18_000_000, 1_700_000_000_000);
 
         assert_eq!(ticks.len(), 2);
 
@@ -352,11 +341,7 @@ mod tests {
     fn test_compute_tick_zero_reserves_handled() {
         let weth = mock_token("WETH", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", 18);
         let usdc = mock_token("USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6);
-        let entry = mock_entry(
-            "0x0000000000000000000000000000000000000001",
-            weth,
-            usdc,
-        );
+        let entry = mock_entry("0x0000000000000000000000000000000000000001", weth, usdc);
 
         let ticks = PriceFeed::compute_tick(&entry, 0, 0, 0, 0);
 
@@ -371,18 +356,22 @@ mod tests {
     fn test_compute_tick_one_side_zero_reserve() {
         let weth = mock_token("WETH", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", 18);
         let usdc = mock_token("USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6);
-        let entry = mock_entry(
-            "0x0000000000000000000000000000000000000002",
-            weth,
-            usdc,
-        );
+        let entry = mock_entry("0x0000000000000000000000000000000000000002", weth, usdc);
 
         let reserve0: u128 = 1_000 * DECIMAL_BASE.pow(18);
         let ticks = PriceFeed::compute_tick(&entry, reserve0, 0, 0, 0);
 
         assert_eq!(ticks.len(), 2);
-        assert_eq!(ticks[0].price, Decimal::ZERO, "0→1 price should be zero when reserve1 is zero");
-        assert_eq!(ticks[1].price, Decimal::ZERO, "1→0 price should be zero when reserve1 is zero (untradeable)");
+        assert_eq!(
+            ticks[0].price,
+            Decimal::ZERO,
+            "0→1 price should be zero when reserve1 is zero"
+        );
+        assert_eq!(
+            ticks[1].price,
+            Decimal::ZERO,
+            "1→0 price should be zero when reserve1 is zero (untradeable)"
+        );
     }
 
     #[test]
@@ -446,15 +435,7 @@ mod tests {
         let usdc = mock_token("USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6);
 
         let addr = Address::new("0x0000000000000000000000000000000000000001").unwrap();
-        let pair = UniswapV2Pair::new(
-            addr,
-            weth,
-            usdc,
-            1000,
-            2000,
-            30,
-        )
-        .unwrap();
+        let pair = UniswapV2Pair::new(addr, weth, usdc, 1000, 2000, 30).unwrap();
 
         let feed = PriceFeed::new("ws://localhost:8545", vec![pair.clone(), pair]);
         assert_eq!(feed.pool_count(), 1);
@@ -462,11 +443,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_reserves_valid_data() {
-        let client =
-            ChainClient::new(vec!["http://127.0.0.1:1".to_string()], 1, 0).unwrap();
+        let client = ChainClient::new(vec!["http://127.0.0.1:1".to_string()], 1, 0).unwrap();
         let addr = Address::new("0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc").unwrap();
 
         let result = UniswapV2Pair::fetch_reserves(&addr, &client).await;
-        assert!(result.is_err(), "localhost should not be running; verifies the method compiles and calls correctly");
+        assert!(
+            result.is_err(),
+            "localhost should not be running; verifies the method compiles and calls correctly"
+        );
     }
 }

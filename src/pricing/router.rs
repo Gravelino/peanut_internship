@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::amm::UniswapV2Pair;
 use super::errors::{PricingError, PricingResult};
-use super::v3::pool::{v3_base_gas, v3_gas_per_hop, UniswapV3Pool};
-use crate::core::types::{Address, Token, DECIMAL_BASE, ETH_DECIMALS, WEI_PER_GWEI};
+use super::v3::pool::{UniswapV3Pool, v3_base_gas, v3_gas_per_hop};
+use crate::core::types::{Address, DECIMAL_BASE, ETH_DECIMALS, Token, WEI_PER_GWEI};
 
 const BASE_GAS_COST: u128 = 150_000;
 const GAS_PER_HOP: u128 = 100_000;

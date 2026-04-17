@@ -1,8 +1,6 @@
 use std::env;
 
-use peanut_internship_rust::{
-    Address, ChainClient, PricingEngine,
-};
+use peanut_internship_rust::{Address, ChainClient, PricingEngine};
 
 const PAIR_WETH_USDC: &str = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc";
 const PAIR_WETH_USDT: &str = "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852";

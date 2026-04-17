@@ -473,8 +473,8 @@ mod tests {
     use super::*;
     use crate::core::types::{Address, Token};
     use crate::pricing::UniswapV2Pair;
-    use crate::pricing::router::Route;
     use crate::pricing::router::PoolRef;
+    use crate::pricing::router::Route;
 
     #[test]
     fn test_decode_amount_out_uniswap_v2_array() {

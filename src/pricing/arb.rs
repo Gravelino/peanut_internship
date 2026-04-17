@@ -5,7 +5,7 @@ use super::amm::UniswapV2Pair;
 use super::mempool::ParsedSwap;
 use super::router::{PoolRef, RouteFinder};
 use super::v3::pool::UniswapV3Pool;
-use crate::core::types::{Address, Token, DECIMAL_BASE, WEI_PER_GWEI};
+use crate::core::types::{Address, DECIMAL_BASE, Token, WEI_PER_GWEI};
 
 const DEFAULT_GAS_LIMIT: u128 = 250_000;
 

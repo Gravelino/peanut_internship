@@ -1,8 +1,8 @@
+use ethers::types::U256;
 use peanut_internship_rust::{
     Address, ArbDetector, ChainClient, MempoolMonitor, ParsedSwap, PricingEngine, Token,
     UniswapV2Pair, UniswapV3Pool, WEI_PER_GWEI,
 };
-use ethers::types::U256;
 use std::env;
 
 const PAIR_WETH_USDC: &str = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc";

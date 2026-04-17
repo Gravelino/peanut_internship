@@ -284,18 +284,8 @@ impl PricingEngine {
     }
 
     fn rebuild_router(&mut self) {
-        let mut refs: Vec<PoolRef> = self
-            .pools
-            .values()
-            .cloned()
-            .map(PoolRef::V2)
-            .collect();
-        refs.extend(
-            self.v3_pools
-                .values()
-                .cloned()
-                .map(PoolRef::V3),
-        );
+        let mut refs: Vec<PoolRef> = self.pools.values().cloned().map(PoolRef::V2).collect();
+        refs.extend(self.v3_pools.values().cloned().map(PoolRef::V3));
         self.router = Some(RouteFinder::new(refs));
     }
 }

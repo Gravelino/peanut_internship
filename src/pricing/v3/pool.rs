@@ -5,8 +5,7 @@ use super::math;
 use super::tick;
 use crate::chain::client::ChainClient;
 use crate::core::types::{
-    Address, BlockId, DECIMAL_BASE, MAINNET_CHAIN_ID, Token, TokenAmount,
-    TransactionRequest,
+    Address, BlockId, DECIMAL_BASE, MAINNET_CHAIN_ID, Token, TokenAmount, TransactionRequest,
 };
 use crate::pricing::amm::{decode_address_from_slot, decode_u128_from_slot, fetch_token_metadata};
 use crate::pricing::errors::{PricingError, PricingResult};
@@ -176,7 +175,8 @@ impl UniswapV3Pool {
             if sqrt_price_current == step_sqrt_target && amount_remaining > 0 {
                 current_tick = next_tick;
             } else {
-                current_tick = math::get_tick_at_sqrt_ratio(sqrt_price_current).unwrap_or(current_tick);
+                current_tick =
+                    math::get_tick_at_sqrt_ratio(sqrt_price_current).unwrap_or(current_tick);
             }
 
             steps += 1;
@@ -262,7 +262,15 @@ impl UniswapV3Pool {
         let token0 = fetch_token_metadata(&token0_addr, client, zero_value.clone()).await?;
         let token1 = fetch_token_metadata(&token1_addr, client, zero_value).await?;
 
-        Self::new(address, token0, token1, fee_bps, sqrt_price_x96, liquidity, tick_raw)
+        Self::new(
+            address,
+            token0,
+            token1,
+            fee_bps,
+            sqrt_price_x96,
+            liquidity,
+            tick_raw,
+        )
     }
 
     pub async fn fetch_state(
@@ -356,7 +364,10 @@ mod tests {
         let scale_in = Decimal::from(DECIMAL_BASE.pow(pool.token0.decimals as u32));
         let scale_out = Decimal::from(DECIMAL_BASE.pow(pool.token1.decimals as u32));
 
-        assert_eq!(spot.round_dp(12), (expected_price * scale_in / scale_out).round_dp(12));
+        assert_eq!(
+            spot.round_dp(12),
+            (expected_price * scale_in / scale_out).round_dp(12)
+        );
     }
 
     #[test]
@@ -394,7 +405,10 @@ mod tests {
     fn test_v3_gas_estimate_lower_than_v2() {
         let v2_gas = 150_000 + 100_000;
         let v3_gas = UniswapV3Pool::estimate_gas(1);
-        assert!(v3_gas < v2_gas, "V3 gas ({v3_gas}) should be lower than V2 ({v2_gas})");
+        assert!(
+            v3_gas < v2_gas,
+            "V3 gas ({v3_gas}) should be lower than V2 ({v2_gas})"
+        );
     }
 
     #[test]
@@ -408,8 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_v3_pool_from_chain_compiles() {
-        let client =
-            ChainClient::new(vec!["http://127.0.0.1:1".to_string()], 1, 0).unwrap();
+        let client = ChainClient::new(vec!["http://127.0.0.1:1".to_string()], 1, 0).unwrap();
         let addr = Address::new("0x0000000000000000000000000000000000000001").unwrap();
 
         let result = UniswapV3Pool::from_chain(addr, &client).await;
