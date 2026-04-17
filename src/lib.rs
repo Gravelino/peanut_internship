@@ -56,11 +56,14 @@ pub use exchange::{
     MyTrade, NormalizedBalance, OrderBookAnalyzer, OrderBookSnapshot, OrderResult, PriceOracle,
     PriceSource, PortfolioSnapshot, RateLimiter, SkewResult, VenueSkew, WalkResult,
 };
-pub use integration::{ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, DexPoolInfo};
+pub use integration::{
+    ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, CrossDexOpportunity, DexPoolInfo,
+    ForkSimInfo,
+};
 pub use inventory::{
     ArbRecord, Balance, CostEstimate, InventoryError, InventoryResult, InventoryTracker, PnLEngine,
     PnLSummary, RebalancePlanner, TradeLeg, TradeSummary, TransferFeeInfo, TransferPlan, Venue,
-    min_operating_balance, transfer_fees,
+    WalletBalanceFetcher, min_operating_balance, transfer_fees,
 };
 pub use pricing::{
     AmountOutDecoder, ArbDetector, ArbKind, ArbOpportunity, ForkSimulation, ForkSimulator,
