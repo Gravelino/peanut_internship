@@ -10,19 +10,24 @@ run start:
 
 .PHONY: test
 test:
-	$(CARGO) test
+	$(CARGO) test --all
 
 .PHONY: lint
 lint:
 	$(CLIPPY) -- -D warnings
+	$(CLIPPY) --tests -- -A dead_code -D warnings
 
 .PHONY: format
 format:
-	$(CARGO) fmt -- --check
+	$(CARGO) fmt --all -- --check
 
 .PHONY: format-fix
 format-fix:
-	$(CARGO) fmt
+	$(CARGO) fmt --all
+
+.PHONY: ci
+ci: format lint test
+	@echo "CI checks passed"
 
 .PHONY: pre-commit
 pre-commit: lint format test
@@ -39,4 +44,5 @@ help:
 	@echo "  make lint        - Run clippy linting"
 	@echo "  make format      - Check formatting"
 	@echo "  make format-fix  - Automatically format code"
+	@echo "  make ci          - Run full CI pipeline (fmt + clippy + test)"
 	@echo "  make clean       - Remove built artifacts"
