@@ -17,6 +17,7 @@ use crate::exchange::config::BinanceConfig;
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
 use crate::exchange::http_client::{HttpClient, RetryConfig};
 use crate::exchange::rate_limiter::{LimitInterval, LimitKey, LimitType};
+use crate::exchange::traits::ExchangeAdapter;
 use crate::exchange::types::{
     FeeStructure, MyTrade, NormalizedBalance, OrderBookSnapshot, OrderResult,
 };
@@ -43,19 +44,175 @@ fn sign_query(query: &str, secret: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Client for interacting with the Binance exchange REST API.
+/// Client for interacting with exchange REST APIs.
 ///
-/// Delegates all HTTP transport, rate-limit tracking, and retry logic
-/// to an [`HttpClient`] instance.
+/// Currently wraps Binance-specific logic. Use [`ExchangeClient::new`] for Binance
+/// and [`ExchangeClient::bybit`] for Bybit.
 #[derive(Debug)]
 pub struct ExchangeClient {
+    inner: ExchangeClientInner,
+}
+
+/// Internal dispatch: Binance or Bybit.
+#[derive(Debug)]
+enum ExchangeClientInner {
+    Binance(BinanceClient),
+    Bybit(crate::exchange::bybit::BybitAdapter),
+}
+
+impl ExchangeClient {
+    /// Creates a new `ExchangeClient` for Binance from the given configuration.
+    pub fn new(config: BinanceConfig) -> ExchangeResult<Self> {
+        let inner = BinanceClient::new(config)?;
+        Ok(Self {
+            inner: ExchangeClientInner::Binance(inner),
+        })
+    }
+
+    /// Creates a new `ExchangeClient` for Bybit from the given configuration.
+    pub fn bybit(config: crate::exchange::bybit_config::BybitConfig) -> ExchangeResult<Self> {
+        let inner = crate::exchange::bybit::BybitAdapter::new(config)?;
+        Ok(Self {
+            inner: ExchangeClientInner::Bybit(inner),
+        })
+    }
+
+    /// Checks connectivity by fetching the exchange server time.
+    pub async fn health_check(&self) -> ExchangeResult<u64> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.health_check().await,
+            ExchangeClientInner::Bybit(b) => b.health_check().await,
+        }
+    }
+
+    pub async fn fetch_rate_limits(&self) -> ExchangeResult<()> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_rate_limits().await,
+            ExchangeClientInner::Bybit(b) => b.fetch_rate_limits().await,
+        }
+    }
+
+    pub async fn fetch_order_book(
+        &self,
+        symbol: &str,
+        limit: u32,
+    ) -> ExchangeResult<OrderBookSnapshot> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_order_book(symbol, limit).await,
+            ExchangeClientInner::Bybit(b) => b.fetch_order_book(symbol, limit).await,
+        }
+    }
+
+    pub async fn fetch_balance(&self) -> ExchangeResult<HashMap<String, NormalizedBalance>> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_balance().await,
+            ExchangeClientInner::Bybit(b) => b.fetch_balance().await,
+        }
+    }
+
+    pub async fn create_limit_gtc_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        amount: f64,
+        price: f64,
+    ) -> ExchangeResult<OrderResult> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => {
+                b.create_limit_gtc_order(symbol, side, amount, price).await
+            }
+            ExchangeClientInner::Bybit(b) => {
+                b.create_limit_order(symbol, side, amount, price, "GTC")
+                    .await
+            }
+        }
+    }
+
+    pub async fn create_limit_ioc_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        amount: f64,
+        price: f64,
+    ) -> ExchangeResult<OrderResult> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => {
+                b.create_limit_ioc_order(symbol, side, amount, price).await
+            }
+            ExchangeClientInner::Bybit(b) => {
+                b.create_limit_order(symbol, side, amount, price, "IOC")
+                    .await
+            }
+        }
+    }
+
+    pub async fn create_market_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        amount: f64,
+    ) -> ExchangeResult<OrderResult> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.create_market_order(symbol, side, amount).await,
+            ExchangeClientInner::Bybit(b) => b.create_market_order(symbol, side, amount).await,
+        }
+    }
+
+    pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> ExchangeResult<OrderResult> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.cancel_order(order_id, symbol).await,
+            ExchangeClientInner::Bybit(b) => b.cancel_order(order_id, symbol).await,
+        }
+    }
+
+    pub async fn fetch_order_status(
+        &self,
+        order_id: &str,
+        symbol: &str,
+    ) -> ExchangeResult<OrderResult> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_order_status(order_id, symbol).await,
+            ExchangeClientInner::Bybit(b) => b.fetch_order_status(order_id, symbol).await,
+        }
+    }
+
+    pub async fn get_trading_fees(&self, symbol: &str) -> ExchangeResult<FeeStructure> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.get_trading_fees(symbol).await,
+            ExchangeClientInner::Bybit(b) => b.get_trading_fees(symbol).await,
+        }
+    }
+
+    pub async fn fetch_my_trades(&self, symbol: &str, limit: u32) -> ExchangeResult<Vec<MyTrade>> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_my_trades(symbol, limit).await,
+            ExchangeClientInner::Bybit(b) => b.fetch_my_trades(symbol, limit).await,
+        }
+    }
+
+    /// Returns a reference to the underlying Binance configuration.
+    ///
+    /// Panics if the client is not a Binance client.
+    pub fn config(&self) -> &BinanceConfig {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => &b.config,
+            ExchangeClientInner::Bybit(_) => {
+                panic!("config() called on non-Binance ExchangeClient")
+            }
+        }
+    }
+}
+
+/// Binance-specific client implementation.
+#[derive(Debug)]
+struct BinanceClient {
     config: BinanceConfig,
     http: HttpClient,
 }
 
-impl ExchangeClient {
-    /// Creates a new `ExchangeClient` from the given Binance configuration.
-    pub fn new(config: BinanceConfig) -> ExchangeResult<Self> {
+impl BinanceClient {
+    /// Creates a new `BinanceClient` from the given Binance configuration.
+    fn new(config: BinanceConfig) -> ExchangeResult<Self> {
         let http = HttpClient::new(RetryConfig::default(), config.enable_rate_limit)?;
 
         Ok(Self { config, http })
@@ -92,7 +249,7 @@ impl ExchangeClient {
     }
 
     /// Checks connectivity by fetching the Binance server time.
-    pub async fn health_check(&self) -> ExchangeResult<u64> {
+    pub(crate) async fn health_check(&self) -> ExchangeResult<u64> {
         let url = format!("{}/api/v3/time", self.config.base_url);
         debug!(url = %url, "Health check: fetching server time");
 
@@ -110,7 +267,7 @@ impl ExchangeClient {
     ///
     /// Registers all three Binance bucket types (REQUEST_WEIGHT, ORDERS, RAW_REQUESTS)
     /// with their respective intervals and limits.
-    pub async fn fetch_rate_limits(&self) -> ExchangeResult<()> {
+    pub(crate) async fn fetch_rate_limits(&self) -> ExchangeResult<()> {
         let url = format!("{}/api/v3/exchangeInfo", self.config.base_url);
         debug!(url = %url, "Fetching rate limits from exchangeInfo");
 
@@ -145,7 +302,7 @@ impl ExchangeClient {
     }
 
     /// Fetches the order book snapshot for the given symbol and depth limit.
-    pub async fn fetch_order_book(
+    pub(crate) async fn fetch_order_book(
         &self,
         symbol: &str,
         limit: u32,
@@ -209,13 +366,10 @@ impl ExchangeClient {
             _ => (None, None),
         };
 
-        let timestamp = resp["lastUpdateId"].as_u64().unwrap_or_else(|| {
-            warn!(
-                symbol,
-                "Missing lastUpdateId in orderbook response, defaulting to 0"
-            );
-            0
-        });
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         Ok(OrderBookSnapshot {
             symbol: symbol.to_string(),
@@ -230,7 +384,7 @@ impl ExchangeClient {
     }
 
     /// Fetches the account balance for all non-zero assets.
-    pub async fn fetch_balance(&self) -> ExchangeResult<HashMap<String, NormalizedBalance>> {
+    pub(crate) async fn fetch_balance(&self) -> ExchangeResult<HashMap<String, NormalizedBalance>> {
         let query = format!("recvWindow={}", BINANCE_RECV_WINDOW_MS);
         let signed = self.sign_request(&query)?;
 
@@ -270,7 +424,7 @@ impl ExchangeClient {
     }
 
     /// Places a LIMIT GTC (good-til-cancelled) order.
-    pub async fn create_limit_gtc_order(
+    pub(crate) async fn create_limit_gtc_order(
         &self,
         symbol: &str,
         side: &str,
@@ -298,7 +452,7 @@ impl ExchangeClient {
     }
 
     /// Places a LIMIT IOC (immediate-or-cancel) order.
-    pub async fn create_limit_ioc_order(
+    pub(crate) async fn create_limit_ioc_order(
         &self,
         symbol: &str,
         side: &str,
@@ -326,7 +480,7 @@ impl ExchangeClient {
     }
 
     /// Places a MARKET order.
-    pub async fn create_market_order(
+    pub(crate) async fn create_market_order(
         &self,
         symbol: &str,
         side: &str,
@@ -352,7 +506,11 @@ impl ExchangeClient {
     }
 
     /// Cancels an existing order by its ID and symbol.
-    pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> ExchangeResult<OrderResult> {
+    pub(crate) async fn cancel_order(
+        &self,
+        order_id: &str,
+        symbol: &str,
+    ) -> ExchangeResult<OrderResult> {
         let query = format!(
             "symbol={}&orderId={}&recvWindow={}",
             symbol.replace('/', ""),
@@ -372,7 +530,7 @@ impl ExchangeClient {
     }
 
     /// Fetches the current status of an order by its ID and symbol.
-    pub async fn fetch_order_status(
+    pub(crate) async fn fetch_order_status(
         &self,
         order_id: &str,
         symbol: &str,
@@ -396,7 +554,7 @@ impl ExchangeClient {
     }
 
     /// Fetches the maker and taker trading fees for a symbol.
-    pub async fn get_trading_fees(&self, symbol: &str) -> ExchangeResult<FeeStructure> {
+    pub(crate) async fn get_trading_fees(&self, symbol: &str) -> ExchangeResult<FeeStructure> {
         let query = format!(
             "symbol={}&recvWindow={}",
             symbol.replace('/', ""),
@@ -429,7 +587,11 @@ impl ExchangeClient {
     }
 
     /// Fetches recent trades for the given symbol.
-    pub async fn fetch_my_trades(&self, symbol: &str, limit: u32) -> ExchangeResult<Vec<MyTrade>> {
+    pub(crate) async fn fetch_my_trades(
+        &self,
+        symbol: &str,
+        limit: u32,
+    ) -> ExchangeResult<Vec<MyTrade>> {
         let query = format!(
             "symbol={}&limit={}&recvWindow={}",
             symbol.replace('/', ""),
@@ -616,16 +778,23 @@ impl ExchangeClient {
             timestamp,
         })
     }
-
-    /// Returns a reference to the underlying Binance configuration.
-    pub fn config(&self) -> &BinanceConfig {
-        &self.config
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_binance_client() -> BinanceClient {
+        BinanceClient::new(make_config()).unwrap()
+    }
+
+    fn make_config() -> BinanceConfig {
+        BinanceConfig::with_custom_url(
+            "test_key".into(),
+            "test_secret".into(),
+            "https://testnet.binance.vision".into(),
+        )
+    }
 
     #[test]
     fn test_sign_query_deterministic() {
@@ -645,46 +814,38 @@ mod tests {
     #[test]
     fn test_parse_decimal_valid() {
         let val = serde_json::Value::String("123.456".to_string());
-        let d = ExchangeClient::parse_decimal(&val).unwrap();
+        let d = BinanceClient::parse_decimal(&val).unwrap();
         assert_eq!(d, Decimal::from_str_exact("123.456").unwrap());
     }
 
     #[test]
     fn test_parse_decimal_zero() {
         let val = serde_json::Value::String("0.00000000".to_string());
-        let d = ExchangeClient::parse_decimal(&val).unwrap();
+        let d = BinanceClient::parse_decimal(&val).unwrap();
         assert_eq!(d, Decimal::ZERO);
     }
 
     #[test]
     fn test_parse_decimal_invalid() {
         let val = serde_json::Value::String("not_a_number".to_string());
-        assert!(ExchangeClient::parse_decimal(&val).is_err());
+        assert!(BinanceClient::parse_decimal(&val).is_err());
     }
 
     #[test]
     fn test_parse_decimal_non_string_type() {
         let val = serde_json::Value::Number(123.into());
-        assert!(ExchangeClient::parse_decimal(&val).is_err());
+        assert!(BinanceClient::parse_decimal(&val).is_err());
     }
 
     #[test]
     fn test_parse_decimal_null() {
         let val = serde_json::Value::Null;
-        assert!(ExchangeClient::parse_decimal(&val).is_err());
-    }
-
-    fn make_config() -> BinanceConfig {
-        BinanceConfig::with_custom_url(
-            "test_key".into(),
-            "test_secret".into(),
-            "https://testnet.binance.vision".into(),
-        )
+        assert!(BinanceClient::parse_decimal(&val).is_err());
     }
 
     #[test]
     fn test_check_api_error_rate_limit() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp = serde_json::json!({"code": BINANCE_ERR_RATE_LIMIT, "msg": "Too many requests"});
         let err = client.check_api_error(&resp).unwrap_err();
         assert!(matches!(err, ExchangeError::RateLimit(_)));
@@ -692,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_check_api_error_insufficient_funds() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp = serde_json::json!({"code": BINANCE_ERR_INSUFFICIENT_FUNDS, "msg": "Not enough balance"});
         let err = client.check_api_error(&resp).unwrap_err();
         assert!(matches!(err, ExchangeError::InsufficientFunds(_)));
@@ -700,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_check_api_error_invalid_symbol() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp = serde_json::json!({"code": BINANCE_ERR_INVALID_SYMBOL, "msg": "Invalid symbol"});
         let err = client.check_api_error(&resp).unwrap_err();
         assert!(matches!(err, ExchangeError::InvalidSymbol(_)));
@@ -708,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_check_api_error_invalid_quantity() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp =
             serde_json::json!({"code": BINANCE_ERR_INVALID_QUANTITY, "msg": "Invalid quantity"});
         let err = client.check_api_error(&resp).unwrap_err();
@@ -717,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_check_api_error_generic_api_error() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp = serde_json::json!({"code": -9999, "msg": "Something went wrong"});
         let err = client.check_api_error(&resp).unwrap_err();
         assert!(matches!(err, ExchangeError::Api { code, .. } if code == -9999));
@@ -725,14 +886,14 @@ mod tests {
 
     #[test]
     fn test_check_api_error_positive_code_is_ok() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp = serde_json::json!({"code": 200, "msg": "OK"});
         assert!(client.check_api_error(&resp).is_ok());
     }
 
     #[test]
     fn test_check_api_error_no_code_field_is_ok() {
-        let client = ExchangeClient::new(make_config()).unwrap();
+        let client = make_binance_client();
         let resp = serde_json::json!({"symbol": "ETHUSDT", "price": "2000"});
         assert!(client.check_api_error(&resp).is_ok());
     }
@@ -747,7 +908,7 @@ mod tests {
             "origQty": "1.0",
             "executedQty": "0.0"
         });
-        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+        assert!(BinanceClient::parse_order_result(&resp).is_err());
     }
 
     #[test]
@@ -760,7 +921,7 @@ mod tests {
             "origQty": "1.0",
             "executedQty": "0.0"
         });
-        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+        assert!(BinanceClient::parse_order_result(&resp).is_err());
     }
 
     #[test]
@@ -773,7 +934,7 @@ mod tests {
             "origQty": "1.0",
             "executedQty": "0.0"
         });
-        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+        assert!(BinanceClient::parse_order_result(&resp).is_err());
     }
 
     #[test]
@@ -786,7 +947,7 @@ mod tests {
             "origQty": "1.0",
             "executedQty": "0.0"
         });
-        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+        assert!(BinanceClient::parse_order_result(&resp).is_err());
     }
 
     #[test]
@@ -799,7 +960,7 @@ mod tests {
             "origQty": "1.0",
             "executedQty": "0.0"
         });
-        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+        assert!(BinanceClient::parse_order_result(&resp).is_err());
     }
 
     #[test]
@@ -815,7 +976,7 @@ mod tests {
             "status": "NEW",
             "transactTime": 1700000000000u64
         });
-        let result = ExchangeClient::parse_order_result(&resp).unwrap();
+        let result = BinanceClient::parse_order_result(&resp).unwrap();
         assert_eq!(result.id, "123");
         assert_eq!(result.symbol, "ETHUSDT");
         assert_eq!(result.side, "BUY");
@@ -845,7 +1006,7 @@ mod tests {
                 {"commission": "0.50000000", "commissionAsset": "BNB"}
             ]
         });
-        let result = ExchangeClient::parse_order_result(&resp).unwrap();
+        let result = BinanceClient::parse_order_result(&resp).unwrap();
         assert_eq!(
             result.avg_fill_price,
             Decimal::from_str_exact("2000.5").unwrap()
@@ -865,13 +1026,13 @@ mod tests {
             "origQty": "not_a_number",
             "executedQty": "0.00000000"
         });
-        assert!(ExchangeClient::parse_order_result(&resp).is_err());
+        assert!(BinanceClient::parse_order_result(&resp).is_err());
     }
 
     #[test]
     fn test_exchange_client_new_builds_http() {
         let config = make_config();
         let client = ExchangeClient::new(config).unwrap();
-        assert_eq!(client.config.api_key, "test_key");
+        assert_eq!(client.config().api_key, "test_key");
     }
 }

@@ -9,6 +9,8 @@ use crate::core::types::{DEFAULT_TRANSFER_TIME_MIN, ETH_CONFIRMATIONS};
 pub enum Venue {
     /// Binance centralized exchange.
     Binance,
+    /// Bybit centralized exchange.
+    Bybit,
     /// On-chain wallet.
     Wallet,
 }
@@ -17,6 +19,7 @@ impl std::fmt::Display for Venue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Venue::Binance => write!(f, "binance"),
+            Venue::Bybit => write!(f, "bybit"),
             Venue::Wallet => write!(f, "wallet"),
         }
     }
