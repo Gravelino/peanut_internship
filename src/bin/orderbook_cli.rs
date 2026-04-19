@@ -3,6 +3,13 @@ use rust_decimal::Decimal;
 
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient, OrderBookAnalyzer};
 
+/// Formats a Unix-millisecond timestamp as a human-readable UTC string.
+fn format_unix_millis(millis: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("{millis} (raw epoch ms)"))
+}
+
 #[derive(Parser)]
 #[command(name = "orderbook")]
 #[command(about = "Fetch and analyze Binance order books")]
@@ -35,7 +42,10 @@ async fn main() {
     };
 
     match client.health_check().await {
-        Ok(t) => println!("Connected to Binance testnet (server time: {t})"),
+        Ok(t) => println!(
+            "Connected to Binance testnet (server time: {})",
+            format_unix_millis(t)
+        ),
         Err(e) => {
             eprintln!("Connection check failed: {e}");
             std::process::exit(1);
@@ -56,7 +66,7 @@ async fn main() {
     println!();
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  {} Order Book Analysis", pad_right(&ob.symbol, 34));
-    println!("║  Timestamp: {}", ob.timestamp);
+    println!("║  Timestamp: {}", format_unix_millis(ob.timestamp));
     println!("╠══════════════════════════════════════════════════════╣");
 
     match ob.best_bid {

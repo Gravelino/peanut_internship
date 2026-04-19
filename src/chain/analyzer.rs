@@ -171,8 +171,12 @@ impl AnalysisResult {
         out.push_str(&format!(
             "Timestamp:      {}\n",
             self.timestamp
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".into())
+                .and_then(|v| chrono::DateTime::from_timestamp(v as i64, 0))
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| self
+                    .timestamp
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into()))
         ));
         out.push_str(&format!("Status:         {}\n\n", self.status));
 

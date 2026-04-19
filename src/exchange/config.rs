@@ -3,7 +3,7 @@ use crate::exchange::errors::{ExchangeError, ExchangeResult};
 /// Base URL for the Binance testnet REST API.
 pub const BINANCE_TESTNET_BASE_URL: &str = "https://testnet.binance.vision";
 /// WebSocket URL for the Binance testnet streaming API.
-pub const BINANCE_TESTNET_WS_URL: &str = "wss://testnet.binance.vision/ws";
+pub const BINANCE_TESTNET_WS_URL: &str = "wss://stream.testnet.binance.vision";
 
 /// Configuration for connecting to the Binance exchange.
 #[derive(Debug, Clone)]
