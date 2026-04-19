@@ -1,12 +1,33 @@
 use chrono::{TimeZone, Utc};
+use clap::Parser;
 use rust_decimal::Decimal;
 
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient, PriceOracle};
+use peanut_internship_rust::inventory::PnLChartExporter;
 use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeLeg};
 use peanut_internship_rust::inventory::types::Venue;
 
+/// Formats a Unix-millisecond timestamp as a human-readable UTC string.
+fn format_unix_millis(millis: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("{millis} (raw epoch ms)"))
+}
+
+#[derive(Parser)]
+#[command(name = "pnl")]
+#[command(about = "PnL engine for tracking arbitrage trade performance")]
+struct Cli {
+    #[arg(long)]
+    chart: Option<String>,
+
+    #[arg(long, default_value = "html")]
+    chart_format: String,
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
     let config = match BinanceConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -25,7 +46,10 @@ async fn main() {
     };
 
     match client.health_check().await {
-        Ok(t) => println!("Connected to Binance testnet (server time: {t})"),
+        Ok(t) => println!(
+            "Connected to Binance testnet (server time: {})",
+            format_unix_millis(t)
+        ),
         Err(e) => {
             eprintln!("Connection check failed: {e}");
             std::process::exit(1);
@@ -163,7 +187,7 @@ async fn main() {
             let icon = if t.profitable { "✅" } else { "❌" };
             println!(
                 "  {} {} {}/{}  ${:+.2} ({:.1} bps) {}",
-                t.timestamp.format("%H:%M"),
+                t.timestamp.format("%H:%M UTC"),
                 t.symbol,
                 t.buy_venue,
                 t.sell_venue,
@@ -176,6 +200,18 @@ async fn main() {
         let csv_path = std::env::temp_dir().join("pnl_export.csv");
         if let Ok(()) = engine.export_csv(csv_path.to_str().unwrap()) {
             println!("\nCSV exported to: {}", csv_path.display());
+        }
+
+        if let Some(chart_path) = &cli.chart {
+            let trades = engine.trades();
+            let result = match cli.chart_format.as_str() {
+                "svg" => PnLChartExporter::export_svg(trades, chart_path),
+                _ => PnLChartExporter::export_html(trades, chart_path),
+            };
+            match result {
+                Ok(()) => println!("Chart exported to: {}", chart_path),
+                Err(e) => eprintln!("Chart export failed: {e}"),
+            }
         }
     }
 }

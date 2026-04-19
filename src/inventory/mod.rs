@@ -6,6 +6,7 @@
 //! - **PnL**: Arbitrage trade recording and PnL computation ([`PnLEngine`])
 //! - **Wallet**: On-chain ERC-20 balance fetching ([`WalletBalanceFetcher`])
 
+pub mod chart;
 pub mod errors;
 pub mod pnl;
 pub mod rebalancer;
@@ -13,6 +14,7 @@ pub mod tracker;
 pub mod types;
 pub mod wallet;
 
+pub use chart::PnLChartExporter;
 pub use errors::{InventoryError, InventoryResult};
 pub use pnl::{ArbRecord, PnLEngine, PnLSummary, TradeLeg, TradeSummary};
 pub use rebalancer::RebalancePlanner;
