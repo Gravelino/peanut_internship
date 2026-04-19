@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 
 use peanut_internship_rust::exchange::types::NormalizedBalance;
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient};
-use peanut_internship_rust::integration::{ArbCheckResult, ArbChecker};
+use peanut_internship_rust::integration::{ArbCheckResult, ArbChecker, ArbLogger};
 use peanut_internship_rust::inventory::{InventoryTracker, PnLEngine, Venue, WalletBalanceFetcher};
 
 const WETH_USDC_V2: &str = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc";
@@ -38,6 +38,12 @@ struct Cli {
 
     #[arg(long, default_value = "http://127.0.0.1:8545")]
     rpc_url: String,
+
+    #[arg(long)]
+    log_csv: Option<String>,
+
+    #[arg(long, default_value = "0")]
+    interval_secs: u64,
 }
 
 #[tokio::main]
@@ -131,38 +137,73 @@ async fn main() {
 
     let pnl_engine = PnLEngine::new();
     let checker = ArbChecker::new(exchange_client, tracker, pnl_engine);
+    let mut logger = ArbLogger::new();
 
-    println!();
-    println!("═══════════════════════════════════════════");
-    println!(
-        "  ARB CHECK: {} (size: {} {})",
-        cli.pair,
-        size,
-        base_asset(&cli.pair)
-    );
-    println!("═══════════════════════════════════════════");
-    println!();
+    loop {
+        println!();
+        println!("═══════════════════════════════════════════");
+        println!(
+            "  ARB CHECK: {} (size: {} {})",
+            cli.pair,
+            size,
+            base_asset(&cli.pair)
+        );
+        println!("═══════════════════════════════════════════");
+        println!();
 
+        let result = run_check(&checker, &cli, size, dex_fee_bps, gas_cost_usd).await;
+
+        match result {
+            Ok(r) => {
+                let exec = r.executable;
+                display_result(r.clone());
+                if cli.log_csv.is_some() {
+                    logger.log(r);
+                }
+                if cli.interval_secs == 0 {
+                    break;
+                }
+                if exec {
+                    println!("Profitable opportunity found, stopping loop.");
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("Arb check failed: {e}");
+                if cli.interval_secs == 0 {
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        println!("Waiting {}s before next check...", cli.interval_secs);
+        tokio::time::sleep(std::time::Duration::from_secs(cli.interval_secs)).await;
+    }
+
+    if let Some(csv_path) = &cli.log_csv {
+        match logger.export_csv(csv_path) {
+            Ok(()) => println!("Arb log exported to {}", csv_path),
+            Err(e) => eprintln!("Failed to export CSV: {e}"),
+        }
+    }
+}
+
+async fn run_check(
+    checker: &ArbChecker,
+    cli: &Cli,
+    size: Decimal,
+    dex_fee_bps: Decimal,
+    gas_cost_usd: Decimal,
+) -> Result<ArbCheckResult, peanut_internship_rust::integration::ArbCheckError> {
     if let (Some(fork_url), Some(pool)) = (cli.fork_url.as_deref(), cli.pool.as_deref()) {
         println!("DEX source: Uniswap V2 via Anvil fork");
         println!("  Fork URL: {}", fork_url);
         println!("  Pool:     {}", pool);
         println!();
         println!("Fetching DEX price from Uniswap V2 pool...");
-
-        match checker
+        checker
             .check_with_dex(&cli.pair, size, dex_fee_bps, gas_cost_usd, fork_url, pool)
             .await
-        {
-            Ok(result) => display_result(result),
-            Err(e) => {
-                eprintln!("Arb check failed: {e}");
-                eprintln!();
-                eprintln!("Make sure Anvil is running:");
-                eprintln!("  ./scripts/start_fork.sh");
-                std::process::exit(1);
-            }
-        }
     } else if let Some(fork_url) = cli.fork_url.as_deref() {
         let pool = default_pool(&cli.pair);
         println!("DEX source: Uniswap V2 via Anvil fork");
@@ -170,36 +211,18 @@ async fn main() {
         println!("  Pool:     {} (default for {})", pool, cli.pair);
         println!();
         println!("Fetching DEX price from Uniswap V2 pool...");
-
-        match checker
+        checker
             .check_with_dex(&cli.pair, size, dex_fee_bps, gas_cost_usd, fork_url, pool)
             .await
-        {
-            Ok(result) => display_result(result),
-            Err(e) => {
-                eprintln!("Arb check failed: {e}");
-                eprintln!();
-                eprintln!("Make sure Anvil is running:");
-                eprintln!("  ./scripts/start_fork.sh");
-                std::process::exit(1);
-            }
-        }
     } else {
         println!("DEX source: Price oracle (Binance, CoinGecko, Kraken, etc.)");
         println!("Tip: Use --fork-url http://127.0.0.1:8545 for real Uniswap V2 prices");
         println!();
         println!("Fetching prices from multiple sources...");
-
-        match checker
+        checker
             .check(&cli.pair, size, dex_fee_bps, gas_cost_usd)
             .await
-        {
-            Ok(result) => display_result(result),
-            Err(e) => {
-                eprintln!("Arb check failed: {e}");
-                std::process::exit(1);
-            }
-        }
+            .map_err(peanut_internship_rust::integration::ArbCheckError::from)
     }
 }
 
