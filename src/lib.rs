@@ -64,10 +64,11 @@ pub use integration::{
     DexPoolInfo, ForkSimInfo,
 };
 pub use inventory::{
-    ArbRecord, Balance, CostEstimate, InventoryError, InventoryResult, InventoryTracker,
-    PnLChartExporter, PnLEngine, PnLSummary, RebalancePlanner, TradeLeg, TradeSummary,
-    TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, min_operating_balance,
-    transfer_fees,
+    ArbRecord, Balance, CostEstimate, ExecutorConfig, InventoryError, InventoryResult,
+    InventoryTracker, PnLChartExporter, PnLEngine, PnLSummary, RebalanceExecutor, RebalancePlanner,
+    RebalanceResult, RebalanceStatus, RebalanceStep, TradeLeg, TradeStep, TradeSummary,
+    TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, WithdrawStep,
+    min_operating_balance, transfer_fees,
 };
 pub use pricing::{
     AmountOutDecoder, ArbDetector, ArbKind, ArbOpportunity, ForkSimulation, ForkSimulator,

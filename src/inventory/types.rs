@@ -15,6 +15,13 @@ pub enum Venue {
     Wallet,
 }
 
+impl Venue {
+    /// Returns true if this venue is a CEX with a trading API.
+    pub fn is_cex(&self) -> bool {
+        matches!(self, Venue::Binance | Venue::Bybit)
+    }
+}
+
 impl std::fmt::Display for Venue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -93,6 +100,121 @@ pub struct CostEstimate {
     pub total_time_min: u32,
     /// List of asset tickers affected by the transfers.
     pub assets_affected: Vec<String>,
+}
+
+/// A concrete step the rebalance executor can perform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RebalanceStep {
+    /// Trade on a CEX venue to adjust inventory (fast, ~1s).
+    Trade(TradeStep),
+    /// Withdraw from a CEX to an on-chain wallet (slow, on-chain).
+    Withdraw(WithdrawStep),
+}
+
+/// Parameters for a single trade on a CEX venue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeStep {
+    /// Venue to execute the trade on.
+    pub venue: Venue,
+    /// Trading pair symbol (e.g. "ETHUSDT").
+    pub symbol: String,
+    /// Order side: "BUY" or "SELL".
+    pub side: String,
+    /// Base asset being bought or sold (e.g. "ETH").
+    pub base_asset: String,
+    /// Quote asset used for pricing (e.g. "USDT").
+    pub quote_asset: String,
+    /// Quantity of the base asset to trade.
+    pub amount: Decimal,
+    /// Maximum acceptable slippage in basis points.
+    pub max_slippage_bps: Decimal,
+}
+
+/// Parameters for an on-chain withdrawal from a CEX to a wallet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WithdrawStep {
+    /// Source CEX venue.
+    pub from_venue: Venue,
+    /// Destination (always Wallet for now).
+    pub to_venue: Venue,
+    /// Asset to withdraw.
+    pub asset: String,
+    /// Amount to withdraw before fees.
+    pub amount: Decimal,
+    /// Estimated withdrawal fee.
+    pub fee: Decimal,
+}
+
+/// Outcome of executing a single rebalance step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalanceResult {
+    /// The step that was (attempted to be) executed.
+    pub step: RebalanceStep,
+    /// Exchange-assigned order ID (if an order was placed).
+    pub order_id: Option<String>,
+    /// Quantity of base asset actually filled.
+    pub amount_filled: Decimal,
+    /// Volume-weighted average fill price.
+    pub avg_price: Decimal,
+    /// Fee charged by the exchange.
+    pub fee: Decimal,
+    /// Asset in which the fee was charged.
+    pub fee_asset: String,
+    /// Final status of this step.
+    pub status: RebalanceStatus,
+}
+
+/// Final status of a rebalance step execution attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RebalanceStatus {
+    /// Fully filled.
+    Executed,
+    /// Partially filled; IOC remainder cancelled.
+    PartiallyFilled,
+    /// Book walk showed slippage exceeding the limit; no order placed.
+    SlippageExceeded,
+    /// Pre-flight balance check failed; no order placed.
+    InsufficientBalance,
+    /// Exchange rejected the order.
+    OrderRejected,
+    /// Hit rate limit; backed off.
+    RateLimited,
+    /// Dry-run mode: logged but not executed.
+    DryRun,
+    /// A previous step failed; this step was skipped.
+    Aborted,
+    /// Withdrawals not yet implemented.
+    NotSupported,
+}
+
+/// Configuration for the rebalance executor's safety limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutorConfig {
+    /// Maximum acceptable slippage per trade in basis points (default: 50 = 0.5%).
+    pub max_slippage_bps: Decimal,
+    /// Maximum notional value of a single trade in USD (default: 1000).
+    pub max_single_trade_usd: Decimal,
+    /// Minimum fill percentage to accept a partial fill (default: 0.8 = 80%).
+    pub min_fill_pct: f64,
+    /// Milliseconds between order-status polls (default: 500).
+    pub order_poll_interval_ms: u64,
+    /// Maximum number of poll attempts before giving up (default: 10).
+    pub order_poll_max_attempts: u32,
+    /// If true, log steps but do not place real orders.
+    pub dry_run: bool,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            max_slippage_bps: Decimal::from(50),
+            max_single_trade_usd: Decimal::from(1000),
+            min_fill_pct: 0.8,
+            order_poll_interval_ms: 500,
+            order_poll_max_attempts: 10,
+            dry_run: false,
+        }
+    }
 }
 
 /// Binance withdrawal fees and parameters.
