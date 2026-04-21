@@ -205,7 +205,7 @@ impl ExchangeAdapter for BybitAdapter {
             let qty = Self::parse_decimal(&level[1])?;
             bids.push((price, qty));
         }
-        bids.sort_by(|a, b| b.0.cmp(&a.0));
+        bids.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         let mut asks: Vec<(Decimal, Decimal)> = Vec::with_capacity(asks_raw.len());
         for level in asks_raw {
@@ -213,7 +213,7 @@ impl ExchangeAdapter for BybitAdapter {
             let qty = Self::parse_decimal(&level[1])?;
             asks.push((price, qty));
         }
-        asks.sort_by(|a, b| a.0.cmp(&b.0));
+        asks.sort_by_key(|a| a.0);
 
         let best_bid = bids.first().copied();
         let best_ask = asks.first().copied();
