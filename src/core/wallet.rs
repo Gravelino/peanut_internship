@@ -141,6 +141,7 @@ impl WalletManager {
         ethers::utils::to_checksum(&self.wallet.address(), None)
     }
 
+    /// Signs an arbitrary message, rejecting empty or oversized payloads.
     #[instrument(skip(self, message))]
     pub async fn sign_message(&self, message: &str) -> Result<Signature, WalletError> {
         debug!("Signing message ({} bytes)", message.len());

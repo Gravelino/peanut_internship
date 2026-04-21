@@ -1,12 +1,14 @@
 use super::math;
 
+/// Maps Uniswap V3 fee tier (in bps) to its tick spacing.
+/// See: https://docs.uniswap.org/protocol/concepts/V3-overview/concentrated-liquidity#tick-spacing
 pub fn fee_tier_to_tick_spacing(fee_bps: u32) -> i32 {
     match fee_bps {
         100 => 1,
         500 => 10,
         3000 => 60,
         10000 => 200,
-        _ => 60,
+        _ => 60, // default to 0.3% tier spacing for unknown fee tiers
     }
 }
 

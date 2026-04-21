@@ -15,8 +15,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_url = env::var("MAINNET_RPC_URL")
         .or_else(|_| env::var("SEPOLIA_RPC_URL"))
         .map_err(|_| "MAINNET_RPC_URL or SEPOLIA_RPC_URL is required")?;
-    let ws_url = env::var("WS_RPC_URL")
-        .unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string());
+    let ws_url =
+        env::var("WS_RPC_URL").unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string());
 
     let client = ChainClient::new(vec![rpc_url.clone()], 3, 1)?;
     let mut engine = PricingEngine::new(client, &rpc_url, &ws_url)?;
@@ -75,10 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let summary = analyzer.summarize();
         println!("\n=== Impact Summary ===");
         println!("Observations: {}", summary.num_observations);
-        println!(
-            "Price change: {:.4}%",
-            summary.price_change_pct.round_dp(4)
-        );
+        println!("Price change: {:.4}%", summary.price_change_pct.round_dp(4));
         println!("Max impact observed: {:.4}%", summary.max_impact_observed);
         println!("\nAvg impact by trade size:");
         for stat in &summary.avg_impact_by_size {
@@ -112,11 +109,26 @@ fn demo_local_history() -> Result<(), Box<dyn std::error::Error>> {
     let mut analyzer = HistoricalImpactAnalyzer::new(weth.clone(), usdc.clone());
 
     let reserves = [
-        (10_000_000_000_000_000_000_000u128, 20_000_000_000_000_000_000_000u128),
-        (9_500_000_000_000_000_000_000u128, 21_000_000_000_000_000_000_000u128),
-        (8_000_000_000_000_000_000_000u128, 25_000_000_000_000_000_000_000u128),
-        (11_000_000_000_000_000_000_000u128, 19_000_000_000_000_000_000_000u128),
-        (10_000_000_000_000_000_000_000u128, 20_000_000_000_000_000_000_000u128),
+        (
+            10_000_000_000_000_000_000_000u128,
+            20_000_000_000_000_000_000_000u128,
+        ),
+        (
+            9_500_000_000_000_000_000_000u128,
+            21_000_000_000_000_000_000_000u128,
+        ),
+        (
+            8_000_000_000_000_000_000_000u128,
+            25_000_000_000_000_000_000_000u128,
+        ),
+        (
+            11_000_000_000_000_000_000_000u128,
+            19_000_000_000_000_000_000_000u128,
+        ),
+        (
+            10_000_000_000_000_000_000_000u128,
+            20_000_000_000_000_000_000_000u128,
+        ),
     ];
 
     for (i, (r_in, r_out)) in reserves.iter().enumerate() {
@@ -133,17 +145,31 @@ fn demo_local_history() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     for obs in analyzer.observations() {
-        print!("blk={}: price={:.2}  impact:", obs.block_number, obs.price.round_dp(2));
+        print!(
+            "blk={}: price={:.2}  impact:",
+            obs.block_number,
+            obs.price.round_dp(2)
+        );
         for si in &obs.impacts {
-            print!(" {}bps={:.4}%", si.size_bps, si.price_impact_pct.round_dp(4));
+            print!(
+                " {}bps={:.4}%",
+                si.size_bps,
+                si.price_impact_pct.round_dp(4)
+            );
         }
         println!();
     }
 
     let summary = analyzer.summarize();
     println!("\nSummary:");
-    println!("  Price change: {:.4}%", summary.price_change_pct.round_dp(4));
-    println!("  Max impact:   {:.4}%", summary.max_impact_observed.round_dp(4));
+    println!(
+        "  Price change: {:.4}%",
+        summary.price_change_pct.round_dp(4)
+    );
+    println!(
+        "  Max impact:   {:.4}%",
+        summary.max_impact_observed.round_dp(4)
+    );
     for stat in &summary.avg_impact_by_size {
         println!(
             "  {}bps: avg={:.4}% min={:.4}% max={:.4}%",

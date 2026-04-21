@@ -19,8 +19,8 @@ pub mod router;
 pub mod simulator;
 pub mod v3;
 
-pub use arb::{ArbDetector, ArbKind, ArbOpportunity};
 pub use amm::{ImpactRow, PriceImpactAnalyzer, TradeCost, UniswapV2Pair};
+pub use arb::{ArbDetector, ArbKind, ArbOpportunity};
 pub use engine::{PricingEngine, Quote, QuoteError, QuoteResult};
 pub use errors::{PricingError, PricingResult};
 pub use feed::{PriceFeed, PriceTick};

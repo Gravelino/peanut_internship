@@ -33,6 +33,9 @@
 
 pub mod chain;
 pub mod core;
+pub mod exchange;
+pub mod integration;
+pub mod inventory;
 pub mod pricing;
 
 pub use chain::{
@@ -47,11 +50,31 @@ pub use core::types::{
     TransactionStatus, WEI_PER_GWEI,
 };
 pub use core::wallet::{WalletError, WalletManager};
+pub use exchange::{
+    AggregatedPrice, BINANCE_TESTNET_BASE_URL, BINANCE_TESTNET_WS_URL, BYBIT_TESTNET_BASE_URL,
+    BYBIT_TESTNET_WS_URL, BinanceConfig, BybitAdapter, BybitConfig, CanExecuteResult, DepthEvent,
+    DepthSnapshot, DepthUpdate, ExchangeAdapter, ExchangeClient, ExchangeConfig, ExchangeError,
+    ExchangeResult, FeeStructure, FillLevel, HttpClient, LimitInterval, LimitKey, LimitType,
+    LocalOrderBook, MyTrade, NormalizedBalance, OrderBookAnalyzer, OrderBookSnapshot, OrderResult,
+    PortfolioSnapshot, PriceOracle, PriceSource, RateLimiter, RetryConfig, SequenceStatus,
+    SkewResult, VenueSkew, WalkResult,
+};
+pub use integration::{
+    ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, ArbLogger, CrossDexOpportunity,
+    DexPoolInfo, ForkSimInfo,
+};
+pub use inventory::{
+    ArbRecord, Balance, CostEstimate, ExecutorConfig, InventoryError, InventoryResult,
+    InventoryTracker, PnLChartExporter, PnLEngine, PnLSummary, RebalanceExecutor, RebalancePlanner,
+    RebalanceResult, RebalanceStatus, RebalanceStep, TradeLeg, TradeStep, TradeSummary,
+    TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, WithdrawStep,
+    min_operating_balance, transfer_fees,
+};
 pub use pricing::{
-    ArbDetector, ArbKind, ArbOpportunity, AmountOutDecoder, ForkSimulation, ForkSimulator,
+    AmountOutDecoder, ArbDetector, ArbKind, ArbOpportunity, ForkSimulation, ForkSimulator,
     HistoricalImpactAnalyzer, HistoricalImpactPoint, ImpactRow, ImpactSummary, MempoolMonitor,
     ParsedSwap, PoolRef, PriceFeed, PriceImpactAnalyzer, PriceTick, PricingEngine, PricingError,
-    PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SizeImpact, SizeImpactAvg,
-    SimulationComparison, SimulationResult, SimulationVerdict, SwapParams, TradeCost,
+    PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SimulationComparison,
+    SimulationResult, SimulationVerdict, SizeImpact, SizeImpactAvg, SwapParams, TradeCost,
     UniswapV2Pair, UniswapV3Pool, V3SwapQuote,
 };

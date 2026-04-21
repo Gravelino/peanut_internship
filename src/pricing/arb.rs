@@ -5,36 +5,55 @@ use super::amm::UniswapV2Pair;
 use super::mempool::ParsedSwap;
 use super::router::{PoolRef, RouteFinder};
 use super::v3::pool::UniswapV3Pool;
-use crate::core::types::{Address, Token, DECIMAL_BASE, WEI_PER_GWEI};
+use crate::core::types::{
+    Address, DECIMAL_BASE, MIN_CROSS_DEX_AMOUNT_WEI, MIN_TRIANGULAR_ARB_HOPS, Token, WEI_PER_GWEI,
+};
 
+/// Estimated gas units for a single cross-DEX arb execution (2 swaps + overhead).
 const DEFAULT_GAS_LIMIT: u128 = 250_000;
 
+/// Classification of arbitrage opportunity type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArbKind {
+    /// Cross-DEX arb: same pair on different pools with a price spread.
     CrossDex,
+    /// Triangular arb: cyclic route through multiple tokens returning a profit.
     Triangular,
+    /// Mempool front-run: pending swap accepts less than fair value.
     MempoolFrontRun,
 }
 
+/// A detected arbitrage opportunity with profit and gas estimates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbOpportunity {
+    /// Type of arbitrage detected.
     pub kind: ArbKind,
+    /// Input token address.
     pub token_in: Address,
+    /// Output token address.
     pub token_out: Address,
+    /// Input amount in raw token units.
     pub amount_in: u128,
+    /// Expected gross profit in ETH wei.
     pub expected_profit_wei: u128,
+    /// Estimated gas cost in ETH wei.
     pub gas_cost_wei: u128,
+    /// Net profit after gas in ETH wei.
     pub net_profit_wei: u128,
+    /// Triggering transaction hash, if any.
     pub trigger_tx: Option<String>,
+    /// Pool addresses involved in the route.
     pub route_pools: Vec<Address>,
 }
 
 impl ArbOpportunity {
+    /// Returns `true` if the opportunity has positive net profit after gas.
     pub fn is_profitable(&self) -> bool {
         self.net_profit_wei > 0
     }
 }
 
+/// Detects arbitrage opportunities across V2 and V3 pools.
 #[derive(Debug, Clone)]
 pub struct ArbDetector {
     pools: Vec<PoolRef>,
@@ -43,6 +62,7 @@ pub struct ArbDetector {
 }
 
 impl ArbDetector {
+    /// Creates a new detector from V2 and V3 pools and the current gas price.
     pub fn new(
         v2_pools: Vec<UniswapV2Pair>,
         v3_pools: Vec<UniswapV3Pool>,
@@ -58,6 +78,7 @@ impl ArbDetector {
         }
     }
 
+    /// Scans for all arbitrage opportunities triggered by a pending swap.
     pub fn detect_from_swap(&self, swap: &ParsedSwap) -> Vec<ArbOpportunity> {
         let Some(token_in) = &swap.token_in else {
             return vec![];
@@ -94,7 +115,7 @@ impl ArbDetector {
             return vec![];
         }
 
-        let amount_in = swap.amount_in.as_u128().max(1_000_000_000_000_000_000);
+        let amount_in = swap.amount_in.as_u128().max(MIN_CROSS_DEX_AMOUNT_WEI);
         let mut best: Option<ArbOpportunity> = None;
 
         for i in 0..matching.len() {
@@ -285,7 +306,7 @@ impl ArbDetector {
             None => return vec![],
         };
 
-        let amount_in: u128 = 1_000_000_000_000_000_000;
+        let amount_in: u128 = MIN_CROSS_DEX_AMOUNT_WEI;
         let routes = self.finder.find_all_routes(&start_tok, &end_tok, 3);
 
         let mut best: Option<ArbOpportunity> = None;
@@ -297,7 +318,7 @@ impl ArbDetector {
 
             let reverse_routes = self.finder.find_all_routes(&end_tok, &start_tok, 3);
             for rev_route in &reverse_routes {
-                if route.num_hops() + rev_route.num_hops() < 3 {
+                if route.num_hops() + rev_route.num_hops() < MIN_TRIANGULAR_ARB_HOPS {
                     continue;
                 }
 

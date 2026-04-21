@@ -1,47 +1,70 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::amm::PriceImpactAnalyzer;
+use super::amm::{DEFAULT_FEE_BPS, PriceImpactAnalyzer};
 use super::errors::{PricingError, PricingResult};
 use super::feed::PriceTick;
-use crate::core::types::{Address, Token};
+use crate::core::types::{Address, BPS_SCALE, Token};
 
 const DEFAULT_TRADE_SIZES_BPS: &[u128] = &[1, 5, 10, 25, 50, 100];
 
+/// A single historical observation containing price and impact measurements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoricalImpactPoint {
+    /// Block number of this observation.
     pub block_number: u64,
+    /// Unix timestamp (milliseconds) of this observation.
     pub timestamp: u64,
+    /// Spot price at the time of observation.
     pub price: Decimal,
+    /// Price impact at each configured trade size.
     pub impacts: Vec<SizeImpact>,
 }
 
+/// Price impact measurement for a specific trade size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SizeImpact {
+    /// Trade size in basis points of the input reserve.
     pub size_bps: u128,
+    /// Raw input amount corresponding to this BPS size.
     pub amount_in_raw: u128,
+    /// Price impact expressed as a percentage.
     pub price_impact_pct: Decimal,
 }
 
+/// Aggregate summary of historical price impact observations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactSummary {
+    /// Pool contract address.
     pub pool_address: Address,
+    /// Input token address.
     pub token_in: Address,
+    /// Output token address.
     pub token_out: Address,
+    /// Total number of observations recorded.
     pub num_observations: usize,
+    /// Average impact statistics per configured trade size.
     pub avg_impact_by_size: Vec<SizeImpactAvg>,
+    /// Maximum price impact observed across all sizes and observations.
     pub max_impact_observed: Decimal,
+    /// Price change from first to last observation as a percentage.
     pub price_change_pct: Decimal,
 }
 
+/// Average, max, and min impact for a single trade size across observations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SizeImpactAvg {
+    /// Trade size in basis points of the input reserve.
     pub size_bps: u128,
+    /// Average price impact percentage across observations.
     pub avg_impact_pct: Decimal,
+    /// Maximum price impact percentage observed.
     pub max_impact_pct: Decimal,
+    /// Minimum price impact percentage observed.
     pub min_impact_pct: Decimal,
 }
 
+/// Accumulates price impact observations over time and computes aggregate statistics.
 #[derive(Debug, Clone)]
 pub struct HistoricalImpactAnalyzer {
     token_in: Token,
@@ -51,6 +74,7 @@ pub struct HistoricalImpactAnalyzer {
 }
 
 impl HistoricalImpactAnalyzer {
+    /// Creates a new analyzer with default trade sizes (1, 5, 10, 25, 50, 100 BPS).
     pub fn new(token_in: Token, token_out: Token) -> Self {
         Self {
             token_in,
@@ -60,6 +84,7 @@ impl HistoricalImpactAnalyzer {
         }
     }
 
+    /// Creates a new analyzer with custom trade sizes specified in basis points.
     pub fn with_trade_sizes(token_in: Token, token_out: Token, sizes_bps: Vec<u128>) -> Self {
         Self {
             token_in,
@@ -69,22 +94,27 @@ impl HistoricalImpactAnalyzer {
         }
     }
 
+    /// Returns the input token being analyzed.
     pub fn token_in(&self) -> &Token {
         &self.token_in
     }
 
+    /// Returns the output token being analyzed.
     pub fn token_out(&self) -> &Token {
         &self.token_out
     }
 
+    /// Returns the recorded observations.
     pub fn observations(&self) -> &[HistoricalImpactPoint] {
         &self.observations
     }
 
+    /// Returns the number of recorded observations.
     pub fn observation_count(&self) -> usize {
         self.observations.len()
     }
 
+    /// Records a price tick and computes impact at the current reserves.
     pub fn record_tick(&mut self, tick: &PriceTick) -> PricingResult<()> {
         if tick.token_in != self.token_in.address || tick.token_out != self.token_out.address {
             return Err(PricingError::UnknownToken(format!(
@@ -105,6 +135,7 @@ impl HistoricalImpactAnalyzer {
         Ok(())
     }
 
+    /// Records an observation manually from raw reserve data.
     pub fn record_manual(
         &mut self,
         pool_address: Address,
@@ -119,7 +150,7 @@ impl HistoricalImpactAnalyzer {
             self.token_out.clone(),
             reserve_in,
             reserve_out,
-            30,
+            DEFAULT_FEE_BPS,
         )?;
 
         let price = pair.get_spot_price(&self.token_in)?;
@@ -158,7 +189,7 @@ impl HistoricalImpactAnalyzer {
             self.token_out.clone(),
             reserve_in,
             reserve_out,
-            30,
+            DEFAULT_FEE_BPS,
         )?;
 
         let analyzer = PriceImpactAnalyzer::new(pair);
@@ -166,14 +197,14 @@ impl HistoricalImpactAnalyzer {
         self.trade_sizes_bps
             .iter()
             .map(|&bps| {
-                let amount_in = reserve_in * bps / 10_000;
+                let amount_in = reserve_in * bps / BPS_SCALE as u128;
                 let impact = if amount_in == 0 {
                     Decimal::ZERO
                 } else {
                     analyzer
                         .pair
                         .get_price_impact(amount_in, &self.token_in)
-                        .unwrap_or(Decimal::ZERO)
+                        .map_err(|e| PricingError::ChainCall(format!("price impact: {e}")))?
                         * Decimal::ONE_HUNDRED
                 };
                 Ok(SizeImpact {
@@ -185,6 +216,7 @@ impl HistoricalImpactAnalyzer {
             .collect()
     }
 
+    /// Computes aggregate statistics over all recorded observations.
     pub fn summarize(&self) -> ImpactSummary {
         let n = self.observations.len();
         if n == 0 {
@@ -284,6 +316,7 @@ impl HistoricalImpactAnalyzer {
         }
     }
 
+    /// Returns the price series as `(timestamp, price)` pairs.
     pub fn price_series(&self) -> Vec<(u64, Decimal)> {
         self.observations
             .iter()
@@ -291,12 +324,19 @@ impl HistoricalImpactAnalyzer {
             .collect()
     }
 
+    /// Returns the impact series for a specific trade size as `(timestamp, impact_pct)` pairs.
     pub fn impact_series_for_size(&self, size_bps: u128) -> Vec<(u64, Decimal)> {
         let idx = self
             .trade_sizes_bps
             .iter()
             .position(|&s| s == size_bps)
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    size_bps,
+                    "Requested impact size not in trade_sizes_bps, using index 0 as fallback"
+                );
+                0
+            });
 
         self.observations
             .iter()
@@ -311,6 +351,7 @@ impl HistoricalImpactAnalyzer {
             .collect()
     }
 
+    /// Clears all recorded observations.
     pub fn clear(&mut self) {
         self.observations.clear();
     }
@@ -329,6 +370,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_tick(
         pool: &str,
         t_in: &Address,

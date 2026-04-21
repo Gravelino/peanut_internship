@@ -186,13 +186,20 @@ impl ForkSimulator {
 
         match self.provider.call(&typed, block).await {
             Ok(bytes) => {
-                let amount_out = decode_amount_out(bytes.as_ref(), swap_params.decoder)
-                    .unwrap_or(DEFAULT_AMOUNT_OUT);
+                let decode_result = decode_amount_out(bytes.as_ref(), swap_params.decoder);
+                let (success, amount_out, error) = match decode_result {
+                    Some(out) => (true, out, None),
+                    None => (
+                        false,
+                        DEFAULT_AMOUNT_OUT,
+                        Some("failed to decode amount_out from call output".into()),
+                    ),
+                };
                 Ok(SimulationResult {
-                    success: true,
+                    success,
                     amount_out,
                     gas_used,
-                    error: None,
+                    error,
                     logs: Vec::new(),
                 })
             }
@@ -278,28 +285,37 @@ impl ForkSimulator {
         match self.provider.call(&tx, block).await {
             Ok(bytes) => {
                 let decoder = AmountOutDecoder::UniswapV2Amounts;
-                let amount_out =
-                    decode_amount_out(bytes.as_ref(), decoder).unwrap_or(DEFAULT_AMOUNT_OUT);
+                let decode_result = decode_amount_out(bytes.as_ref(), decoder);
+                let (success, amount_out, error) = match decode_result {
+                    Some(out) => (true, out, None),
+                    None => (
+                        false,
+                        DEFAULT_AMOUNT_OUT,
+                        Some("failed to decode amount_out from call output".into()),
+                    ),
+                };
 
-                let local_amounts = route.get_intermediate_amounts(amount_in)?;
-                for i in 0..route.num_hops() {
-                    let token_in = &route.path[i].symbol;
-                    let token_out = &route.path[i + 1].symbol;
-                    logs.push(format!(
-                        "hop{} {}->{} local_in={} local_out={}",
-                        i + 1,
-                        token_in,
-                        token_out,
-                        local_amounts[i],
-                        local_amounts[i + 1]
-                    ));
+                if success {
+                    let local_amounts = route.get_intermediate_amounts(amount_in)?;
+                    for i in 0..route.num_hops() {
+                        let token_in = &route.path[i].symbol;
+                        let token_out = &route.path[i + 1].symbol;
+                        logs.push(format!(
+                            "hop{} {}->{} local_in={} local_out={}",
+                            i + 1,
+                            token_in,
+                            token_out,
+                            local_amounts[i],
+                            local_amounts[i + 1]
+                        ));
+                    }
                 }
 
                 Ok(SimulationResult {
-                    success: true,
+                    success,
                     amount_out,
                     gas_used,
-                    error: None,
+                    error,
                     logs,
                 })
             }
@@ -473,8 +489,9 @@ mod tests {
     use super::*;
     use crate::core::types::{Address, Token};
     use crate::pricing::UniswapV2Pair;
-    use crate::pricing::router::Route;
     use crate::pricing::router::PoolRef;
+    use crate::pricing::router::Route;
+    use crate::pricing::v3::pool::UniswapV3Pool;
 
     #[test]
     fn test_decode_amount_out_uniswap_v2_array() {
@@ -745,5 +762,137 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(result.amount_out, DEFAULT_AMOUNT_OUT);
+    }
+
+    #[test]
+    fn test_fork_simulator_rejects_invalid_url() {
+        let result = ForkSimulator::new("not a valid url!!!///");
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err, PricingError::ChainCall(_)));
+    }
+
+    #[test]
+    fn test_decode_amount_out_none_decoder() {
+        let decoded = decode_amount_out(&[], AmountOutDecoder::None);
+        assert_eq!(decoded, Some(DEFAULT_AMOUNT_OUT));
+    }
+
+    #[test]
+    fn test_decode_amount_out_uniswap_v2_garbage_returns_none() {
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let decoded = decode_amount_out(&garbage, AmountOutDecoder::UniswapV2Amounts);
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn test_decode_amount_out_single_uint_garbage_returns_none() {
+        let garbage = vec![0xDE, 0xAD];
+        let decoded = decode_amount_out(&garbage, AmountOutDecoder::SingleUint);
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn test_extract_revert_reason_no_revert_keyword() {
+        let msg = "some unrelated error message";
+        assert!(extract_revert_reason(msg).is_none());
+    }
+
+    #[test]
+    fn test_extract_revert_reason_empty_after_revert() {
+        let msg = "vm error: revert ";
+        let reason = extract_revert_reason(msg);
+        assert!(reason.is_none() || reason.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_trim_quotes_double() {
+        assert_eq!(trim_quotes("\"hello\""), "hello");
+    }
+
+    #[test]
+    fn test_trim_quotes_single() {
+        assert_eq!(trim_quotes("'hello'"), "hello");
+    }
+
+    #[test]
+    fn test_trim_quotes_mixed() {
+        assert_eq!(trim_quotes("'\"hello\"'"), "\"hello\"");
+    }
+
+    #[test]
+    fn test_trim_quotes_none() {
+        assert_eq!(trim_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn test_simulation_verdict_executable() {
+        let result = SimulationResult {
+            success: true,
+            amount_out: 100,
+            gas_used: 21000,
+            error: None,
+            logs: vec![],
+        };
+        assert_eq!(result.verdict(), SimulationVerdict::Executable);
+        assert!(result.is_executable());
+    }
+
+    #[test]
+    fn test_simulation_verdict_revert_likely() {
+        let result = SimulationResult {
+            success: false,
+            amount_out: 0,
+            gas_used: 21000,
+            error: Some("revert".into()),
+            logs: vec![],
+        };
+        assert_eq!(result.verdict(), SimulationVerdict::RevertLikely);
+        assert!(!result.is_executable());
+    }
+
+    #[test]
+    fn test_simulation_comparison_fields() {
+        let cmp = SimulationComparison {
+            calculated: 100,
+            simulated: 100,
+            difference: 0,
+            is_match: true,
+        };
+        assert!(cmp.is_match);
+        assert_eq!(cmp.difference, 0);
+    }
+
+    #[tokio::test]
+    async fn test_encode_route_calldata_rejects_v3() {
+        let token_a = Token {
+            address: Address::new("0x00000000000000000000000000000000000000a1").unwrap(),
+            symbol: "A".to_string(),
+            decimals: 18,
+        };
+        let token_b = Token {
+            address: Address::new("0x00000000000000000000000000000000000000b1").unwrap(),
+            symbol: "B".to_string(),
+            decimals: 18,
+        };
+
+        let pool_ab = UniswapV3Pool::new(
+            Address::new("0x1000000000000000000000000000000000000001").unwrap(),
+            token_a.clone(),
+            token_b.clone(),
+            3000,
+            U256::from(1u64),
+            1_000_000u128,
+            0,
+        )
+        .unwrap();
+
+        let route = Route::new(vec![PoolRef::V3(pool_ab)], vec![token_a, token_b]);
+        let simulator = ForkSimulator::new("http://127.0.0.1:8545").unwrap();
+        let sender = Address::new("0x00000000000000000000000000000000000000aa").unwrap();
+
+        let result = simulator.encode_route_calldata(&route, 1_000, &sender, false, false);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), PricingError::AbiDecode(_)));
     }
 }

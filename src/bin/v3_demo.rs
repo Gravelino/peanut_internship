@@ -1,7 +1,7 @@
+use ethers::types::U256;
 use peanut_internship_rust::{
     Address, ChainClient, PoolRef, PricingEngine, RouteFinder, Token, UniswapV2Pair, UniswapV3Pool,
 };
-use ethers::types::U256;
 
 const V3_WETH_USDC_030: &str = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8";
 const RPC_URL: &str = "https://eth.llamarpc.com";
@@ -21,8 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match engine.load_v3_pools(std::slice::from_ref(&addr)).await {
         Ok(()) => {
             let pool = &engine.v3_pools()[&addr];
-            println!("Loaded pool: tick={}, liq={}, fee={}bps",
-                pool.tick, pool.liquidity, pool.fee_bps);
+            println!(
+                "Loaded pool: tick={}, liq={}, fee={}bps",
+                pool.tick, pool.liquidity, pool.fee_bps
+            );
             if let Ok(price) = pool.get_spot_price(&pool.token0) {
                 println!("Spot price (token0→1): {price}");
             }
@@ -59,27 +61,46 @@ fn demo_local_math() -> Result<(), Box<dyn std::error::Error>> {
 
         let price = pool.get_spot_price(&weth)?;
         let quote = pool.quote_swap(1_000_000_000_000_000_000, &weth)?;
-        println!("tick={tick:>5}  price={price}  quote_out={} gas={} partial={}",
-            quote.amount_out, quote.gas_estimate, quote.is_partial);
+        println!(
+            "tick={tick:>5}  price={price}  quote_out={} gas={} partial={}",
+            quote.amount_out, quote.gas_estimate, quote.is_partial
+        );
     }
 
     println!("\n--- Mixed V2+V3 route finding ---\n");
-    let shib = Token { address: Address::new("0x0000000000000000000000000000000000000001")?, symbol: "SHIB".into(), decimals: 18 };
-    let eth = Token { address: Address::new("0x0000000000000000000000000000000000000002")?, symbol: "ETH".into(), decimals: 18 };
-    let usdc_t = Token { address: Address::new("0x0000000000000000000000000000000000000003")?, symbol: "USDC".into(), decimals: 6 };
+    let shib = Token {
+        address: Address::new("0x0000000000000000000000000000000000000001")?,
+        symbol: "SHIB".into(),
+        decimals: 18,
+    };
+    let eth = Token {
+        address: Address::new("0x0000000000000000000000000000000000000002")?,
+        symbol: "ETH".into(),
+        decimals: 18,
+    };
+    let usdc_t = Token {
+        address: Address::new("0x0000000000000000000000000000000000000003")?,
+        symbol: "USDC".into(),
+        decimals: 6,
+    };
 
     let v2 = UniswapV2Pair::new(
         Address::new("0x1000000000000000000000000000000000000000")?,
-        shib.clone(), eth.clone(),
+        shib.clone(),
+        eth.clone(),
         10_000_000_000_000_000_000_000,
-        10_000_000_000_000_000_000_000, 30,
+        10_000_000_000_000_000_000_000,
+        30,
     )?;
 
     let v3 = UniswapV3Pool::new(
         Address::new("0x2000000000000000000000000000000000000000")?,
-        eth.clone(), usdc_t.clone(), 3000,
+        eth.clone(),
+        usdc_t.clone(),
+        3000,
         U256::from(79228162514264337593543950336u128),
-        1_000_000_000_000_000_000, 0,
+        1_000_000_000_000_000_000,
+        0,
     )?;
 
     let finder = RouteFinder::new(vec![PoolRef::V2(v2), PoolRef::V3(v3)]);
@@ -87,8 +108,12 @@ fn demo_local_math() -> Result<(), Box<dyn std::error::Error>> {
         Ok((route, net)) => {
             println!("Best route: {} hops, net_out={}", route.num_hops(), net);
             for (i, pr) in route.pools.iter().enumerate() {
-                println!("  hop {}: {} pool {}", i + 1,
-                    if pr.is_v3() { "V3" } else { "V2" }, pr.address());
+                println!(
+                    "  hop {}: {} pool {}",
+                    i + 1,
+                    if pr.is_v3() { "V3" } else { "V2" },
+                    pr.address()
+                );
             }
         }
         Err(e) => println!("No route: {e}"),

@@ -13,7 +13,7 @@ use crate::core::types::{
 };
 
 /// Default fee in basis points (0.3%).
-const DEFAULT_FEE_BPS: u32 = 30;
+pub const DEFAULT_FEE_BPS: u32 = 30;
 
 /// Size of an EVM word in bytes.
 const EVM_WORD_LEN: usize = 32;
@@ -372,6 +372,7 @@ pub fn decode_u128_from_slot(slot: &[u8]) -> PricingResult<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
+/// Decodes a 20-byte Ethereum address from a 32-byte ABI slot.
 pub fn decode_address_from_slot(slot: &[u8]) -> PricingResult<Address> {
     if slot.len() < EVM_WORD_LEN {
         return Err(PricingError::AbiDecode("slot too short".into()));
@@ -403,7 +404,9 @@ pub async fn fetch_token_metadata(
         .call(&call(DECIMALS_SELECTOR.to_vec()), BlockId::Latest)
         .await
         .map_err(|e| PricingError::ChainCall(e.to_string()))?;
-    let decimals = decode_u8_from_slot(&dec_raw).unwrap_or(ETH_DECIMALS);
+    let decimals = decode_u8_from_slot(&dec_raw).ok_or_else(|| {
+        PricingError::AbiDecode(format!("failed to decode decimals for token {}", addr))
+    })?;
 
     let sym_raw = client
         .call(&call(SYMBOL_SELECTOR.to_vec()), BlockId::Latest)

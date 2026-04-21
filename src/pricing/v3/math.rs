@@ -15,24 +15,31 @@ const MAX_SQRT_RATIO: U256 = U256([
     288,
 ]);
 
+/// Fee scale in parts-per-million used by Uniswap V3 swap step math.
+/// 1_000_000 PPM = 100% fee; actual fee = fee_bps * FEE_PPM / 10_000.
 const FEE_PPM: u64 = 1_000_000;
 
+/// Returns 2^96 as a U256, the Q64.96 fixed-point scale factor.
 pub fn q96() -> U256 {
     U256([0, 0x100000000, 0, 0])
 }
 
+/// Returns the minimum valid sqrt price ratio for a V3 pool.
 pub fn min_sqrt_ratio() -> U256 {
     MIN_SQRT_RATIO
 }
 
+/// Returns the maximum valid sqrt price ratio for a V3 pool.
 pub fn max_sqrt_ratio() -> U256 {
     MAX_SQRT_RATIO
 }
 
+/// Returns the minimum tick index for a V3 pool (-887272).
 pub fn min_tick() -> i32 {
     MIN_TICK
 }
 
+/// Returns the maximum tick index for a V3 pool (887272).
 pub fn max_tick() -> i32 {
     MAX_TICK
 }
@@ -140,6 +147,7 @@ fn shr_round_up(val: U256, n: usize, _label: &str) -> PricingResult<U256> {
     })
 }
 
+/// Computes the sqrt price ratio (Q64.96) at the given tick index.
 pub fn get_sqrt_ratio_at_tick(tick: i32) -> PricingResult<U256> {
     if !(MIN_TICK..=MAX_TICK).contains(&tick) {
         return Err(PricingError::AbiDecode(format!(
@@ -227,6 +235,7 @@ pub fn get_sqrt_ratio_at_tick(tick: i32) -> PricingResult<U256> {
     }
 }
 
+/// Returns the tick index corresponding to the given sqrt price ratio (Q64.96).
 pub fn get_tick_at_sqrt_ratio(sqrt_price: U256) -> PricingResult<i32> {
     if sqrt_price < MIN_SQRT_RATIO || sqrt_price >= MAX_SQRT_RATIO {
         return Err(PricingError::AbiDecode("sqrtPrice out of range".into()));
@@ -274,6 +283,7 @@ fn get_amount1_delta(a: U256, b: U256, liq: u128, up: bool) -> PricingResult<u12
     Ok(r.as_u128())
 }
 
+/// Computes the amount of token0 between two sqrt prices for a given liquidity (unsigned, rounded down).
 pub fn get_amount0_delta_unsigned(a: U256, b: U256, liq: u128) -> PricingResult<u128> {
     if liq == 0 {
         return Err(PricingError::ZeroAmountIn);
@@ -281,6 +291,7 @@ pub fn get_amount0_delta_unsigned(a: U256, b: U256, liq: u128) -> PricingResult<
     get_amount0_delta(a, b, liq, false)
 }
 
+/// Computes the amount of token1 between two sqrt prices for a given liquidity (unsigned, rounded down).
 pub fn get_amount1_delta_unsigned(a: U256, b: U256, liq: u128) -> PricingResult<u128> {
     if liq == 0 {
         return Err(PricingError::ZeroAmountIn);
@@ -288,14 +299,20 @@ pub fn get_amount1_delta_unsigned(a: U256, b: U256, liq: u128) -> PricingResult<
     get_amount1_delta(a, b, liq, false)
 }
 
+/// Result of a single V3 swap step computation.
 #[derive(Debug, Clone)]
 pub struct SwapStepResult {
+    /// Sqrt price after this step (Q64.96).
     pub sqrt_ratio_next: U256,
+    /// Input amount consumed in this step.
     pub amount_in: u128,
+    /// Output amount produced in this step.
     pub amount_out: u128,
+    /// Fee amount charged in this step.
     pub fee_amount: u128,
 }
 
+/// Computes a single swap step: moves price toward `tgt`, consuming up to `rem` input with `fee` BPS.
 pub fn compute_swap_step(
     cur: U256,
     tgt: U256,

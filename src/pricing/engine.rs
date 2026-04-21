@@ -24,21 +24,32 @@ const QUOTE_TOLERANCE_DENOMINATOR: u128 = 1000;
 /// Errors returned by [PricingEngine].
 #[derive(Debug, Error)]
 pub enum QuoteError {
+    /// Router has not been initialized with any pools.
     #[error("pricing engine has no initialized router")]
     RouterNotInitialized,
 
+    /// No route exists between the requested token pair.
     #[error("no route could be found")]
     NoRoute,
 
+    /// On-chain simulation of the route reverted.
     #[error("simulation failed: {0}")]
     SimulationFailed(String),
 
+    /// Failed to load pool data from chain.
     #[error("pool load failed for {address}: {reason}")]
-    PoolLoadFailed { address: String, reason: String },
+    PoolLoadFailed {
+        /// Pool contract address that failed to load.
+        address: String,
+        /// Reason the load failed.
+        reason: String,
+    },
 
+    /// Mempool subscription or stream error.
     #[error("mempool stream failed: {0}")]
     Mempool(String),
 
+    /// No route found, with detailed pricing error message.
     #[error("no route: {0}")]
     NoRouteDetailed(String),
 }
@@ -284,18 +295,8 @@ impl PricingEngine {
     }
 
     fn rebuild_router(&mut self) {
-        let mut refs: Vec<PoolRef> = self
-            .pools
-            .values()
-            .cloned()
-            .map(PoolRef::V2)
-            .collect();
-        refs.extend(
-            self.v3_pools
-                .values()
-                .cloned()
-                .map(PoolRef::V3),
-        );
+        let mut refs: Vec<PoolRef> = self.pools.values().cloned().map(PoolRef::V2).collect();
+        refs.extend(self.v3_pools.values().cloned().map(PoolRef::V3));
         self.router = Some(RouteFinder::new(refs));
     }
 }
@@ -303,8 +304,8 @@ impl PricingEngine {
 fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .expect("system clock unavailable")
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -468,5 +469,95 @@ mod tests {
         };
 
         assert!(!engine.on_mempool_swap(&swap));
+    }
+
+    #[test]
+    fn test_quote_is_valid_false_when_expected_output_zero() {
+        let quote = Quote {
+            route: Route::new(vec![], vec![]),
+            amount_in: 100,
+            expected_output: 0,
+            simulated_output: 0,
+            gas_estimate: 21000,
+            timestamp: 0,
+        };
+        assert!(!quote.is_valid());
+    }
+
+    #[test]
+    fn test_quote_is_valid_at_exact_tolerance_boundary() {
+        let quote = Quote {
+            route: Route::new(vec![], vec![]),
+            amount_in: 100,
+            expected_output: 1000,
+            simulated_output: 999,
+            gas_estimate: 21000,
+            timestamp: 0,
+        };
+        let diff = 1u128;
+        let within = diff.saturating_mul(QUOTE_TOLERANCE_DENOMINATOR) < 1000u128;
+        assert_eq!(quote.is_valid(), within);
+    }
+
+    #[test]
+    fn test_quote_error_from_pricing_no_route() {
+        let err = QuoteError::from_pricing(PricingError::NoRouteExists);
+        assert!(matches!(err, QuoteError::NoRoute));
+    }
+
+    #[test]
+    fn test_quote_error_from_pricing_other_variant() {
+        let err = QuoteError::from_pricing(PricingError::UnknownToken("FOO".into()));
+        assert!(matches!(err, QuoteError::NoRouteDetailed(_)));
+    }
+
+    #[test]
+    fn test_quote_error_from_pricing_zero_amount_in() {
+        let err = QuoteError::from_pricing(PricingError::ZeroAmountIn);
+        assert!(matches!(err, QuoteError::NoRouteDetailed(_)));
+    }
+
+    #[test]
+    fn test_on_mempool_swap_none_token_in() {
+        let (engine, _shib, _usdc, _eth) = setup_engine();
+        let swap = ParsedSwap {
+            tx_hash: "0xabc".to_string(),
+            router: Address::new("0x0000000000000000000000000000000000000009").unwrap(),
+            dex: "UniswapV2".to_string(),
+            method: "swapExactTokensForTokens".to_string(),
+            token_in: None,
+            token_out: Some(Address::new("0x00000000000000000000000000000000000000f1").unwrap()),
+            amount_in: U256::from(1u64),
+            min_amount_out: U256::from(1u64),
+            deadline: U256::from(1u64),
+            sender: Address::new("0x0000000000000000000000000000000000000010").unwrap(),
+            gas_price: U256::from(1u64),
+        };
+        assert!(!engine.on_mempool_swap(&swap));
+    }
+
+    #[test]
+    fn test_on_mempool_swap_none_token_out() {
+        let (engine, _shib, _usdc, _eth) = setup_engine();
+        let swap = ParsedSwap {
+            tx_hash: "0xabc".to_string(),
+            router: Address::new("0x0000000000000000000000000000000000000009").unwrap(),
+            dex: "UniswapV2".to_string(),
+            method: "swapExactTokensForTokens".to_string(),
+            token_in: Some(Address::new("0x00000000000000000000000000000000000000f1").unwrap()),
+            token_out: None,
+            amount_in: U256::from(1u64),
+            min_amount_out: U256::from(1u64),
+            deadline: U256::from(1u64),
+            sender: Address::new("0x0000000000000000000000000000000000000010").unwrap(),
+            gas_price: U256::from(1u64),
+        };
+        assert!(!engine.on_mempool_swap(&swap));
+    }
+
+    #[test]
+    fn test_now_unix_millis_returns_positive() {
+        let millis = now_unix_millis();
+        assert!(millis > 0);
     }
 }

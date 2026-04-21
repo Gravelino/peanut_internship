@@ -1,8 +1,8 @@
+use ethers::types::U256;
 use peanut_internship_rust::{
     Address, ArbDetector, ChainClient, MempoolMonitor, ParsedSwap, PricingEngine, Token,
     UniswapV2Pair, UniswapV3Pool, WEI_PER_GWEI,
 };
-use ethers::types::U256;
 use std::env;
 
 const PAIR_WETH_USDC: &str = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc";
@@ -118,13 +118,20 @@ fn demo_local_arb() -> Result<(), Box<dyn std::error::Error>> {
         0,
     )?;
 
-    let v2_out = v2_pool
-        .get_amount_out(1_000_000_000_000_000_000, &weth)
-        .unwrap_or(0);
-    let v3_out = v3_pool
-        .quote_swap(1_000_000_000_000_000_000, &weth)
-        .map(|q| q.amount_out)
-        .unwrap_or(0);
+    let v2_out = match v2_pool.get_amount_out(1_000_000_000_000_000_000, &weth) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("V2 get_amount_out failed: {e}");
+            return Err(e.into());
+        }
+    };
+    let v3_out = match v3_pool.quote_swap(1_000_000_000_000_000_000, &weth) {
+        Ok(q) => q.amount_out,
+        Err(e) => {
+            eprintln!("V3 quote_swap failed: {e}");
+            return Err(e.into());
+        }
+    };
     println!("1 WETH → USDC: V2={v2_out}  V3={v3_out}");
 
     let spread = (v2_out as i128 - v3_out as i128).unsigned_abs();
