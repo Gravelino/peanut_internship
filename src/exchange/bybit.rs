@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rust_decimal::Decimal;
 use sha2::Sha256;
 use tracing::{debug, info, warn};
