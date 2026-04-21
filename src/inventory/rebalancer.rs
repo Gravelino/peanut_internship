@@ -130,7 +130,9 @@ impl RebalancePlanner {
                     continue;
                 }
 
-                let amount = (*surplus_remaining).min(*deficit_remaining).min(from_remaining);
+                let amount = (*surplus_remaining)
+                    .min(*deficit_remaining)
+                    .min(from_remaining);
                 if amount < min_withdrawal {
                     continue;
                 }
@@ -183,11 +185,7 @@ impl RebalancePlanner {
         let mut deficit: Vec<(Venue, Decimal)> = vec![];
 
         for venue in self.tracker.venues() {
-            let ratio = self
-                .target_ratio
-                .get(venue)
-                .copied()
-                .unwrap_or(equal_ratio);
+            let ratio = self.target_ratio.get(venue).copied().unwrap_or(equal_ratio);
             let ratio_dec = Decimal::from_f64(ratio).unwrap_or_else(|| {
                 warn!(venue = %venue, ratio, "Invalid target_ratio, falling back to equal split");
                 Decimal::from_f64(equal_ratio).unwrap_or(Decimal::ZERO)
@@ -284,7 +282,10 @@ impl RebalancePlanner {
         let min_balance = match min_operating_balance().get(asset) {
             Some(b) => *b,
             None => {
-                warn!(asset, "No min operating balance configured, treating as zero");
+                warn!(
+                    asset,
+                    "No min operating balance configured, treating as zero"
+                );
                 Decimal::ZERO
             }
         };
@@ -364,7 +365,8 @@ impl RebalancePlanner {
                         consumed = true;
                     }
                 } else if !surplus_venue.is_cex() && deficit_venue.is_cex() {
-                    let withdrawal_fee = fee_info.map(|f| f.withdrawal_fee).unwrap_or(Decimal::ZERO);
+                    let withdrawal_fee =
+                        fee_info.map(|f| f.withdrawal_fee).unwrap_or(Decimal::ZERO);
                     if amount > withdrawal_fee {
                         steps.push(RebalanceStep::Withdraw(WithdrawStep {
                             from_venue: *surplus_venue,
@@ -621,8 +623,7 @@ mod tests {
 
     #[test]
     fn test_plan_distributes_surplus_across_multiple_deficits() {
-        let mut tracker =
-            InventoryTracker::new(vec![Venue::Binance, Venue::Bybit, Venue::Wallet]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Bybit, Venue::Wallet]);
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(

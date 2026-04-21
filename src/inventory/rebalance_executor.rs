@@ -119,10 +119,7 @@ impl RebalanceExecutor {
             };
             let tracker = self.tracker.lock().await;
             let (need_asset, need_amount) = match trade.side.as_str() {
-                "BUY" => (
-                    trade.quote_asset.as_str(),
-                    trade.amount * estimated_price,
-                ),
+                "BUY" => (trade.quote_asset.as_str(), trade.amount * estimated_price),
                 _ => (trade.base_asset.as_str(), trade.amount),
             };
 
