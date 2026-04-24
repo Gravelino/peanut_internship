@@ -158,6 +158,17 @@ struct Cli {
     /// DEX transactions. Only read when `--dex-address-book` is set.
     #[arg(long, default_value = "WALLET_PRIVATE_KEY")]
     wallet_key_env: String,
+
+    /// Seed the inventory tracker with synthetic balances before the first
+    /// tick. Intended for demos / integration tests running in
+    /// `--simulation` mode, where `sync_cex_balance` would otherwise
+    /// require Binance testnet credentials.
+    ///
+    /// Format: `venue:ASSET=AMOUNT[,ASSET=AMOUNT]...` where venue is
+    /// `binance` or `wallet`. Repeatable. Example:
+    ///   `--seed-inventory binance:USDT=10000,ETH=5 --seed-inventory wallet:ETH=2`
+    #[arg(long)]
+    seed_inventory: Vec<String>,
 }
 
 #[tokio::main]
@@ -195,6 +206,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Venue::Binance,
         Venue::Wallet,
     ])));
+
+    // Optional synthetic seed so simulation demos work without live balance
+    // endpoints. Applied BEFORE the first tick so the inventory pre-check
+    // in `SignalGenerator` has something to approve.
+    if !cli.seed_inventory.is_empty() {
+        if !cli.simulation {
+            warn!(
+                "--seed-inventory used outside --simulation; synthetic balances will be overwritten by the next sync"
+            );
+        }
+        let mut guard = inventory.write().await;
+        for spec in &cli.seed_inventory {
+            match parse_seed_spec(spec) {
+                Ok((venue, balances)) => {
+                    let count = balances.len();
+                    info!(venue = %venue, assets = count, "seeding inventory");
+                    guard.update_from_wallet(venue, balances);
+                }
+                Err(e) => {
+                    return Err(format!("invalid --seed-inventory {spec:?}: {e}").into());
+                }
+            }
+        }
+        drop(guard);
+    }
 
     // Signal generator + scorer.
     let price_source = Arc::new(StubPriceSource::new(Arc::clone(&exchange)));
@@ -797,5 +833,88 @@ fn execution_to_arb_record(
         buy_leg,
         sell_leg,
         gas_cost_usd: Decimal::ZERO,
+    }
+}
+
+/// Parses a `--seed-inventory` spec of shape
+/// `venue:ASSET=AMOUNT[,ASSET=AMOUNT]...` into the tuple expected by
+/// [`InventoryTracker::update_from_wallet`]. Venue names are matched
+/// case-insensitively against `binance` and `wallet`; asset symbols are
+/// upper-cased so callers can write either `usdt` or `USDT`.
+fn parse_seed_spec(
+    spec: &str,
+) -> Result<(Venue, std::collections::HashMap<String, Decimal>), String> {
+    let (venue_raw, balances_raw) = spec
+        .split_once(':')
+        .ok_or_else(|| "expected 'venue:ASSET=AMOUNT[,ASSET=AMOUNT]...'".to_string())?;
+    let venue = match venue_raw.trim().to_ascii_lowercase().as_str() {
+        "binance" | "cex" => Venue::Binance,
+        "wallet" | "onchain" | "dex" => Venue::Wallet,
+        other => {
+            return Err(format!(
+                "unknown venue '{other}' (expected binance or wallet)"
+            ));
+        }
+    };
+    let mut balances = std::collections::HashMap::new();
+    for entry in balances_raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (asset, amount) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("expected ASSET=AMOUNT, got '{entry}'"))?;
+        let asset = asset.trim().to_ascii_uppercase();
+        if asset.is_empty() {
+            return Err(format!("empty asset symbol in '{entry}'"));
+        }
+        let amount = Decimal::from_str_exact(amount.trim())
+            .map_err(|e| format!("invalid amount for {asset}: {e}"))?;
+        balances.insert(asset, amount);
+    }
+    if balances.is_empty() {
+        return Err("no asset=amount entries".into());
+    }
+    Ok((venue, balances))
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn parses_binance_single_asset() {
+        let (venue, map) = parse_seed_spec("binance:USDT=10000").unwrap();
+        assert_eq!(venue, Venue::Binance);
+        assert_eq!(map.get("USDT"), Some(&Decimal::from(10000)));
+    }
+
+    #[test]
+    fn parses_wallet_multi_with_case_insensitive_venue_and_asset() {
+        let (venue, map) = parse_seed_spec("Wallet: eth=2.5 , usdc=100").unwrap();
+        assert_eq!(venue, Venue::Wallet);
+        assert_eq!(map.get("ETH"), Some(&Decimal::new(25, 1)));
+        assert_eq!(map.get("USDC"), Some(&Decimal::from(100)));
+    }
+
+    #[test]
+    fn rejects_missing_colon() {
+        assert!(parse_seed_spec("binance USDT=10").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_venue() {
+        assert!(parse_seed_spec("kraken:USDT=10").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_body() {
+        assert!(parse_seed_spec("binance:").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_amount() {
+        assert!(parse_seed_spec("binance:USDT=notanumber").is_err());
     }
 }
