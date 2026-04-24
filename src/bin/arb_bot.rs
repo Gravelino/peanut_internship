@@ -747,22 +747,20 @@ fn load_address_book(path: &str) -> Result<PairAddressBook, Box<dyn std::error::
     Ok(book)
 }
 
+/// One entry in the live-pricing pool book: `(pair_symbol, pool_address, base, quote)`.
+type LivePoolEntry = (
+    String,
+    Address,
+    peanut_internship_rust::core::types::Token,
+    peanut_internship_rust::core::types::Token,
+);
+
 /// Reads the same `--dex-address-book` JSON but extracts only entries that
 /// have a `pool` field set, producing the tuples expected by
 /// [`LivePriceSource::new`]. Silently skips entries without a pool so the
 /// file can serve both the swapper (which only needs token metadata) and
 /// the live pricer (which additionally needs the pool address).
-fn load_live_pool_book(
-    path: &str,
-) -> Result<
-    Vec<(
-        String,
-        Address,
-        peanut_internship_rust::core::types::Token,
-        peanut_internship_rust::core::types::Token,
-    )>,
-    Box<dyn std::error::Error>,
-> {
+fn load_live_pool_book(path: &str) -> Result<Vec<LivePoolEntry>, Box<dyn std::error::Error>> {
     use peanut_internship_rust::core::types::Token;
     let content = std::fs::read_to_string(path)?;
     let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
