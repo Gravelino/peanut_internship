@@ -34,9 +34,12 @@
 pub mod chain;
 pub mod core;
 pub mod exchange;
+pub mod executor;
 pub mod integration;
 pub mod inventory;
+pub mod observability;
 pub mod pricing;
+pub mod strategy;
 
 pub use chain::{
     ChainClient, ChainError, ChainResult, InsufficientFunds, NonceTooLow, ReplacementUnderpriced,
@@ -59,6 +62,11 @@ pub use exchange::{
     PortfolioSnapshot, PriceOracle, PriceSource, RateLimiter, RetryConfig, SequenceStatus,
     SkewResult, VenueSkew, WalkResult,
 };
+pub use executor::{
+    CircuitBreaker, CircuitBreakerConfig, ExecutionContext, Executor,
+    ExecutorConfig as ArbExecutorConfig, ExecutorError, ExecutorState, LegBehaviour, LegExecutor,
+    LegFill, LegOutcome, LiveLegs, ReplayProtection, SimulatedLegs,
+};
 pub use integration::{
     ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, ArbLogger, CrossDexOpportunity,
     DexPoolInfo, ForkSimInfo,
@@ -77,4 +85,9 @@ pub use pricing::{
     PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SimulationComparison,
     SimulationResult, SimulationVerdict, SizeImpact, SizeImpactAvg, SwapParams, TradeCost,
     UniswapV2Pair, UniswapV3Pool, V3SwapQuote,
+};
+pub use strategy::{
+    Direction, FeeStructure as StrategyFees, GeneratorConfig, PriceSource as StrategyPriceSource,
+    ScorerConfig, Signal, SignalGenerator, SignalParams, SignalScorer, StrategyError,
+    StrategyResult, StubPriceSource, VenuePrices,
 };
