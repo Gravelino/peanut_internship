@@ -777,14 +777,38 @@ fn execution_to_arb_record(
             "USDT".to_string()
         });
 
-    // Map leg1/leg2 -> buy/sell based on direction.
-    let (buy_venue, sell_venue) = match signal.direction {
-        peanut_internship_rust::strategy::signal::Direction::BuyCexSellDex => {
-            (Venue::Binance, Venue::Wallet)
-        }
-        peanut_internship_rust::strategy::signal::Direction::BuyDexSellCex => {
-            (Venue::Wallet, Venue::Binance)
-        }
+    // Map leg1/leg2 -> buy/sell. This depends on BOTH the direction (which
+    // venue is the buy side) AND leg1_venue (which side was executed first).
+    // In DEX-first flow leg1 == DEX; in CEX-first flow leg1 == CEX.
+    // Previously this mapping hard-coded leg1=buy, which silently inverted
+    // every DEX-first DONE_PROFIT row in the PnL ledger.
+    use peanut_internship_rust::strategy::signal::Direction;
+    let buy_venue = match signal.direction {
+        Direction::BuyCexSellDex => Venue::Binance,
+        Direction::BuyDexSellCex => Venue::Wallet,
+    };
+    let sell_venue = match signal.direction {
+        Direction::BuyCexSellDex => Venue::Wallet,
+        Direction::BuyDexSellCex => Venue::Binance,
+    };
+    let buy_is_leg1 = matches!(
+        (signal.direction, ctx.leg1_venue),
+        (Direction::BuyCexSellDex, "cex") | (Direction::BuyDexSellCex, "dex")
+    );
+    let (buy_size, buy_price, sell_size, sell_price) = if buy_is_leg1 {
+        (
+            ctx.leg1_fill_size,
+            ctx.leg1_fill_price,
+            ctx.leg2_fill_size,
+            ctx.leg2_fill_price,
+        )
+    } else {
+        (
+            ctx.leg2_fill_size,
+            ctx.leg2_fill_price,
+            ctx.leg1_fill_size,
+            ctx.leg1_fill_price,
+        )
     };
 
     let started = DateTime::<chrono::Utc>::from_timestamp(signal.timestamp.timestamp(), 0)
@@ -810,8 +834,8 @@ fn execution_to_arb_record(
         venue: buy_venue,
         symbol: signal.pair.clone(),
         side: "buy".into(),
-        amount: ctx.leg1_fill_size.unwrap_or(Decimal::ZERO),
-        price: ctx.leg1_fill_price.unwrap_or(Decimal::ZERO),
+        amount: buy_size.unwrap_or(Decimal::ZERO),
+        price: buy_price.unwrap_or(Decimal::ZERO),
         fee: Decimal::ZERO,
         fee_asset: quote.clone(),
     };
@@ -821,8 +845,8 @@ fn execution_to_arb_record(
         venue: sell_venue,
         symbol: signal.pair.clone(),
         side: "sell".into(),
-        amount: ctx.leg2_fill_size.unwrap_or(Decimal::ZERO),
-        price: ctx.leg2_fill_price.unwrap_or(Decimal::ZERO),
+        amount: sell_size.unwrap_or(Decimal::ZERO),
+        price: sell_price.unwrap_or(Decimal::ZERO),
         fee: Decimal::ZERO,
         fee_asset: quote,
     };
