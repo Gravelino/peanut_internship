@@ -42,6 +42,7 @@ use peanut_internship_rust::strategy::fees::FeeStructure;
 use peanut_internship_rust::strategy::generator::{
     GeneratorConfig, SignalGenerator, StubPriceSource,
 };
+use peanut_internship_rust::strategy::live_price_source::{AnyPriceSource, LivePriceSource};
 use peanut_internship_rust::strategy::scorer::SignalScorer;
 use tokio::sync::{Mutex, mpsc};
 
@@ -249,7 +250,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Signal generator + scorer.
-    let price_source = Arc::new(StubPriceSource::new(Arc::clone(&exchange)));
+    //
+    // When `--dex-address-book` contains a `pool` address for a pair AND a
+    // chain RPC is configured, we read live Uniswap V2 reserves instead of
+    // synthesising DEX prices from CEX mid. Otherwise we fall back to the
+    // deterministic `StubPriceSource` (demo-friendly, no RPC load).
+    let price_source: Arc<AnyPriceSource> = {
+        let live_pools = if !cli.dex_address_book.is_empty() {
+            load_live_pool_book(&cli.dex_address_book)?
+        } else {
+            Vec::new()
+        };
+        let rpc_url = resolve_wallet_config(&cli).map(|(rpc, _)| rpc);
+        match (live_pools.is_empty(), rpc_url) {
+            (false, Some(rpc)) => {
+                let client = ChainClient::new(vec![rpc], 30, 3)?;
+                let live = LivePriceSource::new(Arc::clone(&exchange), client, live_pools).await?;
+                info!("price source: live Uniswap V2 reserves");
+                Arc::new(AnyPriceSource::Live(live))
+            }
+            _ => {
+                info!("price source: stub (synthetic DEX prices)");
+                Arc::new(AnyPriceSource::Stub(StubPriceSource::new(Arc::clone(
+                    &exchange,
+                ))))
+            }
+        }
+    };
     let generator_config = GeneratorConfig {
         min_profit_usd: Decimal::from_str_exact(&cli.min_profit_usd)
             .map_err(|e| format!("invalid --min-profit-usd: {e}"))?,
@@ -574,7 +601,7 @@ async fn tick(
     pairs: &[String],
     size: Decimal,
     min_score: Decimal,
-    generator: &mut SignalGenerator<StubPriceSource>,
+    generator: &mut SignalGenerator<AnyPriceSource>,
     scorer: Arc<Mutex<SignalScorer>>,
     executor: Arc<Executor>,
     queue: Arc<SignalQueue>,
@@ -649,7 +676,7 @@ async fn tick(
 /// Wrapped in a helper so we only hold the read-lock for the duration of the
 /// `get_skews` call — never across an await.
 async fn generator_inventory_skews(
-    generator: &SignalGenerator<StubPriceSource>,
+    generator: &SignalGenerator<AnyPriceSource>,
 ) -> Vec<peanut_internship_rust::exchange::types::SkewResult> {
     generator.tracker().read().await.get_skews()
 }
@@ -695,6 +722,11 @@ struct AddressBookEntry {
     base_decimals: u8,
     quote: String,
     quote_decimals: u8,
+    /// Optional Uniswap V2 pool address. When present and a chain RPC is
+    /// configured, the bot reads live reserves from this pool for signal
+    /// generation (`LivePriceSource`). Absent -> falls back to stub prices.
+    #[serde(default)]
+    pool: Option<String>,
 }
 
 fn load_address_book(path: &str) -> Result<PairAddressBook, Box<dyn std::error::Error>> {
@@ -713,6 +745,49 @@ fn load_address_book(path: &str) -> Result<PairAddressBook, Box<dyn std::error::
         );
     }
     Ok(book)
+}
+
+/// Reads the same `--dex-address-book` JSON but extracts only entries that
+/// have a `pool` field set, producing the tuples expected by
+/// [`LivePriceSource::new`]. Silently skips entries without a pool so the
+/// file can serve both the swapper (which only needs token metadata) and
+/// the live pricer (which additionally needs the pool address).
+fn load_live_pool_book(
+    path: &str,
+) -> Result<
+    Vec<(
+        String,
+        Address,
+        peanut_internship_rust::core::types::Token,
+        peanut_internship_rust::core::types::Token,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    use peanut_internship_rust::core::types::Token;
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let mut out = Vec::new();
+    for (pair, entry) in raw {
+        let Some(pool_str) = entry.pool.as_deref() else {
+            continue;
+        };
+        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
+            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
+        })?;
+        let pool = Address::new(pool_str)?;
+        let base = Token {
+            address: Address::new(&entry.base)?,
+            symbol: base_symbol.to_string(),
+            decimals: entry.base_decimals,
+        };
+        let quote = Token {
+            address: Address::new(&entry.quote)?,
+            symbol: quote_symbol.to_string(),
+            decimals: entry.quote_decimals,
+        };
+        out.push((pair, pool, base, quote));
+    }
+    Ok(out)
 }
 
 /// Resolves `(rpc_url, wallet_address)` from CLI first, then env vars.
