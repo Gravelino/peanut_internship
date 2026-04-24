@@ -1,19 +1,26 @@
 # Peanut Internship - Rust Project
 
-An arbitrage detection and execution system spanning DEX (Uniswap) and CEX (Binance) venues, built entirely in Rust.
+An arbitrage detection and execution system spanning DEX (Uniswap V2) and CEX (Binance) venues, built entirely in Rust.
+
+Scope covers the full pipeline: order-book + pool monitoring → signal generation and scoring → dual-leg execution (CEX-first or DEX-first) with timeouts, race-on-cancel, partial-fill handling, unwind, circuit breaker, persistent replay protection and reconciliation → Prometheus metrics and webhook alerts.
 
 ### Quick Start
 1. `cp .env.example .env`
 2. Fill in API keys in `.env`
-3. `make run`
+3. `make run` (or `cargo run --bin arb_bot -- --simulation` for a safe dry run)
 4. `make test`
 
 ### Environment
+Exchange / chain basics:
 - `PRIVATE_KEY`: hex-encoded Ethereum private key for local/testnet use
 - `SEPOLIA_RPC_URL`: Sepolia RPC endpoint for integration work
 - `MAINNET_RPC_URL`: optional mainnet RPC endpoint for analysis tooling
-- `BINANCE_TESTNET_API_KEY`: Binance testnet API key (Week 3)
-- `BINANCE_TESTNET_SECRET`: Binance testnet API secret (Week 3)
+- `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_SECRET`: Binance testnet credentials
+
+Live DEX execution (`arb_bot --dex-address-book ...`):
+- `ETH_RPC_URL`: mainnet (or fork) RPC endpoint used by `UniswapV2Swapper`
+- `WALLET_ADDRESS`: 0x-address that signs and receives DEX output
+- `WALLET_PRIVATE_KEY`: signing key (env-var name is configurable via `--wallet-key-env`)
 
 ### Health Check
 Run the environment and RPC checker before integration work:
@@ -63,59 +70,119 @@ cargo run --bin pnl_cli
 cargo run --bin arb_checker_cli -- ETH/USDT --size 2.0
 ```
 
+### Running `arb_bot`
+
+`arb_bot` is the end-to-end runtime: it ticks the signal generator, scores opportunities, executes them via the dual-leg pipeline, persists state for reconciliation, and fans out metrics / alerts.
+
+```sh
+# Safe dry-run: stubbed DEX prices, simulated legs.
+cargo run --bin arb_bot -- --simulation
+
+# Live CEX + live DEX execution with persistent replay + reconcile.
+cargo run --bin arb_bot -- \
+    --pair ETH/USDC \
+    --eth-rpc-url "$ETH_RPC_URL" \
+    --wallet-address "$WALLET_ADDRESS" \
+    --dex-address-book configs/address_book.json \
+    --dex-slippage-bps 50 \
+    --replay-db data/replay.db \
+    --reconcile-db data/reconcile.db \
+    --alert-webhook-url "$SLACK_WEBHOOK" --alert-provider slack \
+    --metrics-addr 0.0.0.0:9090
+```
+
+Key flags:
+- **`--simulation`** — in-process `SimulatedLegs`; never touches the exchange or chain.
+- **`--dex-address-book <path>`** — JSON of `{pair: {base, base_decimals, quote, quote_decimals}}`; enables live DEX via `UniswapV2Swapper`. Without it, live mode logs a warning and the DEX leg returns `NotImplemented`.
+- **`--replay-db <path>`** — SQLite journal so the signal-id replay window survives restarts (stretch S8).
+- **`--reconcile-db <path>`** — SQLite store of `LEG2_TIMEOUT` entries. A background worker polls each entry's receipt, marks it `Resolved` / `Reverted` / `Expired`, and on revert fires `LegExecutor::unwind_position` to flatten leg 1 (stretch S3 + A2).
+- **`--alert-webhook-url` / `--alert-provider`** — Generic, Slack, or Discord adapter. The full URL is **never** logged — `mask_webhook_url` keeps only host + first path segment.
+- **`--metrics-addr`** — Prometheus exporter (S7a). Scrape `http://<addr>/metrics`.
+
+The bot respects a circuit breaker (N failures in a rolling window → cool-off), a replay window that REJECTS duplicate signal ids, and a configurable `max_concurrent_executions` cap. A `ctrl-c` cleanly shuts down the reconcile worker loop.
+
 ### Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Week1 [Week 1: Core + Chain]
+    subgraph Foundations
         A[core/types] --> B[core/wallet]
         C[chain/client] --> D[chain/builder]
     end
 
-    subgraph Week2 [Week 2: Pricing]
+    subgraph Pricing
         E[pricing/amm] --> F[pricing/router]
         F --> G[pricing/engine]
         H[pricing/mempool] --> G
-        I[pricing/simulator] --> G
-        J[pricing/feed] --> G
     end
 
-    subgraph Week3 [Week 3: Exchange + Inventory]
-        K[exchange/config] --> L[exchange/client]
-        L --> M[exchange/orderbook]
-        N[exchange/rate_limiter] --> L
+    subgraph Exchange_Inventory [Exchange + Inventory]
+        K[exchange/client] --> M[exchange/orderbook]
+        N[exchange/rate_limiter] --> K
         O[inventory/tracker] --> P[inventory/rebalancer]
-        Q[inventory/pnl] --> R[integration/arb_checker]
-        M --> R
-        L --> R
-        O --> R
+        Q[inventory/pnl]
+        W[inventory/wallet<br/>on-chain sync] --> O
     end
 
-    Week1 --> Week2
-    Week2 --> Week3
+    subgraph Strategy
+        S1[strategy/generator] --> S2[strategy/scorer]
+        S3[strategy/fees]
+    end
+
+    subgraph Executor_Runtime [Executor + Runtime]
+        X1[executor/queue<br/>priority + concurrency] --> X2[executor/engine<br/>Executor + LegExecutor]
+        X2 --> X3[executor/dex_swapper<br/>UniswapV2Swapper]
+        X2 --> X4[executor/recovery<br/>breaker + replay]
+        X2 --> X5[executor/reconcile<br/>LEG2_TIMEOUT worker]
+    end
+
+    subgraph Observability
+        Y1[observability/metrics<br/>Prometheus] --> Y3[observability/server]
+        Y2[observability/alerts<br/>Slack / Discord / Generic]
+    end
+
+    G --> S1
+    M --> S1
+    S2 --> X1
+    K --> X2
+    X3 --> C
+    X5 --> C
+    X2 --> Q
+    X2 --> Y1
+    X2 --> Y2
 ```
 
-Data flow for arbitrage checking:
+Execution pipeline (per signal):
 ```mermaid
 flowchart LR
-    A[PricingEngine<br/>DEX price] --> E[ArbChecker]
-    B[ExchangeClient<br/>CEX order book] --> C[OrderBookAnalyzer<br/>spread/slippage] --> E
-    D[InventoryTracker<br/>balances] --> E
-    E --> F{gap > costs?}
-    F -->|Yes| G[Executable opportunity]
-    F -->|No| H[Skip]
-    G --> I[PnLEngine<br/>record trade]
-    D --> J[RebalancePlanner<br/>skew detection]
+    IN[Signal] --> QQ[SignalQueue<br/>priority heap]
+    QQ --> EX[Executor.execute]
+    EX --> PF{pre-flight<br/>breaker + replay}
+    PF -->|rejected| OUT1[REJECTED]
+    PF -->|ok| L1[Leg 1: CEX or DEX]
+    L1 -->|timeout| RC[Race-on-cancel<br/>CancelOutcome]
+    L1 -->|partial| FC[classify_fill<br/>Full / ProceedReduced / AbortUnwind / Dust]
+    L1 -->|ok| L2[Leg 2]
+    L2 -->|filled| OUT2[DONE_PROFIT / DONE_LOSS]
+    L2 -->|reverted| UW[Unwind leg 1] --> OUT3[FAILED]
+    L2 -->|timeout| RS[Reconcile store<br/>SQLite] --> OUT4[LEG2_TIMEOUT]
+    RS -.poll.-> WK[Reconcile worker]
+    WK -->|reverted| UW
+    WK -->|success| OUT2
+    WK -->|expired| OUT5[MANUAL_REVIEW]
 ```
 
 ### Repository Architecture
 - `src/core/`: Base types (Address, TokenAmount, Token), WalletManager, CanonicalSerializer
 - `src/chain/`: ChainClient (RPC + retry), TransactionBuilder, TransactionAnalyzer
-- `src/pricing/`: AMM math, router, mempool monitor, fork simulator, and pricing engine
-- `src/exchange/`: Binance testnet client, order book analyzer, rate limiter
-- `src/inventory/`: Position tracker, rebalance planner, PnL engine
-- `src/integration/`: ArbChecker — end-to-end arbitrage pipeline
-- `src/bin/`: CLI binaries
+- `src/pricing/`: AMM math, router, mempool monitor, fork simulator, pricing engine
+- `src/exchange/`: Binance client, order book analyzer, rate limiter, price oracle
+- `src/inventory/`: Position tracker, rebalance planner, PnL engine, on-chain wallet sync
+- `src/strategy/`: Signal generator (from venue prices), scorer (weighted 4-component), fee model
+- `src/executor/`: Queue (priority), `Executor` state machine, `LegExecutor` trait with `SimulatedLegs` / `LiveLegs`, `UniswapV2Swapper`, circuit breaker, replay protection, reconciliation worker
+- `src/observability/`: Prometheus metrics exporter, webhook alert sinks (Generic / Slack / Discord)
+- `src/integration/`: `ArbChecker` — end-to-end arbitrage pipeline helper
+- `src/bin/`: CLI binaries (`arb_bot`, `orderbook_cli`, `pnl_cli`, `analyzer`, `integration_test`, etc.)
 - `tests/`: Unit and integration tests
 - `scripts/`: Automation scripts
 - `configs/`: Non-secret configuration
@@ -146,6 +213,31 @@ flowchart LR
 | File | Purpose |
 |------|---------|
 | `arb_checker.rs` | End-to-end arb check: DEX price + CEX book + inventory + costs |
+
+#### strategy/
+| File | Purpose |
+|------|---------|
+| `signal.rs` | `Signal` / `SignalParams`, direction, TTL, deterministic `signal_id` |
+| `generator.rs` | `SignalGenerator` — converts venue prices into Signals, cooldown + inventory pre-filter |
+| `scorer.rs` | 4-component weighted scorer (spread, liquidity, inventory, history) |
+| `fees.rs` | Fee model shared between scoring and PnL |
+
+#### executor/
+| File | Purpose |
+|------|---------|
+| `engine.rs` | `Executor` state machine, `LegExecutor` trait (`SimulatedLegs`, `LiveLegs` with injected `UniswapV2Swapper`), CEX-first + DEX-first flows, race-on-cancel, partial-fill classifier, unwind |
+| `queue.rs` | Priority-scored `SignalQueue` + `QueueWorker` with `max_concurrent_executions` semaphore |
+| `dex_swapper.rs` | `DexSwapper` trait + production `UniswapV2Swapper` (`ensure_allowance` + `swapExactTokensForTokens` via `TransactionBuilder`) |
+| `recovery.rs` | `CircuitBreaker` + `ReplayProtection` (in-memory or SQLite-backed journal) |
+| `reconcile.rs` | `ReconcileStore` (SQLite) + `ReconcileWorker` — receipt polling, async `spawn_blocking` I/O, transitions Pending→Resolved/Reverted/Expired |
+| `errors.rs` | `ExecutorError`, `ExecutorResult` |
+
+#### observability/
+| File | Purpose |
+|------|---------|
+| `metrics.rs` | Prometheus counters / histograms (`init_metrics`, `metrics_handle`) |
+| `server.rs` | Hyper-based `/metrics` exporter (`serve_metrics`) |
+| `alerts.rs` | `AlertEvent`, `AlertSink` (`Noop` / `Logging` / `Webhook`), provider adapters (Generic / Slack / Discord), `mask_webhook_url`, `evaluate_execution` rule engine |
 
 ### Generating Documentation
 
@@ -218,12 +310,12 @@ cargo test --test integration_arb_flow   # Week 3 integration tests
 
 ### Test Coverage
 
-Week 3 modules include **52 tests** covering:
-- Order book parsing, sort order, spread calculation
-- Walk-the-book with various sizes (exact, multi-level, insufficient liquidity)
-- Rate limiter blocking when exhausted
-- Inventory update after trades (buy/sell/fee deductions)
-- Skew calculation with various distributions
-- Rebalance plan generation with fee accounting and min balances
-- PnL calculation (gross, net, bps, win rate, CSV export)
-- Integration: profitable arb accepted, unprofitable rejected, inventory validation
+**507 lib tests** (`cargo test --lib`), plus integration suites under `tests/`. Highlights:
+
+- **core / chain / pricing**: address validation, wallet secrecy (Debug/Display never expose the private key), AMM math, router choice, fork-simulated quotes.
+- **exchange / inventory**: order-book walking, spread/slippage, rate limiter, inventory skew + rebalance, PnL aggregation + CSV export.
+- **strategy**: signal generation (direction / TTL / cooldown), weighted scoring, fee model.
+- **executor**: full state machine (accepted → filled / rejected / failed / leg2_timeout / manual_review), race-on-cancel all branches, LEG1_PARTIAL classifier (Full / ProceedReduced / AbortUnwind / Dust), unwind on revert, reconcile worker lifecycle (receipt success / revert / pending / expired / RPC error), SQLite persistence across reopens.
+- **recovery**: circuit breaker open/close + cool-off, replay protection in-memory and journaled.
+- **observability**: Prometheus counter increments, webhook URL masking (Slack / Discord / bad input), alert rule evaluation per terminal state.
+- **property tests (proptest)**: AMM invariants, router net-math consistency.
