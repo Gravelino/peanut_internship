@@ -160,6 +160,17 @@ impl<P: PriceSource> SignalGenerator<P> {
                 prices.dex_buy,
             )
         } else {
+            debug!(
+                pair,
+                cex_bid = %prices.cex_bid,
+                cex_ask = %prices.cex_ask,
+                dex_buy = %prices.dex_buy,
+                dex_sell = %prices.dex_sell,
+                spread_cex_to_dex_bps = %spread_buy_cex_sell_dex,
+                spread_dex_to_cex_bps = %spread_buy_dex_sell_cex,
+                min_spread_bps = %self.config.min_spread_bps,
+                "no direction meets min_spread_bps threshold"
+            );
             return Ok(None);
         };
 
