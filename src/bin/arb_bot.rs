@@ -169,6 +169,18 @@ struct Cli {
     ///   `--seed-inventory binance:USDT=10000,ETH=5 --seed-inventory wallet:ETH=2`
     #[arg(long)]
     seed_inventory: Vec<String>,
+
+    /// Minimum net profit in quote-asset units required for the generator
+    /// to emit a signal. Overrides `GeneratorConfig::default().min_profit_usd`
+    /// (which is 5). Lower this for small-notional demos where default
+    /// fees consume more than the achievable spread.
+    #[arg(long, default_value = "5")]
+    min_profit_usd: String,
+
+    /// Minimum spread in basis points required to consider an opportunity.
+    /// Overrides `GeneratorConfig::default().min_spread_bps` (50).
+    #[arg(long, default_value_t = 50)]
+    min_spread_bps: u64,
 }
 
 #[tokio::main]
@@ -234,11 +246,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Signal generator + scorer.
     let price_source = Arc::new(StubPriceSource::new(Arc::clone(&exchange)));
+    let generator_config = GeneratorConfig {
+        min_profit_usd: Decimal::from_str_exact(&cli.min_profit_usd)
+            .map_err(|e| format!("invalid --min-profit-usd: {e}"))?,
+        min_spread_bps: Decimal::from(cli.min_spread_bps),
+        ..GeneratorConfig::default()
+    };
+    info!(
+        min_profit_usd = %generator_config.min_profit_usd,
+        min_spread_bps = %generator_config.min_spread_bps,
+        "generator thresholds"
+    );
     let mut generator = SignalGenerator::new(
         price_source,
         Arc::clone(&inventory),
         FeeStructure::default(),
-        GeneratorConfig::default(),
+        generator_config,
     );
     let scorer = SignalScorer::default();
 
