@@ -10,8 +10,13 @@ pub mod analyzer;
 pub mod builder;
 pub mod client;
 pub mod errors;
+pub mod flashbots;
 pub mod selectors;
 
-pub use builder::TransactionBuilder;
-pub use client::ChainClient;
+pub use builder::{SignedTransaction, TransactionBuilder};
+pub use client::{ChainClient, RpcHealth};
 pub use errors::{ChainError, ChainResult, InsufficientFunds, NonceTooLow, ReplacementUnderpriced};
+pub use flashbots::{
+    BundleRelay, BundleRequest, BundleResult, BundleStatus, BundleSubmission, BundleTx,
+    FlashbotsConfig, FlashbotsRelayClient,
+};

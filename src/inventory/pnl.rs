@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -8,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::core::types::BPS_SCALE;
+use crate::inventory::errors::InventoryResult;
 use crate::inventory::types::Venue;
 
 /// One side (buy or sell) of an arbitrage trade.
@@ -46,6 +50,38 @@ pub struct ArbRecord {
     pub sell_leg: TradeLeg,
     /// On-chain gas cost in USD.
     pub gas_cost_usd: Decimal,
+}
+
+/// Append-only JSONL writer for completed arbitrage records.
+#[derive(Debug)]
+pub struct TradeJsonlLogger {
+    writer: Mutex<BufWriter<File>>,
+}
+
+impl TradeJsonlLogger {
+    /// Opens (or creates) a JSONL trade log at `path`.
+    pub fn open(path: impl AsRef<Path>) -> InventoryResult<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            writer: Mutex::new(BufWriter::new(file)),
+        })
+    }
+
+    /// Appends one trade record as a single JSON line and flushes it.
+    pub fn append(&self, trade: &ArbRecord) -> InventoryResult<()> {
+        let mut guard = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("trade log mutex poisoned"))?;
+        serde_json::to_writer(&mut *guard, trade)?;
+        guard.write_all(b"\n")?;
+        guard.flush()?;
+        Ok(())
+    }
 }
 
 impl ArbRecord {
@@ -598,5 +634,39 @@ mod tests {
         assert_eq!(summary.total_trades, 0);
         assert_eq!(summary.total_pnl_usd, Decimal::ZERO);
         assert!((summary.win_rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn trade_jsonl_logger_appends_one_json_object_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trades.jsonl");
+        let logger = TradeJsonlLogger::open(&path).unwrap();
+
+        logger
+            .append(&make_arb(
+                "t1",
+                Decimal::from(2000),
+                Decimal::from(2010),
+                Decimal::ONE,
+                Decimal::ZERO,
+            ))
+            .unwrap();
+        logger
+            .append(&make_arb(
+                "t2",
+                Decimal::from(2000),
+                Decimal::from(2020),
+                Decimal::ONE,
+                Decimal::ZERO,
+            ))
+            .unwrap();
+
+        let body = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: ArbRecord = serde_json::from_str(lines[0]).unwrap();
+        let second: ArbRecord = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first.id, "t1");
+        assert_eq!(second.id, "t2");
     }
 }

@@ -162,6 +162,25 @@ impl WalletManager {
             .map_err(|e| WalletError::Operation(sanitize_error(&e)))
     }
 
+    pub async fn sign_message_bytes(&self, message: &[u8]) -> Result<Signature, WalletError> {
+        debug!("Signing message ({} bytes)", message.len());
+        if message.is_empty() {
+            return Err(WalletError::EmptyMessage);
+        }
+
+        if message.len() > MAX_MESSAGE_SIZE {
+            return Err(WalletError::MessageTooLarge(format!(
+                "message exceeds maximum size of {} bytes",
+                MAX_MESSAGE_SIZE
+            )));
+        }
+
+        self.wallet
+            .sign_message(message)
+            .await
+            .map_err(|e| WalletError::Operation(sanitize_error(&e)))
+    }
+
     /// Signs EIP-712 typed data.
     pub async fn sign_typed_data(&self, typed_data: TypedData) -> Result<Signature, WalletError> {
         self.wallet

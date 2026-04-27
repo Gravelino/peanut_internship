@@ -34,14 +34,14 @@
 pub mod chain;
 pub mod core;
 pub mod exchange;
+pub mod executor;
 pub mod integration;
 pub mod inventory;
+pub mod observability;
 pub mod pricing;
+pub mod strategy;
 
-pub use chain::{
-    ChainClient, ChainError, ChainResult, InsufficientFunds, NonceTooLow, ReplacementUnderpriced,
-    TransactionBuilder,
-};
+pub use chain::{ChainClient, ChainError, ChainResult, RpcHealth, TransactionBuilder};
 pub use core::serializer::CanonicalSerializer;
 pub use core::types::{
     Address, BlockId, CoreError, DEFAULT_GAS_BUFFER_BPS, ETH_DECIMALS, ETH_SYMBOL, GasPrice,
@@ -59,6 +59,11 @@ pub use exchange::{
     PortfolioSnapshot, PriceOracle, PriceSource, RateLimiter, RetryConfig, SequenceStatus,
     SkewResult, VenueSkew, WalkResult,
 };
+pub use executor::{
+    CircuitBreaker, CircuitBreakerConfig, ExecutionContext, Executor,
+    ExecutorConfig as ArbExecutorConfig, ExecutorError, ExecutorState, LegBehaviour, LegExecutor,
+    LegFill, LegOutcome, LiveLegs, ReplayProtection, SimulatedLegs,
+};
 pub use integration::{
     ArbCheckDetails, ArbCheckError, ArbCheckResult, ArbChecker, ArbLogger, CrossDexOpportunity,
     DexPoolInfo, ForkSimInfo,
@@ -66,8 +71,8 @@ pub use integration::{
 pub use inventory::{
     ArbRecord, Balance, CostEstimate, ExecutorConfig, InventoryError, InventoryResult,
     InventoryTracker, PnLChartExporter, PnLEngine, PnLSummary, RebalanceExecutor, RebalancePlanner,
-    RebalanceResult, RebalanceStatus, RebalanceStep, TradeLeg, TradeStep, TradeSummary,
-    TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, WithdrawStep,
+    RebalanceResult, RebalanceStatus, RebalanceStep, TradeJsonlLogger, TradeLeg, TradeStep,
+    TradeSummary, TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, WithdrawStep,
     min_operating_balance, transfer_fees,
 };
 pub use pricing::{
@@ -77,4 +82,9 @@ pub use pricing::{
     PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SimulationComparison,
     SimulationResult, SimulationVerdict, SizeImpact, SizeImpactAvg, SwapParams, TradeCost,
     UniswapV2Pair, UniswapV3Pool, V3SwapQuote,
+};
+pub use strategy::{
+    Direction, FeeStructure as StrategyFees, GeneratorConfig, PriceSource as StrategyPriceSource,
+    ScorerConfig, Signal, SignalGenerator, SignalParams, SignalScorer, StrategyError,
+    StrategyResult, StubPriceSource, VenuePrices,
 };

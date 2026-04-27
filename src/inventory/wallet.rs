@@ -45,8 +45,13 @@ impl std::fmt::Debug for WalletBalanceFetcher {
 impl WalletBalanceFetcher {
     /// Creates a new fetcher using the given RPC URL and wallet address.
     pub fn new(rpc_url: String, wallet_address: &str) -> InventoryResult<Self> {
+        Self::new_multi(vec![rpc_url], wallet_address)
+    }
+
+    /// Creates a new fetcher using multiple RPC URLs and wallet address.
+    pub fn new_multi(rpc_urls: Vec<String>, wallet_address: &str) -> InventoryResult<Self> {
         let chain_client =
-            ChainClient::new(vec![rpc_url], RPC_TIMEOUT_SECS, RPC_RETRIES).map_err(|e| {
+            ChainClient::new(rpc_urls, RPC_TIMEOUT_SECS, RPC_RETRIES).map_err(|e| {
                 InventoryError::AssetNotFound(format!("failed to create chain client: {e}"))
             })?;
 

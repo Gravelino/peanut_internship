@@ -9,7 +9,7 @@ use crate::exchange::errors::{ExchangeError, ExchangeResult};
 use crate::exchange::rate_limiter::{
     LimitInterval, LimitKey, LimitType, RateLimiter, extract_order_count_from_headers,
     extract_rate_limit_from_headers, extract_retry_after_from_headers,
-    extract_used_weight_from_headers,
+    extract_used_weight_for_interval, extract_used_weight_from_headers,
 };
 
 /// Default maximum number of concurrent in-flight HTTP requests.
@@ -231,32 +231,7 @@ impl HttpClient {
                 Ok(response) => {
                     if self.enabled {
                         let headers = response.headers();
-
-                        if let Some(limit) = extract_rate_limit_from_headers(headers) {
-                            let mut guard = self.rate_limiter.lock().await;
-                            guard.update_quota_from_limit(limit);
-                        }
-
-                        if let Some(used) = extract_used_weight_from_headers(headers) {
-                            let mut guard = self.rate_limiter.lock().await;
-                            guard.update_used_weight(used);
-                        }
-
-                        {
-                            let mut guard = self.rate_limiter.lock().await;
-                            for interval in [
-                                LimitInterval::Second,
-                                LimitInterval::Minute,
-                                LimitInterval::Day,
-                            ] {
-                                if let Some(count) =
-                                    extract_order_count_from_headers(headers, interval)
-                                {
-                                    let key = LimitKey::new(LimitType::Orders, interval);
-                                    guard.update_used_weight_for(key, count);
-                                }
-                            }
-                        }
+                        self.sync_rate_limit_headers(headers).await;
 
                         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                             let retry_after = extract_retry_after_from_headers(headers);
@@ -324,6 +299,36 @@ impl HttpClient {
             tokio::select! {
                 _ = self.window_reset.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(WINDOW_RESET_POLL_SECS)) => {}
+            }
+        }
+    }
+
+    async fn sync_rate_limit_headers(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(limit) = extract_rate_limit_from_headers(headers) {
+            let mut guard = self.rate_limiter.lock().await;
+            guard.update_quota_from_limit(limit);
+        }
+
+        if let Some(used) = extract_used_weight_from_headers(headers) {
+            let mut guard = self.rate_limiter.lock().await;
+            guard.update_used_weight(used);
+        }
+
+        let mut guard = self.rate_limiter.lock().await;
+        for interval in [
+            LimitInterval::Second,
+            LimitInterval::Minute,
+            LimitInterval::FiveMinute,
+            LimitInterval::Day,
+        ] {
+            if let Some(weight) = extract_used_weight_for_interval(headers, interval) {
+                let key = LimitKey::new(LimitType::RequestWeight, interval);
+                guard.update_used_weight_for(key, weight);
+            }
+
+            if let Some(count) = extract_order_count_from_headers(headers, interval) {
+                let key = LimitKey::new(LimitType::Orders, interval);
+                guard.update_used_weight_for(key, count);
             }
         }
     }
@@ -447,6 +452,38 @@ mod tests {
         client.check_rate_limit(10).await;
         let guard = client.rate_limiter().lock().await;
         assert_eq!(guard.used_weight(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_sync_rate_limit_headers_updates_interval_buckets() {
+        let client = HttpClient::new(RetryConfig::no_retry(), true).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-mbx-used-weight-1s", "3".parse().unwrap());
+        headers.insert("x-mbx-used-weight-1m", "30".parse().unwrap());
+        headers.insert("x-mbx-used-weight-5m", "90".parse().unwrap());
+        headers.insert("x-mbx-order-count-1s", "2".parse().unwrap());
+        headers.insert("x-mbx-order-count-1m", "20".parse().unwrap());
+
+        client.sync_rate_limit_headers(&headers).await;
+
+        let guard = client.rate_limiter().lock().await;
+        assert_eq!(
+            guard.used_weight_for(&LimitKey::new(
+                LimitType::RequestWeight,
+                LimitInterval::Second
+            )),
+            3
+        );
+        assert_eq!(guard.used_weight_for(&LimitKey::request_weight()), 30);
+        assert_eq!(
+            guard.used_weight_for(&LimitKey::new(
+                LimitType::RequestWeight,
+                LimitInterval::FiveMinute
+            )),
+            90
+        );
+        assert_eq!(guard.used_weight_for(&LimitKey::orders_per_second()), 2);
+        assert_eq!(guard.used_weight_for(&LimitKey::orders_per_minute()), 20);
     }
 
     #[test]

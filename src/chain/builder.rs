@@ -16,6 +16,13 @@ const MIN_GAS_ESTIMATE_BUFFER_BPS: u64 = BPS_SCALE;
 /// Default poll interval for transaction confirmations in seconds.
 const DEFAULT_POLL_INTERVAL_SECS: f64 = 1.0;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTransaction {
+    pub raw: Vec<u8>,
+    pub raw_hex: String,
+    pub tx_hash: String,
+}
+
 /// A fluent builder for creating and sending Ethereum transactions.
 #[derive(Clone)]
 pub struct TransactionBuilder {
@@ -90,6 +97,11 @@ impl TransactionBuilder {
         self
     }
 
+    /// Returns the configured EIP-1559 max fee per gas, if resolved.
+    pub fn max_fee_per_gas(&self) -> Option<U256> {
+        self.max_fee_per_gas
+    }
+
     /// Estimates gas for the transaction and applies a buffer in basis points.
     ///
     /// When `buffer_bps` is `None` or below [`MIN_GAS_ESTIMATE_BUFFER_BPS`],
@@ -145,6 +157,16 @@ impl TransactionBuilder {
             .sign_transaction_bytes(&request)
             .await
             .map_err(|e| ChainError::SignTransactionFailed(e.to_string()))
+    }
+
+    pub async fn build_and_sign_with_hash(self) -> ChainResult<SignedTransaction> {
+        let raw = self.build_and_sign().await?;
+        let hash = ethers::utils::keccak256(&raw);
+        Ok(SignedTransaction {
+            raw_hex: format!("0x{}", hex::encode(&raw)),
+            tx_hash: format!("0x{}", hex::encode(hash)),
+            raw,
+        })
     }
 
     /// Builds, signs, and sends the transaction to the network.
