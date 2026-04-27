@@ -46,9 +46,15 @@ pub struct Metrics {
     pub breaker_trips_total: IntCounter,
     pub unwind_failures_total: IntCounter,
     pub signal_queue_drops_total: IntCounterVec,
+    pub flashbots_simulations_total: IntCounterVec,
+    pub flashbots_bundles_submitted_total: IntCounterVec,
+    pub flashbots_bundles_included_total: IntCounterVec,
+    pub flashbots_bundles_not_included_total: IntCounterVec,
+    pub flashbots_relay_errors_total: IntCounterVec,
 
     // Gauges
     pub breaker_open: IntGauge,
+    pub pnl_breaker_halted: IntGauge,
     pub signal_queue_depth: IntGauge,
     pub inventory_skew_bps: GaugeVec,
 
@@ -56,6 +62,8 @@ pub struct Metrics {
     pub execution_duration_seconds: HistogramVec,
     pub leg1_fill_ratio: HistogramVec,
     pub realized_pnl_usd: HistogramVec,
+    pub flashbots_bundle_simulation_seconds: HistogramVec,
+    pub flashbots_bundle_inclusion_blocks: HistogramVec,
 
     // Internal: counter for test-only assertions.
     #[doc(hidden)]
@@ -123,6 +131,66 @@ impl Metrics {
             .register(Box::new(signal_queue_drops_total.clone()))
             .expect("unique metric");
 
+        let flashbots_simulations_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_flashbots_simulations_total",
+                "Flashbots bundle simulations grouped by status.",
+            ),
+            &["status"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(flashbots_simulations_total.clone()))
+            .expect("unique metric");
+
+        let flashbots_bundles_submitted_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_flashbots_bundles_submitted_total",
+                "Flashbots bundles accepted by relay submission.",
+            ),
+            &["relay"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(flashbots_bundles_submitted_total.clone()))
+            .expect("unique metric");
+
+        let flashbots_bundles_included_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_flashbots_bundles_included_total",
+                "Flashbots bundle transactions found in mined receipts.",
+            ),
+            &["relay"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(flashbots_bundles_included_total.clone()))
+            .expect("unique metric");
+
+        let flashbots_bundles_not_included_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_flashbots_bundles_not_included_total",
+                "Flashbots bundles that expired without an on-chain receipt.",
+            ),
+            &["relay"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(flashbots_bundles_not_included_total.clone()))
+            .expect("unique metric");
+
+        let flashbots_relay_errors_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_flashbots_relay_errors_total",
+                "Flashbots relay/client errors grouped by bounded error class.",
+            ),
+            &["relay", "error"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(flashbots_relay_errors_total.clone()))
+            .expect("unique metric");
+
         let breaker_open = IntGauge::new(
             "peanut_breaker_open",
             "1 when the circuit breaker is currently open, 0 otherwise.",
@@ -130,6 +198,15 @@ impl Metrics {
         .expect("valid gauge opts");
         registry
             .register(Box::new(breaker_open.clone()))
+            .expect("unique metric");
+
+        let pnl_breaker_halted = IntGauge::new(
+            "peanut_pnl_breaker_halted",
+            "1 when daily PnL loss threshold has been exceeded, 0 otherwise.",
+        )
+        .expect("valid gauge opts");
+        registry
+            .register(Box::new(pnl_breaker_halted.clone()))
             .expect("unique metric");
 
         let signal_queue_depth = IntGauge::new(
@@ -192,6 +269,32 @@ impl Metrics {
             .register(Box::new(realized_pnl_usd.clone()))
             .expect("unique metric");
 
+        let flashbots_bundle_simulation_seconds = HistogramVec::new(
+            histogram_opts!(
+                "peanut_flashbots_bundle_simulation_seconds",
+                "Flashbots eth_callBundle latency.",
+                EXEC_DURATION_BUCKETS.to_vec()
+            ),
+            &["relay", "status"],
+        )
+        .expect("valid histogram opts");
+        registry
+            .register(Box::new(flashbots_bundle_simulation_seconds.clone()))
+            .expect("unique metric");
+
+        let flashbots_bundle_inclusion_blocks = HistogramVec::new(
+            histogram_opts!(
+                "peanut_flashbots_bundle_inclusion_blocks",
+                "Blocks between target bundle submission and observed inclusion.",
+                vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0]
+            ),
+            &["relay"],
+        )
+        .expect("valid histogram opts");
+        registry
+            .register(Box::new(flashbots_bundle_inclusion_blocks.clone()))
+            .expect("unique metric");
+
         Self {
             registry,
             signals_generated_total,
@@ -199,12 +302,20 @@ impl Metrics {
             breaker_trips_total,
             unwind_failures_total,
             signal_queue_drops_total,
+            flashbots_simulations_total,
+            flashbots_bundles_submitted_total,
+            flashbots_bundles_included_total,
+            flashbots_bundles_not_included_total,
+            flashbots_relay_errors_total,
             breaker_open,
+            pnl_breaker_halted,
             signal_queue_depth,
             inventory_skew_bps,
             execution_duration_seconds,
             leg1_fill_ratio,
             realized_pnl_usd,
+            flashbots_bundle_simulation_seconds,
+            flashbots_bundle_inclusion_blocks,
             enabled: true,
         }
     }
@@ -259,6 +370,11 @@ impl Metrics {
         }
     }
 
+    /// Updates the PnL breaker halted gauge.
+    pub fn set_pnl_breaker_halted(&self, halted: bool) {
+        self.pnl_breaker_halted.set(if halted { 1 } else { 0 });
+    }
+
     pub fn record_unwind_failure(&self) {
         self.unwind_failures_total.inc();
     }
@@ -270,6 +386,42 @@ impl Metrics {
     pub fn record_queue_drop(&self, reason: &str) {
         self.signal_queue_drops_total
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    pub fn record_flashbots_simulation(&self, relay: &str, status: &str, duration_secs: f64) {
+        self.flashbots_simulations_total
+            .with_label_values(&[status])
+            .inc();
+        self.flashbots_bundle_simulation_seconds
+            .with_label_values(&[relay, status])
+            .observe(duration_secs);
+    }
+
+    pub fn record_flashbots_bundle_submitted(&self, relay: &str) {
+        self.flashbots_bundles_submitted_total
+            .with_label_values(&[relay])
+            .inc();
+    }
+
+    pub fn record_flashbots_bundle_included(&self, relay: &str, inclusion_blocks: u64) {
+        self.flashbots_bundles_included_total
+            .with_label_values(&[relay])
+            .inc();
+        self.flashbots_bundle_inclusion_blocks
+            .with_label_values(&[relay])
+            .observe(inclusion_blocks as f64);
+    }
+
+    pub fn record_flashbots_bundle_not_included(&self, relay: &str) {
+        self.flashbots_bundles_not_included_total
+            .with_label_values(&[relay])
+            .inc();
+    }
+
+    pub fn record_flashbots_relay_error(&self, relay: &str, error: &str) {
+        self.flashbots_relay_errors_total
+            .with_label_values(&[relay, error])
             .inc();
     }
 }
@@ -327,6 +479,11 @@ mod tests {
         m.record_signal_generated("ETH/USDT", "BuyCexSellDex");
         m.set_breaker_open(true);
         m.set_queue_depth(3);
+        m.record_flashbots_simulation("relay", "ok", 0.01);
+        m.record_flashbots_bundle_submitted("relay");
+        m.record_flashbots_bundle_included("relay", 1);
+        m.record_flashbots_bundle_not_included("relay");
+        m.record_flashbots_relay_error("relay", "send");
 
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         for name in [
@@ -337,6 +494,13 @@ mod tests {
             "peanut_signal_queue_depth",
             "peanut_execution_duration_seconds",
             "peanut_realized_pnl_usd",
+            "peanut_flashbots_simulations_total",
+            "peanut_flashbots_bundles_submitted_total",
+            "peanut_flashbots_bundles_included_total",
+            "peanut_flashbots_bundles_not_included_total",
+            "peanut_flashbots_bundle_simulation_seconds",
+            "peanut_flashbots_bundle_inclusion_blocks",
+            "peanut_flashbots_relay_errors_total",
         ] {
             assert!(body.contains(name), "missing metric: {name}\n{body}");
         }

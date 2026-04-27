@@ -61,6 +61,14 @@ pub enum AlertEvent {
         /// Net realised PnL (serialised as string to avoid lossy f64).
         pnl: String,
     },
+    /// PnL breaker tripped — daily cumulative loss exceeded the configured
+    /// maximum. The bot is halting all execution until UTC midnight rollover.
+    DailyLossHalt {
+        /// Cumulative PnL at the time of halt (negative).
+        cumulative_pnl: String,
+        /// Configured maximum daily loss threshold.
+        max_daily_loss: String,
+    },
 }
 
 impl AlertEvent {
@@ -94,6 +102,12 @@ impl AlertEvent {
                 pair,
                 pnl,
             } => format!(":money_with_wings: LARGE LOSS {pair} {signal_id}: pnl={pnl}"),
+            Self::DailyLossHalt {
+                cumulative_pnl,
+                max_daily_loss,
+            } => format!(
+                ":no_entry: DAILY LOSS HALT — cumulative={cumulative_pnl}, threshold=-{max_daily_loss}"
+            ),
         }
     }
 }

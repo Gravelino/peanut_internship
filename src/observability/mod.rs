@@ -12,4 +12,4 @@ pub use alerts::{
     emit_best_effort, evaluate_execution, mask_webhook_url,
 };
 pub use metrics::{Metrics, init_metrics, metrics_handle};
-pub use server::serve_metrics;
+pub use server::{HaltCoordinator, serve_metrics, serve_metrics_with_halt};
