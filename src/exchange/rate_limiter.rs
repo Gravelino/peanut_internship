@@ -484,14 +484,28 @@ pub fn extract_used_weight_from_headers(headers: &reqwest::header::HeaderMap) ->
         }
     }
 
-    if let Some(val) = headers
-        .get("x-mbx-used-weight-1m")
-        .and_then(|v| v.to_str().ok())
-    {
-        return val.parse::<u32>().ok();
+    if let Some(value) = extract_used_weight_for_interval(headers, LimitInterval::Minute) {
+        return Some(value);
     }
 
     None
+}
+
+/// Extracts Binance request-weight usage for a specific interval.
+pub fn extract_used_weight_for_interval(
+    headers: &reqwest::header::HeaderMap,
+    interval: LimitInterval,
+) -> Option<u32> {
+    let header_name = match interval {
+        LimitInterval::Second => "x-mbx-used-weight-1s",
+        LimitInterval::Minute => "x-mbx-used-weight-1m",
+        LimitInterval::FiveMinute => "x-mbx-used-weight-5m",
+        LimitInterval::Day => "x-mbx-used-weight-1d",
+    };
+    headers
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u32>().ok())
 }
 
 /// Extracts the Binance order count for a specific interval from response headers.
@@ -639,6 +653,32 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-mbx-used-weight-1m", "50".parse().unwrap());
         assert_eq!(extract_used_weight_from_headers(&headers), Some(50));
+    }
+
+    #[test]
+    fn test_extract_used_weight_for_interval_all_supported() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-mbx-used-weight-1s", "7".parse().unwrap());
+        headers.insert("x-mbx-used-weight-1m", "70".parse().unwrap());
+        headers.insert("x-mbx-used-weight-5m", "300".parse().unwrap());
+        headers.insert("x-mbx-used-weight-1d", "5000".parse().unwrap());
+
+        assert_eq!(
+            extract_used_weight_for_interval(&headers, LimitInterval::Second),
+            Some(7)
+        );
+        assert_eq!(
+            extract_used_weight_for_interval(&headers, LimitInterval::Minute),
+            Some(70)
+        );
+        assert_eq!(
+            extract_used_weight_for_interval(&headers, LimitInterval::FiveMinute),
+            Some(300)
+        );
+        assert_eq!(
+            extract_used_weight_for_interval(&headers, LimitInterval::Day),
+            Some(5000)
+        );
     }
 
     #[test]
