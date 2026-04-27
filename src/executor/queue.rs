@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::executor::engine::{ExecutionContext, Executor};
@@ -226,6 +226,7 @@ pub struct QueueWorker {
     queue: Arc<SignalQueue>,
     executor: Arc<Executor>,
     semaphore: Arc<Semaphore>,
+    max_concurrent_executions: usize,
     poll_interval: Duration,
     /// Optional sink that receives completed [`ExecutionContext`]s. `None`
     /// discards them (useful in tests and smoke-run setups).
@@ -246,6 +247,7 @@ impl QueueWorker {
             queue,
             executor,
             semaphore: Arc::new(Semaphore::new(max_concurrent_executions.max(1))),
+            max_concurrent_executions: max_concurrent_executions.max(1),
             poll_interval,
             completion_sink: None,
         }
@@ -262,15 +264,43 @@ impl QueueWorker {
     /// Runs the worker loop until the outer task is cancelled. The caller is
     /// responsible for feeding `queue` via [`SignalQueue::push`].
     pub async fn run(&self) {
+        self.run_loop(None).await;
+    }
+
+    /// Runs the worker until `shutdown` is signalled, then waits for all
+    /// in-flight executions to finish before returning.
+    pub async fn run_until_shutdown(&self, shutdown: watch::Receiver<bool>) {
+        self.run_loop(Some(shutdown)).await;
+    }
+
+    async fn run_loop(&self, mut shutdown: Option<watch::Receiver<bool>>) {
         info!("queue worker started");
         loop {
+            if shutdown.as_ref().is_some_and(|rx| *rx.borrow()) {
+                break;
+            }
+
             // If the queue is empty, back off briefly before polling again.
             let Some(pending) = self.queue.pop_valid().await else {
-                tokio::time::sleep(self.poll_interval).await;
+                if let Some(rx) = shutdown.as_mut() {
+                    tokio::select! {
+                        _ = rx.changed() => {
+                            if *rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(self.poll_interval) => {}
+                    }
+                } else {
+                    tokio::time::sleep(self.poll_interval).await;
+                }
                 continue;
             };
 
-            // Acquire a concurrency slot (blocks when cap reached).
+            // Acquire a concurrency slot (blocks when cap reached). Once a
+            // signal has been popped, we still execute it even if shutdown is
+            // signalled while waiting for capacity; shutdown only prevents
+            // popping additional signals.
             let permit = match self.semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => {
@@ -290,6 +320,20 @@ impl QueueWorker {
                     warn!(error = %e, "completion sink closed; execution context dropped");
                 }
             });
+        }
+
+        info!("queue worker draining in-flight executions");
+        match self
+            .semaphore
+            .clone()
+            .acquire_many_owned(self.max_concurrent_executions as u32)
+            .await
+        {
+            Ok(permits) => {
+                drop(permits);
+                info!("queue worker drained");
+            }
+            Err(_) => warn!("semaphore closed while draining queue worker"),
         }
     }
 }
@@ -460,5 +504,44 @@ mod tests {
         // Sanity: all three were drained.
         assert_eq!(q.len().await, 0);
         assert!(start.elapsed() >= Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn worker_shutdown_drains_in_flight_execution() {
+        let q = SignalQueue::new(QueueConfig::default());
+        q.push(mk_signal(Decimal::from(80), "ETH/USDT")).await;
+
+        let executor = Arc::new(Executor::new(
+            Arc::new(SimulatedLegs {
+                cex_latency: Duration::from_millis(80),
+                dex_latency: Duration::from_millis(80),
+                ..Default::default()
+            }),
+            ExecutorConfig {
+                use_flashbots: false,
+                leg1_timeout: Duration::from_secs(2),
+                leg2_timeout: Duration::from_secs(2),
+                ..ExecutorConfig::default()
+            },
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker =
+            QueueWorker::new(q.clone(), executor, 1, Duration::from_millis(10)).with_sink(tx);
+        let handle = tokio::spawn(async move { worker.run_until_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ctx.state.is_filled());
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.len().await, 0);
     }
 }

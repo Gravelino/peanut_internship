@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::executor::errors::{ExecutorError, ExecutorResult};
+use crate::executor::migrations::{SqlMigration, migrate_executor_db};
 use crate::strategy::signal::Signal;
 
 /// Tunables for the [`CircuitBreaker`].
@@ -135,6 +136,126 @@ impl Default for CircuitBreaker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PnL-based breaker
+// ---------------------------------------------------------------------------
+
+/// Tunables for the [`PnlBreaker`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PnlBreakerConfig {
+    /// Maximum cumulative loss (absolute, positive number) before the breaker
+    /// trips. For example, `100` means the breaker fires when daily realised
+    /// PnL drops below `-$100`.
+    pub max_daily_loss_usd: rust_decimal::Decimal,
+}
+
+impl Default for PnlBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_daily_loss_usd: rust_decimal::Decimal::from(100),
+        }
+    }
+}
+
+/// Halts execution when cumulative realised PnL for the current UTC day
+/// exceeds the configured loss threshold.
+///
+/// Unlike [`CircuitBreaker`] (which counts execution *failures*), this
+/// breaker fires on **economic drawdown** — the bot may be executing
+/// successfully but still bleeding money.
+///
+/// Resets automatically when the UTC date rolls over. All times use
+/// [`chrono::Utc`] so the reset is deterministic regardless of host TZ.
+#[derive(Debug, Clone)]
+pub struct PnlBreaker {
+    config: PnlBreakerConfig,
+    cumulative_pnl: rust_decimal::Decimal,
+    /// UTC date of the current accumulation window.
+    day: chrono::NaiveDate,
+    halted: bool,
+}
+
+impl PnlBreaker {
+    /// Creates a PnL breaker with the given config.
+    pub fn new(config: PnlBreakerConfig) -> Self {
+        Self {
+            config,
+            cumulative_pnl: rust_decimal::Decimal::ZERO,
+            day: chrono::Utc::now().date_naive(),
+            halted: false,
+        }
+    }
+
+    /// Records a realised PnL observation. Trips the breaker when the
+    /// cumulative daily PnL drops below `-max_daily_loss_usd`.
+    pub fn record_pnl(&mut self, net_pnl: rust_decimal::Decimal) {
+        self.maybe_reset_day();
+        self.cumulative_pnl += net_pnl;
+        if !self.halted && self.cumulative_pnl < -self.config.max_daily_loss_usd {
+            self.halted = true;
+            warn!(
+                cumulative_pnl = %self.cumulative_pnl,
+                max_daily_loss = %self.config.max_daily_loss_usd,
+                "PNL BREAKER HALTED — daily loss threshold exceeded"
+            );
+        }
+    }
+
+    /// Deterministic variant for testing: caller supplies `today`.
+    pub fn record_pnl_at(&mut self, net_pnl: rust_decimal::Decimal, today: chrono::NaiveDate) {
+        self.maybe_reset_day_at(today);
+        self.cumulative_pnl += net_pnl;
+        if !self.halted && self.cumulative_pnl < -self.config.max_daily_loss_usd {
+            self.halted = true;
+            warn!(
+                cumulative_pnl = %self.cumulative_pnl,
+                max_daily_loss = %self.config.max_daily_loss_usd,
+                "PNL BREAKER HALTED — daily loss threshold exceeded"
+            );
+        }
+    }
+
+    /// Returns `true` when the breaker is halted (daily loss exceeded).
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    /// Cumulative PnL for the current day.
+    pub fn cumulative_pnl(&self) -> rust_decimal::Decimal {
+        self.cumulative_pnl
+    }
+
+    /// Max daily loss threshold.
+    pub fn max_daily_loss(&self) -> rust_decimal::Decimal {
+        self.config.max_daily_loss_usd
+    }
+
+    /// Resets to a fresh day if the UTC date has rolled over.
+    fn maybe_reset_day(&mut self) {
+        self.maybe_reset_day_at(chrono::Utc::now().date_naive());
+    }
+
+    fn maybe_reset_day_at(&mut self, today: chrono::NaiveDate) {
+        if today != self.day {
+            debug!(
+                old_day = %self.day,
+                new_day = %today,
+                final_pnl = %self.cumulative_pnl,
+                "PnlBreaker: day rollover — resetting"
+            );
+            self.day = today;
+            self.cumulative_pnl = rust_decimal::Decimal::ZERO;
+            self.halted = false;
+        }
+    }
+}
+
+impl Default for PnlBreaker {
+    fn default() -> Self {
+        Self::new(PnlBreakerConfig::default())
+    }
+}
+
 /// Optional SQLite journal for [`ReplayProtection`].
 ///
 /// Wrapped in `Arc<Mutex<>>` so the parent `ReplayProtection` stays `Clone`
@@ -151,17 +272,20 @@ struct ReplayJournal {
 
 impl ReplayJournal {
     fn open(path: &Path, ttl: Duration) -> ExecutorResult<Self> {
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .map_err(|e| ExecutorError::Persistence(format!("open {}: {e}", path.display())))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS replay_seen (
+        migrate_executor_db(
+            &mut conn,
+            &[SqlMigration {
+                version: 1,
+                sql: "CREATE TABLE IF NOT EXISTS replay_seen (
                 signal_id  TEXT PRIMARY KEY,
                 expires_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_replay_expires
                 ON replay_seen(expires_at);",
-        )
-        .map_err(|e| ExecutorError::Persistence(format!("schema: {e}")))?;
+            }],
+        )?;
 
         let journal = Self {
             path: path.to_path_buf(),
@@ -483,8 +607,90 @@ mod tests {
     }
 
     #[test]
+    fn journal_schema_sets_user_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.db");
+        let _rp = ReplayProtection::with_journal(&path, Duration::from_secs(60)).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[test]
     fn in_memory_default_has_no_journal() {
         let rp = ReplayProtection::default();
         assert!(rp.journal.is_none());
+    }
+
+    // ---- PnlBreaker -------------------------------------------------------
+
+    #[test]
+    fn pnl_breaker_trips_on_loss_threshold() {
+        let mut pb = PnlBreaker::new(PnlBreakerConfig {
+            max_daily_loss_usd: rust_decimal::Decimal::from(50),
+        });
+        let today = chrono::Utc::now().date_naive();
+        pb.record_pnl_at(rust_decimal::Decimal::from(-30), today);
+        assert!(!pb.is_halted());
+        assert_eq!(pb.cumulative_pnl(), rust_decimal::Decimal::from(-30));
+
+        pb.record_pnl_at(rust_decimal::Decimal::from(-25), today);
+        // -55 < -50 → halted
+        assert!(pb.is_halted());
+        assert_eq!(pb.cumulative_pnl(), rust_decimal::Decimal::from(-55));
+    }
+
+    #[test]
+    fn pnl_breaker_profits_offset_losses() {
+        let mut pb = PnlBreaker::new(PnlBreakerConfig {
+            max_daily_loss_usd: rust_decimal::Decimal::from(100),
+        });
+        let today = chrono::Utc::now().date_naive();
+        pb.record_pnl_at(rust_decimal::Decimal::from(-80), today);
+        assert!(!pb.is_halted());
+        // Profit pushes cumulative back up
+        pb.record_pnl_at(rust_decimal::Decimal::from(50), today);
+        assert!(!pb.is_halted());
+        assert_eq!(pb.cumulative_pnl(), rust_decimal::Decimal::from(-30));
+    }
+
+    #[test]
+    fn pnl_breaker_resets_on_day_rollover() {
+        let mut pb = PnlBreaker::new(PnlBreakerConfig {
+            max_daily_loss_usd: rust_decimal::Decimal::from(50),
+        });
+        let day1 = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
+        let day2 = chrono::NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+
+        pb.record_pnl_at(rust_decimal::Decimal::from(-60), day1);
+        assert!(pb.is_halted());
+
+        // New day → reset
+        pb.record_pnl_at(rust_decimal::Decimal::from(-10), day2);
+        assert!(!pb.is_halted());
+        assert_eq!(pb.cumulative_pnl(), rust_decimal::Decimal::from(-10));
+    }
+
+    #[test]
+    fn pnl_breaker_stays_halted_within_same_day() {
+        let mut pb = PnlBreaker::new(PnlBreakerConfig {
+            max_daily_loss_usd: rust_decimal::Decimal::from(20),
+        });
+        let today = chrono::Utc::now().date_naive();
+        pb.record_pnl_at(rust_decimal::Decimal::from(-25), today);
+        assert!(pb.is_halted());
+
+        // Even a profit doesn't un-halt within the same day
+        pb.record_pnl_at(rust_decimal::Decimal::from(100), today);
+        assert!(pb.is_halted());
+    }
+
+    #[test]
+    fn pnl_breaker_default_threshold_is_100() {
+        let pb = PnlBreaker::default();
+        assert_eq!(pb.max_daily_loss(), rust_decimal::Decimal::from(100));
+        assert!(!pb.is_halted());
     }
 }

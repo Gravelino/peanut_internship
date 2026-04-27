@@ -28,6 +28,8 @@ use tracing::{info, instrument, warn};
 
 use crate::chain::client::ChainClient;
 use crate::core::types::TransactionReceipt;
+use crate::executor::errors::ExecutorError;
+use crate::executor::migrations::{SqlMigration, migrate_executor_db};
 use crate::strategy::signal::Direction;
 
 // ---------------------------------------------------------------------------
@@ -131,6 +133,10 @@ pub enum ReconcileError {
 /// Convenience alias.
 pub type ReconcileResult<T> = Result<T, ReconcileError>;
 
+fn reconcile_migration_error(error: ExecutorError) -> ReconcileError {
+    ReconcileError::Persistence(error.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Receipt provider (decoupled from ChainClient for testability)
 // ---------------------------------------------------------------------------
@@ -201,10 +207,13 @@ impl ReconcileStore {
     /// Opens (creating if absent) the reconcile database at `path`.
     pub fn open(path: impl AsRef<Path>) -> ReconcileResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .map_err(|e| ReconcileError::Persistence(format!("open {}: {e}", path.display())))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS pending_reconcile (
+        migrate_executor_db(
+            &mut conn,
+            &[SqlMigration {
+                version: 1,
+                sql: "CREATE TABLE IF NOT EXISTS pending_reconcile (
                 signal_id   TEXT PRIMARY KEY,
                 tx_hash     TEXT NOT NULL,
                 payload     TEXT NOT NULL,
@@ -215,8 +224,9 @@ impl ReconcileStore {
             );
             CREATE INDEX IF NOT EXISTS idx_reconcile_status
                 ON pending_reconcile(status);",
+            }],
         )
-        .map_err(|e| ReconcileError::Persistence(format!("migrate: {e}")))?;
+        .map_err(reconcile_migration_error)?;
         Ok(Self {
             path,
             conn: Arc::new(Mutex::new(conn)),
@@ -677,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn store_persists_across_reopens() {
+    fn store_persists_across_reopen() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("r.db");
         {
@@ -688,6 +698,18 @@ mod tests {
         let p = s2.list_pending().unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].signal_id, "sig-persist");
+    }
+
+    #[test]
+    fn store_schema_sets_user_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("r.db");
+        let _store = ReconcileStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
     }
 
     // ---- Worker inspect ------------------------------------------------
