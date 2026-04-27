@@ -21,6 +21,7 @@ Live DEX execution (`arb_bot --dex-address-book ...`):
 - `ETH_RPC_URL`: mainnet (or fork) RPC endpoint used by `UniswapV2Swapper`
 - `WALLET_ADDRESS`: 0x-address that signs and receives DEX output
 - `WALLET_PRIVATE_KEY`: signing key (env-var name is configurable via `--wallet-key-env`)
+- `FLASHBOTS_AUTH_PRIVATE_KEY`: Flashbots relay auth signing key used when private DEX mode is enabled (env-var name is configurable via `--flashbots-auth-key-env`)
 
 ### Health Check
 Run the environment and RPC checker before integration work:
@@ -78,26 +79,53 @@ cargo run --bin arb_checker_cli -- ETH/USDT --size 2.0
 # Safe dry-run: stubbed DEX prices, simulated legs.
 cargo run --bin arb_bot -- --simulation
 
-# Live CEX + live DEX execution with persistent replay + reconcile.
+# Live CEX + private DEX execution through Flashbots with persistent replay + reconcile.
 cargo run --bin arb_bot -- \
     --pair ETH/USDC \
+    --simulation false \
     --eth-rpc-url "$ETH_RPC_URL" \
     --wallet-address "$WALLET_ADDRESS" \
     --dex-address-book configs/address_book.json \
     --dex-slippage-bps 50 \
+    --use-flashbots true \
+    --flashbots-relay-url https://relay.flashbots.net \
+    --flashbots-auth-key-env FLASHBOTS_AUTH_PRIVATE_KEY \
+    --flashbots-target-block-offset 1 \
+    --flashbots-max-blocks-to-try 3 \
+    --require-private-dex true \
     --replay-db data/replay.db \
     --reconcile-db data/reconcile.db \
     --alert-webhook-url "$SLACK_WEBHOOK" --alert-provider slack \
-    --metrics-addr 0.0.0.0:9090
+    --metrics-port 9090
 ```
 
 Key flags:
 - **`--simulation`** — in-process `SimulatedLegs`; never touches the exchange or chain.
-- **`--dex-address-book <path>`** — JSON of `{pair: {base, base_decimals, quote, quote_decimals}}`; enables live DEX via `UniswapV2Swapper`. Without it, live mode logs a warning and the DEX leg returns `NotImplemented`.
+- **`--dex-address-book <path>`** — JSON of `{pair: {base, base_decimals, quote, quote_decimals}}`; enables live DEX via `UniswapV2Swapper` or `FlashbotsSwapper`. Without it, live mode logs a warning and the DEX leg returns `NotImplemented`; in required private mode startup fails instead.
+- **`--use-flashbots true|false`** — when true, live DEX uses `FlashbotsSwapper` and the executor runs DEX-first. When false, live DEX uses public mempool submission and the executor runs CEX-first.
+- **`--flashbots-relay-url <url>`** — Flashbots-compatible relay endpoint. Defaults to `https://relay.flashbots.net`.
+- **`--flashbots-auth-key-env <name>`** — environment variable containing the Flashbots relay auth private key. Defaults to `FLASHBOTS_AUTH_PRIVATE_KEY`.
+- **`--flashbots-target-block-offset <n>`** — first target block offset from the current head. Defaults to `1`.
+- **`--flashbots-max-blocks-to-try <n>`** — number of consecutive target blocks to submit the signed bundle for. Defaults to `3`.
+- **`--require-private-dex true|false`** — when true, missing Flashbots auth or missing DEX address book is a startup error. Set false to allow fallback to public DEX / CEX-first mode.
 - **`--replay-db <path>`** — SQLite journal so the signal-id replay window survives restarts (stretch S8).
 - **`--reconcile-db <path>`** — SQLite store of `LEG2_TIMEOUT` entries. A background worker polls each entry's receipt, marks it `Resolved` / `Reverted` / `Expired`, and on revert fires `LegExecutor::unwind_position` to flatten leg 1 (stretch S3 + A2).
 - **`--alert-webhook-url` / `--alert-provider`** — Generic, Slack, or Discord adapter. The full URL is **never** logged — `mask_webhook_url` keeps only host + first path segment.
-- **`--metrics-addr`** — Prometheus exporter (S7a). Scrape `http://<addr>/metrics`.
+- **`--metrics-port`** — Prometheus exporter port (S7a). Set `0` to disable the HTTP endpoint. Scrape `http://<host>:<port>/metrics`.
+
+Flashbots behaviour:
+- The private DEX swapper builds and signs the Uniswap V2 swap transaction locally, simulates it with `eth_callBundle`, then submits the raw signed transaction bundle with `eth_sendBundle`.
+- The same signed transaction is submitted for `max_blocks_to_try` consecutive target blocks. If no receipt appears by the last target block or inclusion timeout, the DEX leg returns `BundleNotIncluded` and the executor treats the signal as rejected without opening the CEX leg.
+- Allowance approval is still public-chain state. Ensure the wallet has sufficient allowance before relying on fully private swaps, or allow the bot to perform the approval transaction first.
+
+Flashbots Prometheus metrics:
+- `peanut_flashbots_simulations_total`
+- `peanut_flashbots_bundles_submitted_total`
+- `peanut_flashbots_bundles_included_total`
+- `peanut_flashbots_bundles_not_included_total`
+- `peanut_flashbots_bundle_simulation_seconds`
+- `peanut_flashbots_bundle_inclusion_blocks`
+- `peanut_flashbots_relay_errors_total`
 
 The bot respects a circuit breaker (N failures in a rolling window → cool-off), a replay window that REJECTS duplicate signal ids, and a configurable `max_concurrent_executions` cap. A `ctrl-c` cleanly shuts down the reconcile worker loop.
 
@@ -131,7 +159,7 @@ flowchart TB
 
     subgraph Executor_Runtime [Executor + Runtime]
         X1[executor/queue<br/>priority + concurrency] --> X2[executor/engine<br/>Executor + LegExecutor]
-        X2 --> X3[executor/dex_swapper<br/>UniswapV2Swapper]
+        X2 --> X3[executor/dex_swapper<br/>UniswapV2Swapper / FlashbotsSwapper]
         X2 --> X4[executor/recovery<br/>breaker + replay]
         X2 --> X5[executor/reconcile<br/>LEG2_TIMEOUT worker]
     end
@@ -174,12 +202,12 @@ flowchart LR
 
 ### Repository Architecture
 - `src/core/`: Base types (Address, TokenAmount, Token), WalletManager, CanonicalSerializer
-- `src/chain/`: ChainClient (RPC + retry), TransactionBuilder, TransactionAnalyzer
+- `src/chain/`: ChainClient (RPC + retry), TransactionBuilder, Flashbots relay client, TransactionAnalyzer
 - `src/pricing/`: AMM math, router, mempool monitor, fork simulator, pricing engine
 - `src/exchange/`: Binance client, order book analyzer, rate limiter, price oracle
 - `src/inventory/`: Position tracker, rebalance planner, PnL engine, on-chain wallet sync
 - `src/strategy/`: Signal generator (from venue prices), scorer (weighted 4-component), fee model
-- `src/executor/`: Queue (priority), `Executor` state machine, `LegExecutor` trait with `SimulatedLegs` / `LiveLegs`, `UniswapV2Swapper`, circuit breaker, replay protection, reconciliation worker
+- `src/executor/`: Queue (priority), `Executor` state machine, `LegExecutor` trait with `SimulatedLegs` / `LiveLegs`, `UniswapV2Swapper`, `FlashbotsSwapper`, circuit breaker, replay protection, reconciliation worker
 - `src/observability/`: Prometheus metrics exporter, webhook alert sinks (Generic / Slack / Discord)
 - `src/integration/`: `ArbChecker` — end-to-end arbitrage pipeline helper
 - `src/bin/`: CLI binaries (`arb_bot`, `orderbook_cli`, `pnl_cli`, `analyzer`, `integration_test`, etc.)
@@ -225,9 +253,9 @@ flowchart LR
 #### executor/
 | File | Purpose |
 |------|---------|
-| `engine.rs` | `Executor` state machine, `LegExecutor` trait (`SimulatedLegs`, `LiveLegs` with injected `UniswapV2Swapper`), CEX-first + DEX-first flows, race-on-cancel, partial-fill classifier, unwind |
+| `engine.rs` | `Executor` state machine, `LegExecutor` trait (`SimulatedLegs`, `LiveLegs` with injected DEX swapper), CEX-first + Flashbots DEX-first flows, race-on-cancel, partial-fill classifier, unwind |
 | `queue.rs` | Priority-scored `SignalQueue` + `QueueWorker` with `max_concurrent_executions` semaphore |
-| `dex_swapper.rs` | `DexSwapper` trait + production `UniswapV2Swapper` (`ensure_allowance` + `swapExactTokensForTokens` via `TransactionBuilder`) |
+| `dex_swapper.rs` | `DexSwapper` trait + production `UniswapV2Swapper` and private `FlashbotsSwapper` (`ensure_allowance` + `swapExactTokensForTokens` via `TransactionBuilder`) |
 | `recovery.rs` | `CircuitBreaker` + `ReplayProtection` (in-memory or SQLite-backed journal) |
 | `reconcile.rs` | `ReconcileStore` (SQLite) + `ReconcileWorker` — receipt polling, async `spawn_blocking` I/O, transitions Pending→Resolved/Reverted/Expired |
 | `errors.rs` | `ExecutorError`, `ExecutorResult` |
@@ -310,12 +338,12 @@ cargo test --test integration_arb_flow   # Week 3 integration tests
 
 ### Test Coverage
 
-**507 lib tests** (`cargo test --lib`), plus integration suites under `tests/`. Highlights:
+**542 lib tests** (`cargo test --lib`), plus integration suites under `tests/`. Highlights:
 
 - **core / chain / pricing**: address validation, wallet secrecy (Debug/Display never expose the private key), AMM math, router choice, fork-simulated quotes.
 - **exchange / inventory**: order-book walking, spread/slippage, rate limiter, inventory skew + rebalance, PnL aggregation + CSV export.
 - **strategy**: signal generation (direction / TTL / cooldown), weighted scoring, fee model.
-- **executor**: full state machine (accepted → filled / rejected / failed / leg2_timeout / manual_review), race-on-cancel all branches, LEG1_PARTIAL classifier (Full / ProceedReduced / AbortUnwind / Dust), unwind on revert, reconcile worker lifecycle (receipt success / revert / pending / expired / RPC error), SQLite persistence across reopens.
+- **executor**: full state machine (accepted → filled / rejected / failed / leg2_timeout / manual_review), race-on-cancel all branches, LEG1_PARTIAL classifier (Full / ProceedReduced / AbortUnwind / Dust), unwind on revert, Flashbots bundle target-block calculation, reconcile worker lifecycle (receipt success / revert / pending / expired / RPC error), SQLite persistence across reopens.
 - **recovery**: circuit breaker open/close + cool-off, replay protection in-memory and journaled.
-- **observability**: Prometheus counter increments, webhook URL masking (Slack / Discord / bad input), alert rule evaluation per terminal state.
+- **observability**: Prometheus counter increments including Flashbots lifecycle metrics, webhook URL masking (Slack / Discord / bad input), alert rule evaluation per terminal state.
 - **property tests (proptest)**: AMM invariants, router net-math consistency.
