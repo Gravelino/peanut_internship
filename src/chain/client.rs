@@ -22,9 +22,18 @@ pub const MIN_POLL_INTERVAL: f64 = 0.1;
 /// Providers are created once at construction and reused across calls.
 #[derive(Clone)]
 pub struct ChainClient {
+    rpc_urls: Vec<String>,
     providers: Vec<Arc<Provider<Http>>>,
     timeout_secs: u64,
     max_retries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcHealth {
+    pub url: String,
+    pub healthy: bool,
+    pub block_number: Option<u64>,
+    pub error: Option<String>,
 }
 
 impl ChainClient {
@@ -42,15 +51,47 @@ impl ChainClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            rpc_urls,
             providers,
             timeout_secs,
             max_retries,
         })
     }
 
+    pub fn rpc_urls(&self) -> &[String] {
+        &self.rpc_urls
+    }
+
     /// Returns a reference to the first (primary) provider, if any.
     pub fn provider(&self) -> Option<Arc<Provider<Http>>> {
         self.providers.first().cloned()
+    }
+
+    pub async fn health_check(&self) -> Vec<RpcHealth> {
+        let mut out = Vec::with_capacity(self.providers.len());
+        for (idx, provider) in self.providers.iter().enumerate() {
+            match provider.get_block_number().await {
+                Ok(block) => out.push(RpcHealth {
+                    url: self.rpc_urls.get(idx).cloned().unwrap_or_default(),
+                    healthy: true,
+                    block_number: Some(block.as_u64()),
+                    error: None,
+                }),
+                Err(error) => out.push(RpcHealth {
+                    url: self.rpc_urls.get(idx).cloned().unwrap_or_default(),
+                    healthy: false,
+                    block_number: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        out
+    }
+
+    pub async fn get_block_number(&self) -> ChainResult<u64> {
+        self.with_provider(|provider| async move { provider.get_block_number().await })
+            .await
+            .map(|block| block.as_u64())
     }
 
     /// Fetches the native ETH balance for an address.
@@ -86,6 +127,34 @@ impl ChainClient {
 
     /// Fetches the current gas prices and base fee.
     pub async fn get_gas_price(&self) -> ChainResult<GasPrice> {
+        match self.get_fee_history_gas_price(20).await {
+            Ok(gas) => return Ok(gas),
+            Err(error) => {
+                warn!(error = %error, "eth_feeHistory failed; falling back to legacy gas price");
+            }
+        }
+
+        self.get_legacy_gas_price().await
+    }
+
+    async fn get_fee_history_gas_price(&self, block_count: u64) -> ChainResult<GasPrice> {
+        let percentiles = vec![25.0_f64, 50.0_f64, 75.0_f64];
+        let history = self
+            .with_provider(|provider| {
+                let percentiles = percentiles.clone();
+                async move {
+                    provider
+                        .fee_history(U256::from(block_count), BlockNumber::Latest, &percentiles)
+                        .await
+                }
+            })
+            .await?;
+
+        gas_price_from_fee_history(&history.base_fee_per_gas, &history.reward)
+            .ok_or_else(|| ChainError::Rpc("fee history response missing fee samples".into()))
+    }
+
+    async fn get_legacy_gas_price(&self) -> ChainResult<GasPrice> {
         let latest_block = self
             .with_provider(|provider| async move { provider.get_block(BlockNumber::Latest).await })
             .await?;
@@ -215,13 +284,24 @@ impl ChainClient {
         for (url_idx, provider) in self.providers.iter().enumerate() {
             for retry in 0..=self.max_retries {
                 if retry > 0 {
-                    debug!(url_idx, retry, "Retrying RPC operation");
+                    debug!(
+                        url_idx,
+                        url = %self.rpc_urls.get(url_idx).map(String::as_str).unwrap_or("<unknown>"),
+                        retry,
+                        "Retrying RPC operation"
+                    );
                 }
                 let result = operation(Arc::clone(provider)).await;
                 match result {
                     Ok(value) => return Ok(value),
                     Err(error) => {
-                        warn!(url_idx, retry, error = %error, "RPC operation failed");
+                        warn!(
+                            url_idx,
+                            url = %self.rpc_urls.get(url_idx).map(String::as_str).unwrap_or("<unknown>"),
+                            retry,
+                            error = %error,
+                            "RPC operation failed"
+                        );
                         last_error = Some(error);
                     }
                 }
@@ -233,6 +313,39 @@ impl ChainClient {
             None => Err(ChainError::Rpc("all RPC endpoints failed".to_string())),
         }
     }
+}
+
+fn gas_price_from_fee_history(base_fees: &[U256], rewards: &[Vec<U256>]) -> Option<GasPrice> {
+    let base_fee = *base_fees.last()?;
+    let mut low = Vec::new();
+    let mut medium = Vec::new();
+    let mut high = Vec::new();
+
+    for row in rewards {
+        if row.len() >= 3 {
+            low.push(row[0]);
+            medium.push(row[1]);
+            high.push(row[2]);
+        }
+    }
+
+    Some(GasPrice {
+        base_fee,
+        priority_fee_low: average_u256(&low)?,
+        priority_fee_medium: average_u256(&medium)?,
+        priority_fee_high: average_u256(&high)?,
+    })
+}
+
+fn average_u256(values: &[U256]) -> Option<U256> {
+    if values.is_empty() {
+        return None;
+    }
+    let sum = values
+        .iter()
+        .copied()
+        .fold(U256::zero(), |acc, v| acc.saturating_add(v));
+    Some(sum / U256::from(values.len()))
 }
 
 /// Classifies a raw RPC error message into a structured [ChainError].
@@ -275,6 +388,26 @@ mod tests {
             ChainClient::new(vec![TEST_RPC_URL.to_string()], TEST_TIMEOUT, TEST_RETRIES).unwrap();
         let address = Address::new(TEST_RECIPIENT).unwrap();
         (client, address)
+    }
+
+    #[test]
+    fn client_preserves_rpc_urls_for_diagnostics() {
+        let client = ChainClient::new(
+            vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            TEST_TIMEOUT,
+            TEST_RETRIES,
+        )
+        .unwrap();
+        assert_eq!(
+            client.rpc_urls(),
+            &[
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -323,6 +456,38 @@ mod tests {
     fn classify_generic_rpc_error() {
         let err = classify_rpc_error("some random RPC failure xyz");
         assert!(matches!(err, ChainError::Rpc(_)));
+    }
+
+    #[test]
+    fn gas_price_from_fee_history_uses_latest_base_and_average_tips() {
+        let gwei = U256::from(1_000_000_000u64);
+        let gas = gas_price_from_fee_history(
+            &[
+                U256::from(30u64) * gwei,
+                U256::from(31u64) * gwei,
+                U256::from(32u64) * gwei,
+            ],
+            &[
+                vec![gwei, U256::from(2u64) * gwei, U256::from(3u64) * gwei],
+                vec![
+                    U256::from(3u64) * gwei,
+                    U256::from(4u64) * gwei,
+                    U256::from(5u64) * gwei,
+                ],
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(gas.base_fee, U256::from(32u64) * gwei);
+        assert_eq!(gas.priority_fee_low, U256::from(2u64) * gwei);
+        assert_eq!(gas.priority_fee_medium, U256::from(3u64) * gwei);
+        assert_eq!(gas.priority_fee_high, U256::from(4u64) * gwei);
+    }
+
+    #[test]
+    fn gas_price_from_fee_history_rejects_missing_reward_samples() {
+        let gas = gas_price_from_fee_history(&[U256::from(1u64)], &[vec![U256::from(1u64)]]);
+        assert!(gas.is_none());
     }
 
     #[tokio::test]

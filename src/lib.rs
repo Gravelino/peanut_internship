@@ -41,10 +41,7 @@ pub mod observability;
 pub mod pricing;
 pub mod strategy;
 
-pub use chain::{
-    ChainClient, ChainError, ChainResult, InsufficientFunds, NonceTooLow, ReplacementUnderpriced,
-    TransactionBuilder,
-};
+pub use chain::{ChainClient, ChainError, ChainResult, RpcHealth, TransactionBuilder};
 pub use core::serializer::CanonicalSerializer;
 pub use core::types::{
     Address, BlockId, CoreError, DEFAULT_GAS_BUFFER_BPS, ETH_DECIMALS, ETH_SYMBOL, GasPrice,
@@ -74,8 +71,8 @@ pub use integration::{
 pub use inventory::{
     ArbRecord, Balance, CostEstimate, ExecutorConfig, InventoryError, InventoryResult,
     InventoryTracker, PnLChartExporter, PnLEngine, PnLSummary, RebalanceExecutor, RebalancePlanner,
-    RebalanceResult, RebalanceStatus, RebalanceStep, TradeLeg, TradeStep, TradeSummary,
-    TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, WithdrawStep,
+    RebalanceResult, RebalanceStatus, RebalanceStep, TradeJsonlLogger, TradeLeg, TradeStep,
+    TradeSummary, TransferFeeInfo, TransferPlan, Venue, WalletBalanceFetcher, WithdrawStep,
     min_operating_balance, transfer_fees,
 };
 pub use pricing::{
