@@ -30,6 +30,9 @@ pub enum InventoryError {
     /// A CSV serialization/deserialization error occurred.
     #[error("csv error: {0}")]
     Csv(#[from] csv::Error),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Convenience alias for `Result<T, InventoryError>`.

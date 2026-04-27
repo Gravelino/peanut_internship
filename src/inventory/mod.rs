@@ -18,7 +18,7 @@ pub mod wallet;
 
 pub use chart::PnLChartExporter;
 pub use errors::{InventoryError, InventoryResult};
-pub use pnl::{ArbRecord, PnLEngine, PnLSummary, TradeLeg, TradeSummary};
+pub use pnl::{ArbRecord, PnLEngine, PnLSummary, TradeJsonlLogger, TradeLeg, TradeSummary};
 pub use rebalance_executor::RebalanceExecutor;
 pub use rebalancer::RebalancePlanner;
 pub use tracker::InventoryTracker;
