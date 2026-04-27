@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ethers::abi::{Token as AbiToken, encode as abi_encode};
@@ -36,8 +37,12 @@ use tracing::{info, instrument, warn};
 use crate::chain::builder::TransactionBuilder;
 use crate::chain::client::ChainClient;
 use crate::chain::selectors::TRANSFER_TOPIC;
-use crate::core::types::{Address, BlockId, GasPriority, TokenAmount, TransactionRequest};
+use crate::chain::{BundleRelay, BundleRequest, BundleTx, FlashbotsConfig};
+use crate::core::types::{
+    Address, BlockId, GasPriority, TokenAmount, TransactionRequest, WEI_PER_GWEI,
+};
 use crate::core::wallet::WalletManager;
+use crate::observability::metrics_handle;
 
 // ---------------------------------------------------------------------------
 // Function selectors (first 4 bytes of keccak256("<signature>")).
@@ -74,6 +79,9 @@ pub struct DexSwapperConfig {
     pub receipt_timeout_secs: u64,
     /// Chain ID (mainnet default).
     pub chain_id: u64,
+    /// Optional maximum EIP-1559 maxFeePerGas cap in gwei. When configured,
+    /// DEX tx build aborts before signing if current fees exceed the cap.
+    pub max_gas_gwei: Option<u64>,
 }
 
 impl Default for DexSwapperConfig {
@@ -87,6 +95,7 @@ impl Default for DexSwapperConfig {
             gas_buffer_bps: 12_000, // 1.20×
             receipt_timeout_secs: 120,
             chain_id: 1,
+            max_gas_gwei: None,
         }
     }
 }
@@ -147,6 +156,28 @@ pub struct SwapResult {
     pub success: bool,
 }
 
+/// Result of broadcasting a swap transaction before receipt confirmation.
+#[derive(Debug, Clone)]
+pub struct SwapSubmission {
+    /// Transaction hash (0x-prefixed lowercase hex) returned by
+    /// `eth_sendRawTransaction`.
+    pub tx_hash: String,
+    /// Amount of the input token submitted to the router.
+    pub amount_in: U256,
+    /// Token whose `Transfer(..., recipient, amount)` logs are parsed after
+    /// the receipt is mined.
+    pub token_out: Address,
+    /// Recipient expected to receive `token_out`.
+    pub recipient: Address,
+    pub private_bundle: Option<PrivateSwapBundle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrivateSwapBundle {
+    pub bundle_hash: String,
+    pub target_block: u64,
+}
+
 /// Errors surfaced by [`DexSwapper`] implementations.
 #[derive(Debug, Error)]
 pub enum SwapperError {
@@ -168,6 +199,10 @@ pub enum SwapperError {
     /// Signing or building the transaction failed.
     #[error("tx build error: {0}")]
     TxBuild(String),
+    #[error("bundle error: {0}")]
+    Bundle(String),
+    #[error("bundle not included before timeout (tx {tx_hash}, target block {target_block})")]
+    BundleNotIncluded { tx_hash: String, target_block: u64 },
 }
 
 /// Convenience result alias.
@@ -184,6 +219,22 @@ pub type SwapperResult<T> = Result<T, SwapperError>;
 /// inject deterministic stubs.
 #[async_trait]
 pub trait DexSwapper: Send + Sync + std::fmt::Debug {
+    /// Broadcasts the swap transaction and returns as soon as a tx hash is
+    /// known. This is the critical first phase used by the executor to persist
+    /// a reconcile handle before starting any external receipt timeout.
+    async fn submit_swap(
+        &self,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission>;
+
+    /// Waits for a previously-submitted swap transaction and parses the mined
+    /// receipt into a [`SwapResult`].
+    async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult>;
+
     /// Swaps exactly `amount_in` of `token_in` for at least `min_out` of
     /// `token_out`. `recipient` receives the output token.
     async fn swap(
@@ -193,7 +244,12 @@ pub trait DexSwapper: Send + Sync + std::fmt::Debug {
         amount_in: U256,
         min_out: U256,
         recipient: &Address,
-    ) -> SwapperResult<SwapResult>;
+    ) -> SwapperResult<SwapResult> {
+        let submission = self
+            .submit_swap(token_in, token_out, amount_in, min_out, recipient)
+            .await?;
+        self.wait_swap(submission).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +508,7 @@ impl UniswapV2Swapper {
             .with_gas_price(GasPriority::Medium)
             .await
             .map_err(|e| SwapperError::TxBuild(format!("approve fee: {e}")))?;
+        reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)?;
 
         let receipt = builder
             .send_and_wait(self.config.receipt_timeout_secs)
@@ -464,20 +521,238 @@ impl UniswapV2Swapper {
     }
 }
 
+#[derive(Clone)]
+pub struct FlashbotsSwapper {
+    inner: UniswapV2Swapper,
+    relay: Arc<dyn BundleRelay>,
+    flashbots: FlashbotsConfig,
+}
+
+impl std::fmt::Debug for FlashbotsSwapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashbotsSwapper")
+            .field("inner", &self.inner)
+            .field("relay", &self.relay)
+            .field("flashbots", &self.flashbots)
+            .finish()
+    }
+}
+
+impl FlashbotsSwapper {
+    pub fn new(
+        inner: UniswapV2Swapper,
+        relay: Arc<dyn BundleRelay>,
+        flashbots: FlashbotsConfig,
+    ) -> Self {
+        Self {
+            inner,
+            relay,
+            flashbots,
+        }
+    }
+}
+
 #[async_trait]
-impl DexSwapper for UniswapV2Swapper {
+impl DexSwapper for FlashbotsSwapper {
     #[instrument(level = "info", skip(self), fields(
         token_in = %token_in, token_out = %token_out,
         amount_in = %amount_in, min_out = %min_out, recipient = %recipient
     ))]
-    async fn swap(
+    async fn submit_swap(
         &self,
         token_in: &Address,
         token_out: &Address,
         amount_in: U256,
         min_out: U256,
         recipient: &Address,
-    ) -> SwapperResult<SwapResult> {
+    ) -> SwapperResult<SwapSubmission> {
+        if min_out.is_zero() {
+            return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
+        }
+
+        self.inner
+            .ensure_allowance(token_in, &self.inner.config.router, amount_in)
+            .await?;
+
+        let deadline =
+            U256::from(current_unix_ts().saturating_add(self.inner.config.deadline_secs));
+        let path = vec![token_in.clone(), token_out.clone()];
+        let calldata = build_swap_calldata(amount_in, min_out, &path, recipient, deadline);
+
+        let builder = TransactionBuilder::new(self.inner.client.clone(), self.inner.wallet.clone())
+            .to(self.inner.config.router.clone())
+            .data(calldata)
+            .chain_id(self.inner.config.chain_id)
+            .with_gas_estimate(Some(self.inner.config.gas_buffer_bps))
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("bundle swap gas: {e}")))?
+            .with_gas_price(GasPriority::Medium)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("bundle swap fee: {e}")))?;
+        reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.inner.config.max_gas_gwei)?;
+
+        let signed = builder
+            .build_and_sign_with_hash()
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("bundle swap sign: {e}")))?;
+        let current_block = self
+            .inner
+            .client
+            .get_block_number()
+            .await
+            .map_err(|e| SwapperError::Chain(format!("bundle current block: {e}")))?;
+        let tx_hash = signed.tx_hash.clone();
+        let txs = vec![BundleTx {
+            raw_tx: signed.raw_hex,
+            tx_hash: signed.tx_hash.clone(),
+        }];
+        let mut submitted = None;
+        for target_block in bundle_target_blocks(current_block, &self.flashbots) {
+            let request = BundleRequest {
+                txs: txs.clone(),
+                target_block,
+                min_timestamp: None,
+                max_timestamp: Some(
+                    current_unix_ts().saturating_add(self.inner.config.deadline_secs),
+                ),
+            };
+
+            let simulation_started = Instant::now();
+            if let Err(e) = self.relay.simulate_bundle(&request).await {
+                metrics_handle().record_flashbots_simulation(
+                    &self.flashbots.relay_url,
+                    "error",
+                    simulation_started.elapsed().as_secs_f64(),
+                );
+                metrics_handle()
+                    .record_flashbots_relay_error(&self.flashbots.relay_url, "simulation");
+                return Err(SwapperError::Bundle(format!("simulation: {e}")));
+            }
+            metrics_handle().record_flashbots_simulation(
+                &self.flashbots.relay_url,
+                "ok",
+                simulation_started.elapsed().as_secs_f64(),
+            );
+
+            let submission = match self.relay.send_bundle(&request).await {
+                Ok(submission) => submission,
+                Err(e) => {
+                    metrics_handle()
+                        .record_flashbots_relay_error(&self.flashbots.relay_url, "send");
+                    return Err(SwapperError::Bundle(format!("send: {e}")));
+                }
+            };
+            metrics_handle().record_flashbots_bundle_submitted(&self.flashbots.relay_url);
+
+            info!(
+                tx = %tx_hash,
+                bundle = %submission.bundle_hash,
+                target_block,
+                "DEX: submitted private Flashbots bundle"
+            );
+            submitted = Some(submission);
+        }
+        let submitted =
+            submitted.ok_or_else(|| SwapperError::Bundle("no target blocks configured".into()))?;
+
+        Ok(SwapSubmission {
+            tx_hash,
+            amount_in,
+            token_out: token_out.clone(),
+            recipient: recipient.clone(),
+            private_bundle: Some(PrivateSwapBundle {
+                bundle_hash: submitted.bundle_hash,
+                target_block: submitted.target_block,
+            }),
+        })
+    }
+
+    #[instrument(level = "info", skip(self, submission), fields(tx = %submission.tx_hash))]
+    async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult> {
+        let Some(private_bundle) = submission.private_bundle.clone() else {
+            return self.inner.wait_swap(submission).await;
+        };
+        let deadline = Instant::now() + Duration::from_secs(self.flashbots.inclusion_timeout_secs);
+        let receipt = loop {
+            if let Some(receipt) = self
+                .inner
+                .client
+                .get_receipt(&submission.tx_hash)
+                .await
+                .map_err(|e| SwapperError::Chain(format!("bundle receipt: {e}")))?
+            {
+                break receipt;
+            }
+            let current_block = self
+                .inner
+                .client
+                .get_block_number()
+                .await
+                .map_err(|e| SwapperError::Chain(format!("bundle current block: {e}")))?;
+            if current_block > private_bundle.target_block || Instant::now() >= deadline {
+                metrics_handle().record_flashbots_bundle_not_included(&self.flashbots.relay_url);
+                return Err(SwapperError::BundleNotIncluded {
+                    tx_hash: submission.tx_hash.clone(),
+                    target_block: private_bundle.target_block,
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+
+        if receipt.tx_hash.to_lowercase() != submission.tx_hash.to_lowercase() {
+            metrics_handle().record_flashbots_bundle_not_included(&self.flashbots.relay_url);
+            return Err(SwapperError::BundleNotIncluded {
+                tx_hash: submission.tx_hash.clone(),
+                target_block: private_bundle.target_block,
+            });
+        }
+
+        metrics_handle().record_flashbots_bundle_included(
+            &self.flashbots.relay_url,
+            receipt
+                .block_number
+                .saturating_sub(private_bundle.target_block),
+        );
+
+        if !receipt.status {
+            return Err(SwapperError::Reverted(receipt.tx_hash));
+        }
+
+        let amount_out =
+            sum_transfer_to(&receipt.logs, &submission.token_out, &submission.recipient);
+        if amount_out.is_zero() {
+            warn!(
+                tx = %receipt.tx_hash,
+                bundle = %private_bundle.bundle_hash,
+                "private DEX swap mined but no matching Transfer(token_out -> recipient) log; treating as revert"
+            );
+            return Err(SwapperError::Reverted(receipt.tx_hash));
+        }
+
+        Ok(SwapResult {
+            tx_hash: receipt.tx_hash,
+            amount_in: submission.amount_in,
+            amount_out,
+            gas_used: receipt.gas_used,
+            success: true,
+        })
+    }
+}
+
+#[async_trait]
+impl DexSwapper for UniswapV2Swapper {
+    #[instrument(level = "info", skip(self), fields(
+        token_in = %token_in, token_out = %token_out,
+        amount_in = %amount_in, min_out = %min_out, recipient = %recipient
+    ))]
+    async fn submit_swap(
+        &self,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
         if min_out.is_zero() {
             return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
         }
@@ -486,7 +761,8 @@ impl DexSwapper for UniswapV2Swapper {
         self.ensure_allowance(token_in, &self.config.router, amount_in)
             .await?;
 
-        // Step 2: build + send swap.
+        // Step 2: build + broadcast swap. Return immediately once tx_hash is
+        // known; receipt waiting is the second phase.
         let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));
         let path = vec![token_in.clone(), token_out.clone()];
         let calldata = build_swap_calldata(amount_in, min_out, &path, recipient, deadline);
@@ -501,18 +777,37 @@ impl DexSwapper for UniswapV2Swapper {
             .with_gas_price(GasPriority::Medium)
             .await
             .map_err(|e| SwapperError::TxBuild(format!("swap fee: {e}")))?;
+        reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)?;
 
-        let receipt = builder
-            .send_and_wait(self.config.receipt_timeout_secs)
+        let tx_hash = builder
+            .send()
             .await
             .map_err(|e| SwapperError::Chain(format!("swap send: {e}")))?;
+
+        Ok(SwapSubmission {
+            tx_hash,
+            amount_in,
+            token_out: token_out.clone(),
+            recipient: recipient.clone(),
+            private_bundle: None,
+        })
+    }
+
+    #[instrument(level = "info", skip(self, submission), fields(tx = %submission.tx_hash))]
+    async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult> {
+        let receipt = self
+            .client
+            .wait_for_receipt(&submission.tx_hash, self.config.receipt_timeout_secs, 1.0)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("swap receipt: {e}")))?;
 
         if !receipt.status {
             return Err(SwapperError::Reverted(receipt.tx_hash));
         }
 
         // Step 3: sum Transfer(token_out -> recipient) in the logs.
-        let amount_out = sum_transfer_to(&receipt.logs, token_out, recipient);
+        let amount_out =
+            sum_transfer_to(&receipt.logs, &submission.token_out, &submission.recipient);
         if amount_out.is_zero() {
             // Safety net: the tx succeeded but we couldn't find a credit
             // Transfer log (wrong token? recipient mismatch?). Treat as
@@ -527,7 +822,7 @@ impl DexSwapper for UniswapV2Swapper {
 
         Ok(SwapResult {
             tx_hash: receipt.tx_hash,
-            amount_in,
+            amount_in: submission.amount_in,
             amount_out,
             gas_used: receipt.gas_used,
             success: true,
@@ -540,6 +835,33 @@ fn current_unix_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn bundle_target_blocks(current_block: u64, config: &FlashbotsConfig) -> Vec<u64> {
+    let first = current_block.saturating_add(config.target_block_offset.max(1));
+    let count = config.max_blocks_to_try.max(1);
+    (0..count)
+        .map(|offset| first.saturating_add(offset))
+        .collect()
+}
+
+fn reject_if_gas_cap_exceeded(
+    max_fee_per_gas: Option<U256>,
+    max_gas_gwei: Option<u64>,
+) -> SwapperResult<()> {
+    let Some(cap_gwei) = max_gas_gwei else {
+        return Ok(());
+    };
+    let Some(max_fee) = max_fee_per_gas else {
+        return Ok(());
+    };
+    let cap_wei = U256::from(cap_gwei) * U256::from(WEI_PER_GWEI);
+    if max_fee > cap_wei {
+        return Err(SwapperError::TxBuild(format!(
+            "gas cap exceeded: max_fee_per_gas={max_fee} wei > cap={cap_gwei} gwei"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +935,52 @@ mod tests {
     fn slippage_ge_full_clamps_to_zero() {
         assert_eq!(apply_slippage(U256::from(12345u64), 10_000), U256::zero());
         assert_eq!(apply_slippage(U256::from(12345u64), 99_999), U256::zero());
+    }
+
+    #[test]
+    fn gas_cap_allows_fee_at_or_below_cap() {
+        let gwei = U256::from(WEI_PER_GWEI);
+        assert!(reject_if_gas_cap_exceeded(Some(U256::from(50u64) * gwei), Some(50)).is_ok());
+        assert!(reject_if_gas_cap_exceeded(Some(U256::from(49u64) * gwei), Some(50)).is_ok());
+    }
+
+    #[test]
+    fn gas_cap_rejects_fee_above_cap() {
+        let gwei = U256::from(WEI_PER_GWEI);
+        let err = reject_if_gas_cap_exceeded(Some(U256::from(51u64) * gwei), Some(50))
+            .expect_err("fee above cap should fail");
+        assert!(err.to_string().contains("gas cap exceeded"));
+    }
+
+    #[test]
+    fn gas_cap_disabled_is_noop() {
+        let gwei = U256::from(WEI_PER_GWEI);
+        assert!(reject_if_gas_cap_exceeded(Some(U256::from(500u64) * gwei), None).is_ok());
+        assert!(reject_if_gas_cap_exceeded(None, Some(50)).is_ok());
+    }
+
+    #[test]
+    fn bundle_target_blocks_respects_offset_and_retry_count() {
+        let config = FlashbotsConfig {
+            relay_url: "http://relay.test".into(),
+            target_block_offset: 2,
+            max_blocks_to_try: 3,
+            simulation_timeout_secs: 5,
+            inclusion_timeout_secs: 30,
+        };
+        assert_eq!(bundle_target_blocks(100, &config), vec![102, 103, 104]);
+    }
+
+    #[test]
+    fn bundle_target_blocks_clamps_zero_values() {
+        let config = FlashbotsConfig {
+            relay_url: "http://relay.test".into(),
+            target_block_offset: 0,
+            max_blocks_to_try: 0,
+            simulation_timeout_secs: 5,
+            inclusion_timeout_secs: 30,
+        };
+        assert_eq!(bundle_target_blocks(100, &config), vec![101]);
     }
 
     // ---- Log parsing ---------------------------------------------------

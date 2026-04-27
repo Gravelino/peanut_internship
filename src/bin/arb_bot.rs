@@ -17,7 +17,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use peanut_internship_rust::chain::ChainClient;
+use peanut_internship_rust::chain::{ChainClient, FlashbotsConfig, FlashbotsRelayClient};
 use peanut_internship_rust::core::types::Address;
 use peanut_internship_rust::core::wallet::WalletManager;
 use peanut_internship_rust::exchange::client::ExchangeClient;
@@ -27,16 +27,17 @@ use peanut_internship_rust::executor::engine::{
 };
 use peanut_internship_rust::executor::queue::{QueueConfig, QueueWorker, SignalQueue};
 use peanut_internship_rust::executor::{
-    ChainReceiptProvider, DexSwapperConfig, PairAddressBook, PairTokens, PendingReconcile,
-    ReconcileConfig, ReconcileStore, ReconcileWorker, TickOutcome, UniswapV2Swapper,
+    ChainReceiptProvider, DexSwapper, DexSwapperConfig, FlashbotsSwapper, PairAddressBook,
+    PairTokens, PendingReconcile, ReconcileConfig, ReconcileStore, ReconcileWorker, TickOutcome,
+    UniswapV2Swapper,
 };
-use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeLeg};
+use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeJsonlLogger, TradeLeg};
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
 use peanut_internship_rust::inventory::types::Venue;
 use peanut_internship_rust::inventory::wallet::WalletBalanceFetcher;
 use peanut_internship_rust::observability::{
-    AlertEvent, AlertProvider, AlertRules, AlertSink, NoopSink, WebhookSink, emit_best_effort,
-    evaluate_execution, mask_webhook_url,
+    AlertEvent, AlertProvider, AlertRules, AlertSink, HaltCoordinator, NoopSink, WebhookSink,
+    emit_best_effort, evaluate_execution, mask_webhook_url,
 };
 use peanut_internship_rust::strategy::fees::FeeStructure;
 use peanut_internship_rust::strategy::generator::{
@@ -44,7 +45,7 @@ use peanut_internship_rust::strategy::generator::{
 };
 use peanut_internship_rust::strategy::live_price_source::{AnyPriceSource, LivePriceSource};
 use peanut_internship_rust::strategy::scorer::SignalScorer;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 
 /// CLI arguments.
 #[derive(Debug, Parser)]
@@ -151,14 +152,37 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     dex_slippage_bps: u64,
 
-    /// Deadline offset in seconds for DEX swaps.
+    /// DEX tx deadline in seconds from submission.
     #[arg(long, default_value_t = 60)]
     dex_deadline_secs: u64,
+
+    /// Maximum EIP-1559 maxFeePerGas for live DEX transactions, in gwei.
+    /// Set to 0 to disable the cap.
+    #[arg(long, default_value_t = 0)]
+    max_gas_gwei: u64,
 
     /// Environment variable name for the wallet private key used to sign
     /// DEX transactions. Only read when `--dex-address-book` is set.
     #[arg(long, default_value = "WALLET_PRIVATE_KEY")]
     wallet_key_env: String,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    use_flashbots: bool,
+
+    #[arg(long, default_value = "https://relay.flashbots.net")]
+    flashbots_relay_url: String,
+
+    #[arg(long, default_value = "FLASHBOTS_AUTH_PRIVATE_KEY")]
+    flashbots_auth_key_env: String,
+
+    #[arg(long, default_value_t = 1)]
+    flashbots_target_block_offset: u64,
+
+    #[arg(long, default_value_t = 3)]
+    flashbots_max_blocks_to_try: u64,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    require_private_dex: bool,
 
     /// Seed the inventory tracker with synthetic balances before the first
     /// tick. Intended for demos / integration tests running in
@@ -182,6 +206,44 @@ struct Cli {
     /// Overrides `GeneratorConfig::default().min_spread_bps` (50).
     #[arg(long, default_value_t = 50)]
     min_spread_bps: u64,
+
+    /// CEX taker fee in basis points. Drives both pre-trade profitability
+    /// gating and post-trade realised PnL accounting (shared
+    /// [`FeeStructure`]). Binance spot default = 10 bps.
+    #[arg(long, default_value_t = 10)]
+    fee_cex_taker_bps: u64,
+
+    /// DEX swap fee in basis points. Uniswap V2 = 30 bps; Uniswap V3 tiers
+    /// vary (5 / 30 / 100 / 1000 bps). Used in both generator and executor.
+    #[arg(long, default_value_t = 30)]
+    fee_dex_swap_bps: u64,
+
+    /// Flat on-chain gas cost in USD per execution. Amortised per trade
+    /// inside `FeeStructure::total_fee_bps` — small notionals pay a
+    /// disproportionately higher %-ge. Default $5.
+    #[arg(long, default_value = "5")]
+    fee_gas_usd: String,
+
+    /// Append-only structured trade log path. Completed executions are
+    /// written as one JSON object per line. Leave empty to disable.
+    #[arg(long, default_value = "trades.jsonl")]
+    trade_log_path: String,
+
+    /// Maximum time to wait for queued/in-flight executions to finish during
+    /// graceful shutdown.
+    #[arg(long, default_value_t = 30)]
+    shutdown_drain_secs: u64,
+
+    /// Maximum cumulative daily loss (USD) before the bot auto-halts.
+    /// Set to 0 to disable. Default $100.
+    #[arg(long, default_value = "100")]
+    max_daily_loss_usd: String,
+
+    /// Path to a watchdog halt file. When this file exists, the bot halts
+    /// immediately. Useful for emergency stops via `touch STOP`. Leave
+    /// empty to disable.
+    #[arg(long, default_value = "")]
+    halt_file_path: String,
 }
 
 #[tokio::main]
@@ -197,6 +259,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Decimal::from_str_exact(&cli.size).map_err(|e| format!("invalid --size: {e}"))?;
     let min_score = Decimal::from(cli.min_score);
 
+    // Kill-switch: shared between main loop, metrics HTTP, and PnL breaker.
+    let watchdog_path = if cli.halt_file_path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(&cli.halt_file_path))
+    };
+    let halt_coordinator = Arc::new(HaltCoordinator::new(watchdog_path));
+
+    // PnL-based breaker: trips when cumulative daily realised PnL drops
+    // below -max_daily_loss_usd. Shared via Arc<Mutex<>> between the
+    // completion consumer (records PnL) and the tick loop (checks halt).
+    let max_daily_loss = Decimal::from_str_exact(&cli.max_daily_loss_usd)
+        .map_err(|e| format!("invalid --max-daily-loss-usd: {e}"))?;
+    let pnl_breaker = Arc::new(Mutex::new(
+        peanut_internship_rust::executor::PnlBreaker::new(
+            peanut_internship_rust::executor::PnlBreakerConfig {
+                max_daily_loss_usd: max_daily_loss,
+            },
+        ),
+    ));
+    if max_daily_loss > Decimal::ZERO {
+        info!(max_daily_loss_usd = %max_daily_loss, "PnL breaker enabled");
+    } else {
+        info!("PnL breaker disabled (--max-daily-loss-usd 0)");
+    }
+
     // Prometheus metrics: init global registry + spawn /metrics server.
     // When `--metrics-port 0`, we still init the registry (so instrumented
     // code records observations) but skip the HTTP endpoint.
@@ -206,8 +294,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.metrics_port != 0 {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cli.metrics_port));
         let m = _metrics.clone();
+        let h = Arc::clone(&halt_coordinator);
         tokio::spawn(async move {
-            if let Err(e) = peanut_internship_rust::observability::serve_metrics(addr, m).await {
+            if let Err(e) =
+                peanut_internship_rust::observability::serve_metrics_with_halt(addr, m, Some(h))
+                    .await
+            {
                 error!(error = %e, "metrics server terminated");
             }
         });
@@ -261,10 +353,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Vec::new()
         };
-        let rpc_url = resolve_wallet_config(&cli).map(|(rpc, _)| rpc);
-        match (live_pools.is_empty(), rpc_url) {
-            (false, Some(rpc)) => {
-                let client = ChainClient::new(vec![rpc], 30, 3)?;
+        let rpc_urls = resolve_wallet_config(&cli).map(|(rpc, _)| rpc);
+        match (live_pools.is_empty(), rpc_urls) {
+            (false, Some(rpc_urls)) => {
+                let client = ChainClient::new(rpc_urls, 30, 3)?;
+                log_rpc_health("live price source", &client).await;
                 let live = LivePriceSource::new(Arc::clone(&exchange), client, live_pools).await?;
                 info!("price source: live Uniswap V2 reserves");
                 Arc::new(AnyPriceSource::Live(live))
@@ -283,15 +376,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_spread_bps: Decimal::from(cli.min_spread_bps),
         ..GeneratorConfig::default()
     };
+    // Shared fee model. A single source of truth keeps pre-trade gating
+    // (`SignalGenerator`) and post-trade realised PnL (`Executor::calc_pnl`)
+    // in lockstep — skewing one without the other is a classic source of
+    // "we signalled profit but booked a loss" bugs.
+    let fees = FeeStructure {
+        cex_taker_bps: Decimal::from(cli.fee_cex_taker_bps),
+        dex_swap_bps: Decimal::from(cli.fee_dex_swap_bps),
+        gas_cost_usd: Decimal::from_str_exact(&cli.fee_gas_usd)
+            .map_err(|e| format!("invalid --fee-gas-usd: {e}"))?,
+    };
     info!(
         min_profit_usd = %generator_config.min_profit_usd,
         min_spread_bps = %generator_config.min_spread_bps,
-        "generator thresholds"
+        cex_taker_bps = %fees.cex_taker_bps,
+        dex_swap_bps = %fees.dex_swap_bps,
+        gas_cost_usd = %fees.gas_cost_usd,
+        "generator thresholds + fee model"
     );
     let mut generator = SignalGenerator::new(
         price_source,
         Arc::clone(&inventory),
-        FeeStructure::default(),
+        fees.clone(),
         generator_config,
     );
     let scorer = SignalScorer::default();
@@ -313,31 +419,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Executor: simulated or live legs. Wrap in `Arc` so the queue worker can
     // share it with the producer (tick) for breaker introspection.
+    let mut effective_use_flashbots = cli.use_flashbots;
     let legs: Arc<dyn peanut_internship_rust::executor::engine::LegExecutor> = if cli.simulation {
         Arc::new(SimulatedLegs::default())
     } else {
         if !cli.dex_address_book.is_empty() {
-            let rpc_url = resolve_wallet_config(&cli)
+            let rpc_urls = resolve_wallet_config(&cli)
                 .map(|(rpc, _)| rpc)
                 .ok_or("live DEX execution requires --eth-rpc-url or ETH_RPC_URL")?;
-            let chain_client = ChainClient::new(vec![rpc_url], 30, 3)?;
+            let chain_client = ChainClient::new(rpc_urls, 30, 3)?;
+            log_rpc_health("live dex", &chain_client).await;
             let wallet = WalletManager::from_env(&cli.wallet_key_env)?;
             let recipient = Address::new(wallet.address())?;
             let address_book = Arc::new(load_address_book(&cli.dex_address_book)?);
             let dex_config = DexSwapperConfig {
                 slippage_bps: cli.dex_slippage_bps,
                 deadline_secs: cli.dex_deadline_secs,
+                max_gas_gwei: (cli.max_gas_gwei > 0).then_some(cli.max_gas_gwei),
                 ..DexSwapperConfig::default()
             };
-            let swapper = Arc::new(UniswapV2Swapper::new(
-                chain_client,
-                wallet,
-                dex_config.clone(),
-            ));
+            let base_swapper =
+                UniswapV2Swapper::new(chain_client.clone(), wallet.clone(), dex_config.clone());
+            let swapper: Arc<dyn DexSwapper> = if cli.use_flashbots {
+                match WalletManager::from_env(&cli.flashbots_auth_key_env) {
+                    Ok(auth_wallet) => {
+                        let flashbots_config = FlashbotsConfig {
+                            relay_url: cli.flashbots_relay_url.clone(),
+                            target_block_offset: cli.flashbots_target_block_offset,
+                            max_blocks_to_try: cli.flashbots_max_blocks_to_try,
+                            ..FlashbotsConfig::default()
+                        };
+                        let relay = Arc::new(FlashbotsRelayClient::new(
+                            flashbots_config.clone(),
+                            auth_wallet,
+                        ));
+                        info!(
+                            relay = %flashbots_config.relay_url,
+                            target_block_offset = flashbots_config.target_block_offset,
+                            max_blocks_to_try = flashbots_config.max_blocks_to_try,
+                            "live mode: DEX leg wired via FlashbotsSwapper"
+                        );
+                        Arc::new(FlashbotsSwapper::new(base_swapper, relay, flashbots_config))
+                    }
+                    Err(e) if cli.require_private_dex => {
+                        return Err(format!(
+                            "private DEX mode requires --flashbots-auth-key-env {}: {e}",
+                            cli.flashbots_auth_key_env
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        effective_use_flashbots = false;
+                        warn!(
+                            error = %e,
+                            "Flashbots auth wallet unavailable; falling back to CEX-first public DEX mode"
+                        );
+                        Arc::new(base_swapper)
+                    }
+                }
+            } else {
+                Arc::new(base_swapper)
+            };
             info!(
                 address_book = %cli.dex_address_book,
                 slippage_bps = cli.dex_slippage_bps,
-                "live mode: DEX leg wired via UniswapV2Swapper"
+                max_gas_gwei = ?dex_config.max_gas_gwei,
+                private_dex = effective_use_flashbots,
+                "live mode: DEX leg configured"
             );
             Arc::new(LiveLegs::new(Arc::clone(&exchange)).with_dex(
                 swapper,
@@ -346,6 +494,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 recipient,
             ))
         } else {
+            if cli.use_flashbots && cli.require_private_dex {
+                return Err("private DEX mode requires --dex-address-book in live mode".into());
+            }
+            effective_use_flashbots = false;
             warn!(
                 "live mode: DEX leg will return NotImplemented — pass --dex-address-book to enable"
             );
@@ -365,7 +517,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reconcile worker needs its own Arc for unwind calls.
     let legs_for_reconcile: Arc<dyn LegExecutor> = Arc::clone(&legs);
 
-    let mut executor_builder = Executor::with_replay(legs, ExecutorConfig::default(), replay);
+    let executor_config = ExecutorConfig {
+        use_flashbots: effective_use_flashbots,
+        ..ExecutorConfig::default()
+    };
+    let mut executor_builder = Executor::with_replay(legs, executor_config, replay).with_fees(fees);
     if let Some(ref store) = reconcile_store {
         executor_builder = executor_builder.with_reconcile_store(Arc::clone(store));
     }
@@ -387,6 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..QueueConfig::default()
     });
     let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+    let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
     let worker = QueueWorker::new(
         Arc::clone(&queue),
         Arc::clone(&executor),
@@ -395,7 +552,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_sink(completion_tx);
 
-    tokio::spawn(async move { worker.run().await });
+    let worker_handle = tokio::spawn(async move {
+        worker.run_until_shutdown(worker_shutdown_rx).await;
+    });
 
     // Alert sink: WebhookSink when a URL is configured, else NoopSink. The
     // sink is cheap to clone (wraps an `Arc<reqwest::Client>`), so we share
@@ -420,14 +579,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alert_rules = AlertRules {
         large_loss_threshold: Decimal::from(cli.alert_large_loss),
     };
+    let trade_logger = if cli.trade_log_path.is_empty() {
+        None
+    } else {
+        let logger = Arc::new(TradeJsonlLogger::open(&cli.trade_log_path)?);
+        info!(path = %cli.trade_log_path, "structured trade log enabled");
+        Some(logger)
+    };
 
-    // Completion consumer: update scorer history + ledger, and fire alerts
-    // derived from the terminal state via `evaluate_execution`.
+    // Completion consumer: update scorer history + ledger, feed PnL breaker,
+    // and fire alerts derived from the terminal state via `evaluate_execution`.
     {
         let scorer = Arc::clone(&scorer);
         let pnl = Arc::clone(&pnl);
         let alert_sink = Arc::clone(&alert_sink);
         let alert_rules = alert_rules.clone();
+        let pnl_breaker = Arc::clone(&pnl_breaker);
+        let halt_coordinator = Arc::clone(&halt_coordinator);
+        let trade_logger = trade_logger.clone();
         tokio::spawn(async move {
             while let Some(ctx) = completion_rx.recv().await {
                 let pair_str = ctx.signal.pair.clone();
@@ -436,8 +605,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if done {
                     if let Some(net) = ctx.actual_net_pnl {
                         info!(pair = pair_str, pnl = %net, state = %ctx.state, "SUCCESS");
+                        // Feed PnL breaker — trips halt when daily loss exceeded.
+                        let mut pb = pnl_breaker.lock().await;
+                        let was_halted = pb.is_halted();
+                        pb.record_pnl(net);
+                        if pb.is_halted() && !was_halted {
+                            let ev = AlertEvent::DailyLossHalt {
+                                cumulative_pnl: pb.cumulative_pnl().to_string(),
+                                max_daily_loss: pb.max_daily_loss().to_string(),
+                            };
+                            drop(pb); // release lock before async emit
+                            emit_best_effort(&alert_sink, &ev).await;
+                            halt_coordinator.halt("daily PnL loss threshold exceeded");
+                        }
+                        peanut_internship_rust::observability::metrics_handle()
+                            .set_pnl_breaker_halted(pnl_breaker.lock().await.is_halted());
                     }
-                    pnl.lock().await.record(execution_to_arb_record(&ctx));
+                    let record = execution_to_arb_record(&ctx);
+                    if let Some(logger) = trade_logger.as_ref()
+                        && let Err(e) = logger.append(&record)
+                    {
+                        error!(error = %e, signal = %ctx.signal.signal_id, "trade log append failed");
+                    }
+                    pnl.lock().await.record(record);
                 } else {
                     warn!(pair = pair_str, state = %ctx.state, error = ?ctx.error, "FAILED");
                 }
@@ -480,10 +670,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // receipt, marks them resolved/reverted/expired, and fires unwind +
     // alerts on reverts. Requires an RPC URL to be configured.
     if let Some(ref store) = reconcile_store {
-        let rpc_url = resolve_wallet_config(&cli).map(|(rpc, _)| rpc);
-        if let Some(rpc) = rpc_url {
-            match ChainClient::new(vec![rpc.clone()], 30, 3) {
+        let rpc_urls = resolve_wallet_config(&cli).map(|(rpc, _)| rpc);
+        if let Some(rpc_urls) = rpc_urls {
+            match ChainClient::new(rpc_urls, 30, 3) {
                 Ok(chain_client) => {
+                    log_rpc_health("reconcile worker", &chain_client).await;
                     let provider = Arc::new(ChainReceiptProvider::new(chain_client));
                     let worker = ReconcileWorker::new(
                         Arc::clone(store),
@@ -537,9 +728,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional on-chain wallet fetcher. Initialised once and reused across
     // sync passes so the ChainClient's internal connection pool warms up.
     let wallet_fetcher = match resolve_wallet_config(&cli) {
-        Some((rpc, addr)) => match WalletBalanceFetcher::new(rpc.clone(), &addr) {
+        Some((rpc_urls, addr)) => match WalletBalanceFetcher::new_multi(rpc_urls.clone(), &addr) {
             Ok(f) => {
-                info!(wallet = %addr, "wallet balance fetcher enabled");
+                info!(wallet = %addr, rpc_endpoints = rpc_urls.len(), "wallet balance fetcher enabled");
                 Some(f)
             }
             Err(e) => {
@@ -569,6 +760,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_sync = std::time::Instant::now();
 
     loop {
+        // Kill-switch: watchdog file + HTTP halt + PnL breaker all converge
+        // here. Once halted, the bot breaks out of the main loop cleanly.
+        halt_coordinator.check_watchdog();
+        if halt_coordinator.is_halted() {
+            let reason = halt_coordinator
+                .reason()
+                .unwrap_or_else(|| "unknown".into());
+            error!(reason = %reason, "BOT HALTED — exiting main loop");
+            break;
+        }
+
         if let Err(e) = tick(
             &cli.pair,
             trade_size,
@@ -593,8 +795,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             last_sync = std::time::Instant::now();
         }
-        tokio::time::sleep(Duration::from_millis(cli.tick_ms)).await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutdown signal received — stopping new ticks");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(cli.tick_ms)) => {}
+        }
     }
+
+    info!("main loop exited; draining queue worker");
+    if worker_shutdown_tx.send(true).is_err() {
+        warn!("queue worker shutdown receiver already closed");
+    }
+    match tokio::time::timeout(Duration::from_secs(cli.shutdown_drain_secs), worker_handle).await {
+        Ok(Ok(())) => info!("queue worker drained cleanly"),
+        Ok(Err(e)) => warn!(error = %e, "queue worker task join failed"),
+        Err(_) => warn!(
+            timeout_s = cli.shutdown_drain_secs,
+            "queue worker drain timed out; exiting with work possibly still in-flight"
+        ),
+    }
+    Ok(())
 }
 
 async fn tick(
@@ -790,21 +1012,58 @@ fn load_live_pool_book(path: &str) -> Result<Vec<LivePoolEntry>, Box<dyn std::er
 
 /// Resolves `(rpc_url, wallet_address)` from CLI first, then env vars.
 /// Returns `None` when either is empty — caller skips wallet sync.
-fn resolve_wallet_config(cli: &Cli) -> Option<(String, String)> {
-    let rpc = if cli.eth_rpc_url.is_empty() {
+fn resolve_wallet_config(cli: &Cli) -> Option<(Vec<String>, String)> {
+    let rpc_raw = if cli.eth_rpc_url.is_empty() {
         std::env::var("ETH_RPC_URL").unwrap_or_default()
     } else {
         cli.eth_rpc_url.clone()
     };
+    let rpc_urls = parse_rpc_urls(&rpc_raw);
     let addr = if cli.wallet_address.is_empty() {
         std::env::var("WALLET_ADDRESS").unwrap_or_default()
     } else {
         cli.wallet_address.clone()
     };
-    if rpc.is_empty() || addr.is_empty() {
+    if rpc_urls.is_empty() || addr.is_empty() {
         None
     } else {
-        Some((rpc, addr))
+        Some((rpc_urls, addr))
+    }
+}
+
+fn parse_rpc_urls(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+async fn log_rpc_health(label: &str, client: &ChainClient) {
+    let health = client.health_check().await;
+    let healthy = health.iter().filter(|h| h.healthy).count();
+    info!(
+        component = label,
+        healthy,
+        total = health.len(),
+        "RPC health check complete"
+    );
+    for endpoint in health {
+        if endpoint.healthy {
+            info!(
+                component = label,
+                url = %endpoint.url,
+                block = ?endpoint.block_number,
+                "RPC endpoint healthy"
+            );
+        } else {
+            warn!(
+                component = label,
+                url = %endpoint.url,
+                error = ?endpoint.error,
+                "RPC endpoint unhealthy"
+            );
+        }
     }
 }
 
@@ -1040,5 +1299,17 @@ mod seed_tests {
     #[test]
     fn rejects_invalid_amount() {
         assert!(parse_seed_spec("binance:USDT=notanumber").is_err());
+    }
+
+    #[test]
+    fn parses_comma_separated_rpc_urls() {
+        assert_eq!(
+            parse_rpc_urls("http://a, https://b ,,http://c "),
+            vec![
+                "http://a".to_string(),
+                "https://b".to_string(),
+                "http://c".to_string()
+            ]
+        );
     }
 }

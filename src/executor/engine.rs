@@ -18,13 +18,14 @@ use tracing::{info, warn};
 
 use ethers::types::U256;
 
-use crate::core::types::Address;
+use crate::core::types::{Address, BPS_SCALE};
 use crate::exchange::client::ExchangeClient;
 use crate::executor::dex_swapper::{self, DexSwapper, DexSwapperConfig, PairAddressBook};
 use crate::executor::errors::ExecutorResult;
 use crate::executor::reconcile::{PendingReconcile, ReconcileStore};
 use crate::executor::recovery::{CircuitBreaker, ReplayProtection};
 use crate::observability::metrics_handle;
+use crate::strategy::fees::FeeStructure;
 use crate::strategy::signal::{Direction, Signal};
 use rust_decimal::prelude::ToPrimitive;
 
@@ -307,6 +308,19 @@ pub trait LegExecutor: Send + Sync {
     /// Submits the DEX leg and returns a fill result.
     async fn execute_dex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill>;
 
+    async fn execute_dex_tracked(
+        &self,
+        signal: &Signal,
+        size: Decimal,
+        sink: HandleSink,
+    ) -> ExecutorResult<LegFill> {
+        let fill = self.execute_dex(signal, size).await?;
+        if let Some(ref handle) = fill.handle {
+            let _ = sink.set(handle.clone());
+        }
+        Ok(fill)
+    }
+
     /// Best-effort cancellation of a resting / partially-filled CEX leg-1
     /// order. Used when leg-1 times out or partially fills below threshold.
     /// Default impl returns `Cancelled` (appropriate for IOC-only backends
@@ -569,6 +583,138 @@ impl LiveLegs {
         self.recipient = Some(recipient);
         self
     }
+
+    async fn execute_dex_inner(
+        &self,
+        signal: &Signal,
+        size: Decimal,
+        sink: Option<HandleSink>,
+    ) -> ExecutorResult<LegFill> {
+        let Some(ref dex) = self.dex else {
+            return Err(crate::executor::errors::ExecutorError::NotImplemented(
+                "LiveLegs: DEX swapper not configured (call LiveLegs::with_dex)",
+            ));
+        };
+        let Some(ref book) = self.address_book else {
+            return Err(crate::executor::errors::ExecutorError::NotImplemented(
+                "LiveLegs: address book not configured",
+            ));
+        };
+        let Some(ref recipient) = self.recipient else {
+            return Err(crate::executor::errors::ExecutorError::NotImplemented(
+                "LiveLegs: recipient address not configured",
+            ));
+        };
+
+        let tokens = book.get(&signal.pair).ok_or_else(|| {
+            crate::executor::errors::ExecutorError::InvalidSignal(format!(
+                "no address-book entry for pair {}",
+                signal.pair
+            ))
+        })?;
+
+        let (token_in, token_out, decimals_in, decimals_out) = match signal.direction {
+            Direction::BuyCexSellDex => (
+                &tokens.base,
+                &tokens.quote,
+                tokens.base_decimals,
+                tokens.quote_decimals,
+            ),
+            Direction::BuyDexSellCex => (
+                &tokens.quote,
+                &tokens.base,
+                tokens.quote_decimals,
+                tokens.base_decimals,
+            ),
+        };
+
+        let amount_in_units: Decimal = match signal.direction {
+            Direction::BuyCexSellDex => size,
+            Direction::BuyDexSellCex => size * signal.dex_price,
+        };
+        let amount_in = decimal_to_u256_scaled(amount_in_units, decimals_in)
+            .map_err(crate::executor::errors::ExecutorError::InvalidSignal)?;
+
+        let expected_out_units: Decimal = match signal.direction {
+            Direction::BuyCexSellDex => size * signal.dex_price,
+            Direction::BuyDexSellCex => size,
+        };
+        let expected_out = decimal_to_u256_scaled(expected_out_units, decimals_out)
+            .map_err(crate::executor::errors::ExecutorError::InvalidSignal)?;
+
+        let min_out = dex_swapper::apply_slippage(expected_out, self.dex_config.slippage_bps);
+
+        let submission = match dex
+            .submit_swap(token_in, token_out, amount_in, min_out, recipient)
+            .await
+        {
+            Ok(submission) => submission,
+            Err(dex_swapper::SwapperError::Reverted(tx)) => {
+                return Ok(LegFill {
+                    outcome: LegOutcome::Reverted,
+                    price: Decimal::ZERO,
+                    filled: Decimal::ZERO,
+                    handle: Some(tx),
+                    error: Some("on-chain revert".into()),
+                });
+            }
+            Err(e) => {
+                return Ok(LegFill {
+                    outcome: LegOutcome::Rejected,
+                    price: Decimal::ZERO,
+                    filled: Decimal::ZERO,
+                    handle: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
+        if let Some(sink) = sink {
+            let _ = sink.set(submission.tx_hash.clone());
+        }
+
+        match dex.wait_swap(submission).await {
+            Ok(result) => {
+                let filled = u256_to_decimal_scaled(result.amount_out, decimals_out);
+                let price = if matches!(signal.direction, Direction::BuyCexSellDex) {
+                    if size > Decimal::ZERO {
+                        filled / size
+                    } else {
+                        signal.dex_price
+                    }
+                } else if filled > Decimal::ZERO {
+                    amount_in_units / filled
+                } else {
+                    signal.dex_price
+                };
+                let filled_base = match signal.direction {
+                    Direction::BuyCexSellDex => size,
+                    Direction::BuyDexSellCex => filled,
+                };
+                Ok(LegFill {
+                    outcome: LegOutcome::Accepted,
+                    price,
+                    filled: filled_base,
+                    handle: Some(result.tx_hash),
+                    error: None,
+                })
+            }
+            Err(dex_swapper::SwapperError::Reverted(tx)) => Ok(LegFill {
+                outcome: LegOutcome::Reverted,
+                price: Decimal::ZERO,
+                filled: Decimal::ZERO,
+                handle: Some(tx),
+                error: Some("on-chain revert".into()),
+            }),
+            Err(e) => Ok(LegFill {
+                outcome: LegOutcome::Rejected,
+                price: Decimal::ZERO,
+                filled: Decimal::ZERO,
+                handle: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -619,120 +765,16 @@ impl LegExecutor for LiveLegs {
     }
 
     async fn execute_dex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
-        let Some(ref dex) = self.dex else {
-            return Err(crate::executor::errors::ExecutorError::NotImplemented(
-                "LiveLegs: DEX swapper not configured (call LiveLegs::with_dex)",
-            ));
-        };
-        let Some(ref book) = self.address_book else {
-            return Err(crate::executor::errors::ExecutorError::NotImplemented(
-                "LiveLegs: address book not configured",
-            ));
-        };
-        let Some(ref recipient) = self.recipient else {
-            return Err(crate::executor::errors::ExecutorError::NotImplemented(
-                "LiveLegs: recipient address not configured",
-            ));
-        };
+        self.execute_dex_inner(signal, size, None).await
+    }
 
-        let tokens = book.get(&signal.pair).ok_or_else(|| {
-            crate::executor::errors::ExecutorError::InvalidSignal(format!(
-                "no address-book entry for pair {}",
-                signal.pair
-            ))
-        })?;
-
-        // Direction semantics (matches `execute_cex`):
-        //   BuyCexSellDex: DEX leg sells `base`  -> receives `quote`.
-        //   BuyDexSellCex: DEX leg buys  `base`  <- spends   `quote`.
-        let (token_in, token_out, decimals_in, decimals_out) = match signal.direction {
-            Direction::BuyCexSellDex => (
-                &tokens.base,
-                &tokens.quote,
-                tokens.base_decimals,
-                tokens.quote_decimals,
-            ),
-            Direction::BuyDexSellCex => (
-                &tokens.quote,
-                &tokens.base,
-                tokens.quote_decimals,
-                tokens.base_decimals,
-            ),
-        };
-
-        // Convert the requested size (in base units of `token_in`, from the
-        // signal's perspective) to raw token amount. For "BuyDexSellCex" the
-        // input token is the quote asset, so we must multiply size * dex_price
-        // to get the quote-notional to spend.
-        let amount_in_units: Decimal = match signal.direction {
-            Direction::BuyCexSellDex => size,
-            Direction::BuyDexSellCex => size * signal.dex_price,
-        };
-        let amount_in = decimal_to_u256_scaled(amount_in_units, decimals_in)
-            .map_err(crate::executor::errors::ExecutorError::InvalidSignal)?;
-
-        // Expected output computed from `signal.dex_price` (pre-quoted by the
-        // pricing engine). For BuyCexSellDex: output = size * dex_price (quote).
-        // For BuyDexSellCex: output = size                   (base).
-        let expected_out_units: Decimal = match signal.direction {
-            Direction::BuyCexSellDex => size * signal.dex_price,
-            Direction::BuyDexSellCex => size,
-        };
-        let expected_out = decimal_to_u256_scaled(expected_out_units, decimals_out)
-            .map_err(crate::executor::errors::ExecutorError::InvalidSignal)?;
-
-        let min_out = dex_swapper::apply_slippage(expected_out, self.dex_config.slippage_bps);
-
-        match dex
-            .swap(token_in, token_out, amount_in, min_out, recipient)
-            .await
-        {
-            Ok(result) => {
-                // Convert amount_out back to Decimal units for downstream PnL.
-                let filled = u256_to_decimal_scaled(result.amount_out, decimals_out);
-                // Effective DEX price in quote-per-base units.
-                let price = if matches!(signal.direction, Direction::BuyCexSellDex) {
-                    // Sold `size` base for `filled` quote -> price = filled/size.
-                    if size > Decimal::ZERO {
-                        filled / size
-                    } else {
-                        signal.dex_price
-                    }
-                } else {
-                    // Spent `amount_in_units` quote for `filled` base -> price = amount_in/filled.
-                    if filled > Decimal::ZERO {
-                        amount_in_units / filled
-                    } else {
-                        signal.dex_price
-                    }
-                };
-                let filled_base = match signal.direction {
-                    Direction::BuyCexSellDex => size,
-                    Direction::BuyDexSellCex => filled,
-                };
-                Ok(LegFill {
-                    outcome: LegOutcome::Accepted,
-                    price,
-                    filled: filled_base,
-                    handle: Some(result.tx_hash),
-                    error: None,
-                })
-            }
-            Err(dex_swapper::SwapperError::Reverted(tx)) => Ok(LegFill {
-                outcome: LegOutcome::Reverted,
-                price: Decimal::ZERO,
-                filled: Decimal::ZERO,
-                handle: Some(tx),
-                error: Some("on-chain revert".into()),
-            }),
-            Err(e) => Ok(LegFill {
-                outcome: LegOutcome::Rejected,
-                price: Decimal::ZERO,
-                filled: Decimal::ZERO,
-                handle: None,
-                error: Some(e.to_string()),
-            }),
-        }
+    async fn execute_dex_tracked(
+        &self,
+        signal: &Signal,
+        size: Decimal,
+        sink: HandleSink,
+    ) -> ExecutorResult<LegFill> {
+        self.execute_dex_inner(signal, size, Some(sink)).await
     }
 
     async fn unwind(&self, ctx: &ExecutionContext) -> ExecutorResult<()> {
@@ -876,6 +918,11 @@ pub struct Executor {
     /// [`ExecutionContext::leg2_handle`] is enqueued for the
     /// [`ReconcileWorker`](super::reconcile::ReconcileWorker) to poll.
     reconcile_store: Option<Arc<ReconcileStore>>,
+    /// Fee model used by [`Self::calc_pnl`] to compute realised PnL net of
+    /// CEX taker + DEX swap + gas costs. Defaults to [`FeeStructure::default`]
+    /// (10/30 bps + $5 gas) and can be overridden via
+    /// [`Self::with_fees`].
+    fees: FeeStructure,
 }
 
 impl Executor {
@@ -900,7 +947,15 @@ impl Executor {
             circuit_breaker: Arc::new(Mutex::new(CircuitBreaker::default())),
             replay_protection: Arc::new(Mutex::new(replay)),
             reconcile_store: None,
+            fees: FeeStructure::default(),
         }
+    }
+
+    /// Overrides the default fee model used for realised PnL accounting.
+    /// Chainable with [`Self::with_replay`] / [`Self::with_reconcile_store`].
+    pub fn with_fees(mut self, fees: FeeStructure) -> Self {
+        self.fees = fees;
+        self
     }
 
     /// Attaches a [`ReconcileStore`]. When set, `LEG2_TIMEOUT` events that
@@ -1249,9 +1304,11 @@ impl Executor {
         ctx.leg2_venue = "dex";
 
         let leg1_filled = leg1.filled;
+        let leg2_handle_sink: HandleSink = Arc::new(std::sync::OnceLock::new());
         let leg2_res = timeout(
             self.config.leg2_timeout,
-            self.legs.execute_dex(&ctx.signal, leg1_filled),
+            self.legs
+                .execute_dex_tracked(&ctx.signal, leg1_filled, Arc::clone(&leg2_handle_sink)),
         )
         .await;
 
@@ -1263,6 +1320,7 @@ impl Executor {
                 ctx.fail(format!("DEX error - {unwind_status}: {e}"))
             }
             Err(_) => {
+                ctx.leg2_handle = leg2_handle_sink.get().cloned();
                 // CRITICAL: DO NOT auto-unwind. Transaction may still land
                 // on-chain and create double exposure if we flatten now.
                 tracing::error!(
@@ -1303,7 +1361,7 @@ impl Executor {
                 }
                 ctx.leg2_fill_price = Some(leg2.price);
                 ctx.leg2_fill_size = Some(leg2.filled);
-                let pnl = Self::calc_pnl(&ctx);
+                let pnl = self.calc_pnl(&ctx);
                 let done = ctx.complete(pnl);
                 info!(
                     signal = %done.signal.signal_id,
@@ -1432,7 +1490,7 @@ impl Executor {
                 }
                 ctx.leg2_fill_price = Some(leg2.price);
                 ctx.leg2_fill_size = Some(leg2.filled);
-                let pnl = Self::calc_pnl(&ctx);
+                let pnl = self.calc_pnl(&ctx);
                 let done = ctx.complete(pnl);
                 info!(
                     signal = %done.signal.signal_id,
@@ -1502,7 +1560,7 @@ impl Executor {
         }
     }
 
-    fn calc_pnl(ctx: &ExecutionContext) -> Decimal {
+    fn calc_pnl(&self, ctx: &ExecutionContext) -> Decimal {
         let (leg1_price, leg1_size, leg2_price) =
             match (ctx.leg1_fill_price, ctx.leg1_fill_size, ctx.leg2_fill_price) {
                 (Some(p1), Some(s1), Some(p2)) => (p1, s1, p2),
@@ -1523,9 +1581,9 @@ impl Executor {
             Direction::BuyCexSellDex => (dex_price - cex_price) * leg1_size,
             Direction::BuyDexSellCex => (cex_price - dex_price) * leg1_size,
         };
-        // 40 bps combined fee heuristic (spec default).
-        let fee_bps = Decimal::new(4, 3); // 0.004
-        let fees = leg1_size * cex_price * fee_bps;
+        let trade_value = leg1_size * cex_price;
+        let bps = Decimal::from(BPS_SCALE);
+        let fees = self.fees.total_fee_bps(trade_value) / bps * trade_value;
         gross - fees
     }
 }
@@ -1568,13 +1626,32 @@ mod tests {
         let legs = Arc::new(SimulatedLegs::default());
         let ex = Executor::new(legs, cex_first());
         let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
-        // cex_price=2000, dex_price=2020, size=1 -> gross=20, fees=2000*0.004=8 -> pnl=12 > 0
+        // cex=2000, dex=2020, size=1 -> gross=20.
+        // Default FeeStructure: 10 + 30 bps + $5 gas/$2000 = 65 bps
+        // -> fees = 2000 * 0.0065 = $13 -> net = $7 > 0.
         assert_eq!(ctx.state, ExecutorState::DoneProfit);
         assert!(ctx.state.is_filled());
         assert!(ctx.state.is_terminal());
         assert!(ctx.actual_net_pnl.unwrap() > Decimal::ZERO);
         assert_eq!(ctx.leg1_venue, "cex");
         assert_eq!(ctx.leg2_venue, "dex");
+    }
+
+    #[tokio::test]
+    async fn with_fees_override_shifts_pnl_into_loss() {
+        // Same signal that yields +$7 under the default fee model should flip
+        // to a loss when we inject a heavier bespoke FeeStructure (200 bps +
+        // $50 gas on $2000 notional = 450 bps fees = $90 > $20 gross).
+        let legs = Arc::new(SimulatedLegs::default());
+        let heavy = FeeStructure {
+            cex_taker_bps: Decimal::from(50),
+            dex_swap_bps: Decimal::from(150),
+            gas_cost_usd: Decimal::from(50),
+        };
+        let ex = Executor::new(legs, cex_first()).with_fees(heavy);
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::DoneLoss);
+        assert!(ctx.actual_net_pnl.unwrap() < Decimal::ZERO);
     }
 
     #[tokio::test]
@@ -1830,10 +1907,8 @@ mod tests {
 
     #[tokio::test]
     async fn leg2_timeout_without_tx_hash_skips_reconcile_push() {
-        // Today's DEX swap path doesn't surface a tx_hash before the outer
-        // timeout fires, so `maybe_push_reconcile` should log and skip.
-        // This test locks that behaviour in so the future two-phase swap
-        // refactor can flip it intentionally.
+        // Legacy/non-tracked DEX executors may still fail to surface a tx_hash
+        // before timeout; in that case `maybe_push_reconcile` must skip.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             crate::executor::reconcile::ReconcileStore::open(dir.path().join("r.db")).unwrap(),
@@ -1847,6 +1922,70 @@ mod tests {
         assert_eq!(ctx.state, ExecutorState::Leg2Timeout);
         // Store must be empty: no tx_hash -> no push.
         assert!(store.list_pending().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leg2_timeout_with_tracked_tx_hash_pushes_reconcile() {
+        #[derive(Debug)]
+        struct TwoPhaseTimeoutLegs;
+
+        #[async_trait::async_trait]
+        impl LegExecutor for TwoPhaseTimeoutLegs {
+            async fn execute_cex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
+                Ok(LegFill {
+                    outcome: LegOutcome::Accepted,
+                    price: signal.cex_price,
+                    filled: size,
+                    handle: Some("cex-order-1".into()),
+                    error: None,
+                })
+            }
+
+            async fn execute_dex(
+                &self,
+                _signal: &Signal,
+                _size: Decimal,
+            ) -> ExecutorResult<LegFill> {
+                unreachable!("executor should use execute_dex_tracked for cex-first leg2")
+            }
+
+            async fn execute_dex_tracked(
+                &self,
+                _signal: &Signal,
+                _size: Decimal,
+                sink: HandleSink,
+            ) -> ExecutorResult<LegFill> {
+                let _ = sink.set("0xtwophase".into());
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                unreachable!("outer timeout should fire first")
+            }
+
+            async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::executor::reconcile::ReconcileStore::open(dir.path().join("r.db")).unwrap(),
+        );
+        let cfg = ExecutorConfig {
+            use_flashbots: false,
+            leg1_timeout: Duration::from_millis(200),
+            leg2_timeout: Duration::from_millis(20),
+            ..ExecutorConfig::default()
+        };
+        let ex = Executor::new(Arc::new(TwoPhaseTimeoutLegs), cfg)
+            .with_reconcile_store(Arc::clone(&store));
+
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::Leg2Timeout);
+        assert_eq!(ctx.leg2_handle.as_deref(), Some("0xtwophase"));
+
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tx_hash, "0xtwophase");
+        assert_eq!(pending[0].leg1_fill_size, "1");
     }
 
     #[tokio::test]
@@ -2019,22 +2158,39 @@ mod tests {
 
     #[async_trait]
     impl DexSwapper for MockSwapper {
-        async fn swap(
+        async fn submit_swap(
             &self,
             _token_in: &Address,
-            _token_out: &Address,
+            token_out: &Address,
             amount_in: U256,
             min_out: U256,
-            _recipient: &Address,
-        ) -> dex_swapper::SwapperResult<dex_swapper::SwapResult> {
+            recipient: &Address,
+        ) -> dex_swapper::SwapperResult<dex_swapper::SwapSubmission> {
             *self.last.lock().await = Some((amount_in, min_out));
+            let tx_hash = match self.behaviour {
+                MockSwapBehaviour::FillWithRatio { .. } => "0xdeadbeef",
+                MockSwapBehaviour::Revert => "0xdead",
+            };
+            Ok(dex_swapper::SwapSubmission {
+                tx_hash: tx_hash.into(),
+                amount_in,
+                token_out: token_out.clone(),
+                recipient: recipient.clone(),
+                private_bundle: None,
+            })
+        }
+
+        async fn wait_swap(
+            &self,
+            submission: dex_swapper::SwapSubmission,
+        ) -> dex_swapper::SwapperResult<dex_swapper::SwapResult> {
             match self.behaviour {
                 MockSwapBehaviour::FillWithRatio { ratio_micros } => {
                     let amount_out =
-                        amount_in * U256::from(ratio_micros) / U256::from(1_000_000u64);
+                        submission.amount_in * U256::from(ratio_micros) / U256::from(1_000_000u64);
                     Ok(dex_swapper::SwapResult {
-                        tx_hash: "0xdeadbeef".into(),
-                        amount_in,
+                        tx_hash: submission.tx_hash,
+                        amount_in: submission.amount_in,
                         amount_out,
                         gas_used: U256::from(150_000u64),
                         success: true,

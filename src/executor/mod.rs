@@ -7,13 +7,14 @@
 pub mod dex_swapper;
 pub mod engine;
 pub mod errors;
+pub mod migrations;
 pub mod queue;
 pub mod reconcile;
 pub mod recovery;
 
 pub use dex_swapper::{
-    DexSwapper, DexSwapperConfig, PairAddressBook, PairTokens, SwapResult, SwapperError,
-    UniswapV2Swapper,
+    DexSwapper, DexSwapperConfig, FlashbotsSwapper, PairAddressBook, PairTokens, SwapResult,
+    SwapperError, UniswapV2Swapper,
 };
 pub use reconcile::{
     ChainReceiptProvider, PendingReconcile, ReceiptProvider, ReconcileConfig, ReconcileError,
@@ -28,4 +29,6 @@ pub use errors::{ExecutorError, ExecutorResult};
 pub use queue::{
     DropReason, ExecutionSink, PrioritizedSignal, QueueConfig, QueueWorker, SignalQueue,
 };
-pub use recovery::{CircuitBreaker, CircuitBreakerConfig, ReplayProtection};
+pub use recovery::{
+    CircuitBreaker, CircuitBreakerConfig, PnlBreaker, PnlBreakerConfig, ReplayProtection,
+};

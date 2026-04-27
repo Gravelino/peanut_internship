@@ -1,0 +1,9 @@
+{
+  "ETH/USDT": {
+    "base":  "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "base_decimals": 18,
+    "quote": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "quote_decimals": 6,
+    "pool": "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"
+  }
+}
