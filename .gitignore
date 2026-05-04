@@ -28,6 +28,8 @@ data/
 .claude/
 .claude/settings.local.json
 .claude/*.local.json
+.agents/
+graphify-out/
 
 Cargo.lock
 **/*.rs.bk

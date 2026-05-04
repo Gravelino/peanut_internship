@@ -221,10 +221,12 @@ flowchart LR
 #### exchange/
 | File | Purpose |
 |------|---------|
-| `config.rs` | Binance testnet config from env vars |
+| `config.rs` | Venue configuration (Binance/Bybit) from env vars |
 | `client.rs` | REST API client (order book, balance, orders, fees) |
+| `binance.rs` | Binance-specific adapter for market data and trading |
+| `bybit.rs` | Bybit-specific adapter for market data and trading |
 | `orderbook.rs` | Walk-the-book, depth analysis, spread, imbalance |
-| `rate_limiter.rs` | Token-bucket rate limiter (1200 weight/min) |
+| `rate_limiter.rs` | Token-bucket rate limiter (core cross-cutting concern) |
 | `types.rs` | OrderBookSnapshot, OrderResult, NormalizedBalance, etc. |
 | `errors.rs` | ExchangeError enum |
 
@@ -236,6 +238,18 @@ flowchart LR
 | `pnl.rs` | Per-trade and aggregate PnL tracking, CSV export |
 | `types.rs` | Venue enum, TransferPlan, fee constants |
 | `errors.rs` | InventoryError enum |
+
+#### pricing/
+| File | Purpose |
+|------|---------|
+| `amm.rs` | Uniswap V2 math, reserves, and quote calculation |
+| `v3/` | Uniswap V3 specialized math (ticks, liquidity, sqrt_price) |
+| `router.rs` | Multi-hop route finding and comparison |
+| `engine.rs` | High-level `PricingEngine` combining RPC and simulation |
+| `mempool.rs` | Monitor and decode pending swaps for early arb detection |
+| `simulator.rs` | `ForkSimulator` for zero-risk on-chain trade validation |
+| `history.rs` | `HistoricalImpactAnalyzer` for backtesting price impact |
+| `arb.rs` | `ArbDetector` — logic to find profitable CEX/DEX loops |
 
 #### integration/
 | File | Purpose |
@@ -266,6 +280,13 @@ flowchart LR
 | `metrics.rs` | Prometheus counters / histograms (`init_metrics`, `metrics_handle`) |
 | `server.rs` | Hyper-based `/metrics` exporter (`serve_metrics`) |
 | `alerts.rs` | `AlertEvent`, `AlertSink` (`Noop` / `Logging` / `Webhook`), provider adapters (Generic / Slack / Discord), `mask_webhook_url`, `evaluate_execution` rule engine |
+
+#### safety/
+| File | Purpose |
+|------|---------|
+| `limits.rs` | `RiskManager` — daily loss limits, max trade size, trade frequency |
+| `validator.rs` | `PreTradeValidator` — sanity checks for prices and spreads |
+| `killswitch.rs` | Watchdog file monitor for emergency manual halts |
 
 ### Generating Documentation
 

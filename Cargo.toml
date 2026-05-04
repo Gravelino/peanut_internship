@@ -8,26 +8,32 @@ dotenvy = "0.15"
 ethers = { version = "2", features = ["ws", "rustls"] }
 hex = "0.4"
 rand = "0.8.1"
+primitive-types = { version = "0.14.0", features = ["num-traits"] }
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha3 = "0.11"
 thiserror = "2"
-tokio = { version = "1.52.1", features = ["rt-multi-thread", "time", "macros", "signal"] }
+tokio = { version = "1.52.1", features = [
+    "rt-multi-thread",
+    "time",
+    "macros",
+    "signal",
+] }
 zeroize = "1"
 eth-keystore = "0.5"
 aes-gcm = "0.10"
-scrypt = "0.11"
+scrypt = "0.12.0"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
-generic-array = "1"
+generic-array = "1.4.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-reqwest = { version = "0.13", features = ["rustls", "json"] }
+reqwest = { version = "0.13.3", features = ["rustls", "json"] }
 hmac = "0.13"
 sha2 = "0.11"
 csv = "1.3"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 plotters = "0.3"
 plotters-svg = "0.3"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
@@ -36,11 +42,11 @@ futures-util = "0.3"
 async-trait = "0.1"
 ratatui = "0.30"
 crossterm = "0.29"
-prometheus = "0.13"
+prometheus = "0.14.0"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [dev-dependencies]
 proptest = "1"
