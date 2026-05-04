@@ -60,10 +60,8 @@ pub enum ExecutorState {
     /// **Terminal without auto-unwind** — the transaction may still land,
     /// so operator must reconcile before flattening leg 1.
     Leg2Timeout,
-    /// Both legs filled and the realised PnL is strictly positive. Terminal.
-    DoneProfit,
-    /// Both legs filled but the realised PnL is zero or negative. Terminal.
-    DoneLoss,
+    /// Both legs filled. Terminal. Profit/loss is determined by realised PnL.
+    Done,
     /// Execution failed after a leg-2 problem; leg-1 unwind was attempted.
     /// Terminal. See [`ExecutionContext::error`].
     Failed,
@@ -78,23 +76,13 @@ impl ExecutorState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::DoneProfit
-                | Self::DoneLoss
-                | Self::Failed
-                | Self::Rejected
-                | Self::Leg2Reverted
-                | Self::Leg2Timeout
+            Self::Done | Self::Failed | Self::Rejected | Self::Leg2Reverted | Self::Leg2Timeout
         )
-    }
-
-    /// Returns `true` when the execution fully completed and profited.
-    pub fn is_profitable(self) -> bool {
-        matches!(self, Self::DoneProfit)
     }
 
     /// Returns `true` when both legs filled (regardless of PnL sign).
     pub fn is_filled(self) -> bool {
-        matches!(self, Self::DoneProfit | Self::DoneLoss)
+        matches!(self, Self::Done)
     }
 }
 
@@ -110,8 +98,7 @@ impl std::fmt::Display for ExecutorState {
             Self::Leg2Pending => "LEG2_PENDING",
             Self::Leg2Reverted => "LEG2_REVERTED",
             Self::Leg2Timeout => "LEG2_TIMEOUT",
-            Self::DoneProfit => "DONE_PROFIT",
-            Self::DoneLoss => "DONE_LOSS",
+            Self::Done => "DONE",
             Self::Failed => "FAILED",
             Self::Unwinding => "UNWINDING",
             Self::Rejected => "REJECTED",
@@ -238,16 +225,17 @@ impl ExecutionContext {
         self
     }
 
-    /// Both legs filled — classify PnL sign into DoneProfit / DoneLoss.
     fn complete(mut self, pnl: Decimal) -> Self {
         self.actual_net_pnl = Some(pnl);
-        self.state = if pnl > Decimal::ZERO {
-            ExecutorState::DoneProfit
-        } else {
-            ExecutorState::DoneLoss
-        };
+        self.state = ExecutorState::Done;
         self.finished_at = Some(Instant::now());
         self
+    }
+
+    pub fn is_profitable(&self) -> bool {
+        self.actual_net_pnl
+            .map(|pnl| pnl > Decimal::ZERO)
+            .unwrap_or(false)
     }
 }
 
@@ -1068,7 +1056,10 @@ impl Executor {
             .mark_executed(&ctx.signal);
         let mut cb = self.circuit_breaker.lock().await;
         match ctx.state {
-            ExecutorState::DoneProfit | ExecutorState::DoneLoss => cb.record_success(),
+            ExecutorState::Done if ctx.actual_net_pnl.is_some_and(|pnl| pnl < Decimal::ZERO) => {
+                cb.record_failure()
+            }
+            ExecutorState::Done => cb.record_success(),
             ExecutorState::Rejected => { /* neutral */ }
             _ => cb.record_failure(),
         }
@@ -1622,14 +1613,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executes_successfully_done_profit() {
+    async fn executes_successfully_done_with_profit() {
         let legs = Arc::new(SimulatedLegs::default());
         let ex = Executor::new(legs, cex_first());
         let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
         // cex=2000, dex=2020, size=1 -> gross=20.
         // Default FeeStructure: 10 + 30 bps + $5 gas/$2000 = 65 bps
         // -> fees = 2000 * 0.0065 = $13 -> net = $7 > 0.
-        assert_eq!(ctx.state, ExecutorState::DoneProfit);
+        assert_eq!(ctx.state, ExecutorState::Done);
         assert!(ctx.state.is_filled());
         assert!(ctx.state.is_terminal());
         assert!(ctx.actual_net_pnl.unwrap() > Decimal::ZERO);
@@ -1650,20 +1641,20 @@ mod tests {
         };
         let ex = Executor::new(legs, cex_first()).with_fees(heavy);
         let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
-        assert_eq!(ctx.state, ExecutorState::DoneLoss);
+        assert_eq!(ctx.state, ExecutorState::Done);
         assert!(ctx.actual_net_pnl.unwrap() < Decimal::ZERO);
     }
 
     #[tokio::test]
-    async fn done_loss_when_spread_covered_by_fees() {
-        // Build a signal whose gross = fees, so net PnL is zero -> DoneLoss.
+    async fn done_when_spread_covered_by_fees() {
+        // Build a signal whose gross = fees, so net PnL is zero -> Done.
         let mut signal = mk_signal(Decimal::from(80));
         signal.cex_price = Decimal::from(2000);
         signal.dex_price = Decimal::from(2000); // zero gross
         let legs = Arc::new(SimulatedLegs::default());
         let ex = Executor::new(legs, cex_first());
         let ctx = ex.execute(signal).await;
-        assert_eq!(ctx.state, ExecutorState::DoneLoss);
+        assert_eq!(ctx.state, ExecutorState::Done);
         assert!(ctx.actual_net_pnl.unwrap() <= Decimal::ZERO);
     }
 
@@ -1692,7 +1683,7 @@ mod tests {
     #[tokio::test]
     async fn leg1_timeout_race_filled_continues_to_leg2() {
         // Backend "hangs" but cancel races with a fill — result should
-        // be DoneProfit via the normal path (leg2 then fills as usual).
+        // be Done via the normal path (leg2 then fills as usual).
         let legs = Arc::new(SimulatedLegs {
             cex_behaviour: LegBehaviour::Hang,
             cancel_behaviour: CancelBehaviour::RaceFilled,
@@ -1846,7 +1837,7 @@ mod tests {
         let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
         assert!(
             ctx.state.is_filled(),
-            "expected DONE_* after LEG1_PARTIAL proceed, got {}",
+            "expected DONE after LEG1_PARTIAL proceed, got {}",
             ctx.state
         );
         // Leg 2 fill size must match the reduced leg 1 fill, not the
@@ -2050,6 +2041,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn circuit_breaker_counts_negative_done_pnl_as_failure() {
+        let legs = Arc::new(SimulatedLegs::default());
+        let heavy = FeeStructure {
+            cex_taker_bps: Decimal::from(50),
+            dex_swap_bps: Decimal::from(150),
+            gas_cost_usd: Decimal::from(50),
+        };
+        let ex = Executor::new(legs, cex_first()).with_fees(heavy);
+
+        for _ in 0..3 {
+            let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+            assert_eq!(ctx.state, ExecutorState::Done);
+            assert!(ctx.actual_net_pnl.unwrap() < Decimal::ZERO);
+        }
+
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::Rejected);
+        assert_eq!(ctx.error.as_deref(), Some("Circuit breaker open"));
+    }
+
+    #[tokio::test]
     async fn replay_rejects_duplicate() {
         let legs = Arc::new(SimulatedLegs::default());
         let ex = Executor::new(legs, cex_first());
@@ -2072,7 +2084,7 @@ mod tests {
         };
         let ex = Executor::new(legs, cfg);
         let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
-        assert_eq!(ctx.state, ExecutorState::DoneProfit);
+        assert_eq!(ctx.state, ExecutorState::Done);
         assert_eq!(ctx.leg1_venue, "dex");
         assert_eq!(ctx.leg2_venue, "cex");
     }
@@ -2099,8 +2111,7 @@ mod tests {
     #[test]
     fn state_terminal_helpers() {
         use ExecutorState::*;
-        assert!(DoneProfit.is_terminal());
-        assert!(DoneLoss.is_terminal());
+        assert!(Done.is_terminal());
         assert!(Failed.is_terminal());
         assert!(Rejected.is_terminal());
         assert!(Leg2Reverted.is_terminal());
@@ -2108,17 +2119,29 @@ mod tests {
         assert!(!Leg1Pending.is_terminal());
         assert!(!Unwinding.is_terminal());
 
-        assert!(DoneProfit.is_profitable());
-        assert!(!DoneLoss.is_profitable());
-        assert!(DoneProfit.is_filled());
-        assert!(DoneLoss.is_filled());
+        assert!(Done.is_filled());
         assert!(!Failed.is_filled());
+    }
+
+    #[test]
+    fn context_profitability_comes_from_realized_pnl() {
+        let mut positive = ExecutionContext::new(mk_signal(Decimal::from(80)));
+        positive.actual_net_pnl = Some(Decimal::ONE);
+        assert!(positive.is_profitable());
+
+        let mut zero = ExecutionContext::new(mk_signal(Decimal::from(80)));
+        zero.actual_net_pnl = Some(Decimal::ZERO);
+        assert!(!zero.is_profitable());
+
+        let mut negative = ExecutionContext::new(mk_signal(Decimal::from(80)));
+        negative.actual_net_pnl = Some(-Decimal::ONE);
+        assert!(!negative.is_profitable());
     }
 
     #[test]
     fn state_display_matches_spec() {
         assert_eq!(ExecutorState::Leg2Timeout.to_string(), "LEG2_TIMEOUT");
-        assert_eq!(ExecutorState::DoneProfit.to_string(), "DONE_PROFIT");
+        assert_eq!(ExecutorState::Done.to_string(), "DONE");
         assert_eq!(ExecutorState::Leg1Cancelling.to_string(), "LEG1_CANCELLING");
     }
 
