@@ -934,7 +934,8 @@ mod tests {
     fn token_amount_display_includes_symbol() {
         let amount = TokenAmount::from_eth("1.5").unwrap();
         let display = format!("{amount}");
-        assert!(display.contains("ETH") || display.contains("1.5"));
+        assert!(display.contains("ETH"));
+        assert!(display.contains("1.5"));
     }
 
     #[test]
