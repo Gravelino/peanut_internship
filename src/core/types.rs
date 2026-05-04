@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn token_amount_from_human_rejects_non_numeric() {
-        assert!(TokenAmount::from_eth("abc").is_err());
+        assert!(TokenAmount::from_human("abc", 18, None).is_err());
     }
 
     #[test]
