@@ -269,3 +269,182 @@ pub fn min_operating_balance() -> HashMap<String, Decimal> {
     );
     balances
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Venue ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn venue_is_cex_returns_true_for_cex_venues() {
+        assert!(Venue::Binance.is_cex());
+        assert!(Venue::Bybit.is_cex());
+    }
+
+    #[test]
+    fn venue_is_cex_returns_false_for_wallet() {
+        assert!(!Venue::Wallet.is_cex());
+    }
+
+    #[test]
+    fn venue_display_binance() {
+        assert_eq!(format!("{}", Venue::Binance), "binance");
+    }
+
+    #[test]
+    fn venue_display_bybit() {
+        assert_eq!(format!("{}", Venue::Bybit), "bybit");
+    }
+
+    #[test]
+    fn venue_display_wallet() {
+        assert_eq!(format!("{}", Venue::Wallet), "wallet");
+    }
+
+    // ── Balance ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn balance_total_sums_free_and_locked() {
+        let balance = Balance {
+            venue: Venue::Binance,
+            asset: "ETH".into(),
+            free: Decimal::from(8),
+            locked: Decimal::from(2),
+        };
+        assert_eq!(balance.total(), Decimal::from(10));
+    }
+
+    #[test]
+    fn balance_total_with_zero_locked() {
+        let balance = Balance {
+            venue: Venue::Wallet,
+            asset: "USDT".into(),
+            free: Decimal::from(1000),
+            locked: Decimal::ZERO,
+        };
+        assert_eq!(balance.total(), Decimal::from(1000));
+    }
+
+    #[test]
+    fn balance_serialization_round_trips() {
+        let balance = Balance {
+            venue: Venue::Bybit,
+            asset: "USDC".into(),
+            free: Decimal::from(500),
+            locked: Decimal::from(50),
+        };
+        let json = serde_json::to_string(&balance).unwrap();
+        let restored: Balance = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.venue, balance.venue);
+        assert_eq!(restored.asset, balance.asset);
+        assert_eq!(restored.free, balance.free);
+        assert_eq!(restored.locked, balance.locked);
+    }
+
+    // ── TransferPlan ───────────────────────────────────────────────────────
+
+    #[test]
+    fn transfer_plan_net_amount_subtracts_fee() {
+        let plan = TransferPlan {
+            from_venue: Venue::Binance,
+            to_venue: Venue::Wallet,
+            asset: "ETH".into(),
+            amount: Decimal::from(10),
+            estimated_fee: Decimal::from_str_exact("0.005").unwrap(),
+            estimated_time_min: 15,
+        };
+        let expected = Decimal::from(10) - Decimal::from_str_exact("0.005").unwrap();
+        assert_eq!(plan.net_amount(), expected);
+    }
+
+    #[test]
+    fn transfer_plan_net_amount_with_zero_fee() {
+        let plan = TransferPlan {
+            from_venue: Venue::Wallet,
+            to_venue: Venue::Binance,
+            asset: "USDT".into(),
+            amount: Decimal::from(1000),
+            estimated_fee: Decimal::ZERO,
+            estimated_time_min: 15,
+        };
+        assert_eq!(plan.net_amount(), Decimal::from(1000));
+    }
+
+    // ── transfer_fees ──────────────────────────────────────────────────────
+
+    #[test]
+    fn transfer_fees_contains_eth() {
+        let fees = transfer_fees();
+        assert!(fees.contains_key("ETH"));
+        let eth_fee = &fees["ETH"];
+        assert!(eth_fee.withdrawal_fee > Decimal::ZERO);
+        assert!(eth_fee.min_withdrawal > Decimal::ZERO);
+    }
+
+    #[test]
+    fn transfer_fees_contains_usdt() {
+        let fees = transfer_fees();
+        assert!(fees.contains_key("USDT"));
+    }
+
+    #[test]
+    fn transfer_fees_contains_usdc() {
+        let fees = transfer_fees();
+        assert!(fees.contains_key("USDC"));
+    }
+
+    #[test]
+    fn transfer_fees_confirmations_are_positive() {
+        for (_, fee_info) in transfer_fees() {
+            assert!(fee_info.confirmations > 0);
+            assert!(fee_info.estimated_time_min > 0);
+        }
+    }
+
+    // ── min_operating_balance ──────────────────────────────────────────────
+
+    #[test]
+    fn min_operating_balance_contains_expected_assets() {
+        let balances = min_operating_balance();
+        assert!(balances.contains_key("ETH"));
+        assert!(balances.contains_key("USDT"));
+        assert!(balances.contains_key("USDC"));
+    }
+
+    #[test]
+    fn min_operating_balance_values_are_positive() {
+        for (_, amount) in min_operating_balance() {
+            assert!(amount > Decimal::ZERO);
+        }
+    }
+
+    // ── ExecutorConfig ─────────────────────────────────────────────────────
+
+    #[test]
+    fn executor_config_default_has_sane_values() {
+        let config = ExecutorConfig::default();
+        assert!(config.max_slippage_bps > Decimal::ZERO);
+        assert!(config.max_single_trade_usd > Decimal::ZERO);
+        assert!(config.min_fill_pct > 0.0 && config.min_fill_pct <= 1.0);
+        assert!(!config.dry_run);
+    }
+
+    // ── RebalanceStatus ────────────────────────────────────────────────────
+
+    #[test]
+    fn rebalance_status_serialization_round_trips() {
+        let statuses = [
+            RebalanceStatus::Executed,
+            RebalanceStatus::PartiallyFilled,
+            RebalanceStatus::SlippageExceeded,
+            RebalanceStatus::InsufficientBalance,
+            RebalanceStatus::DryRun,
+        ];
+        for status in statuses {
+            let json = serde_json::to_string(&status).unwrap();
+            let restored: RebalanceStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, status);
+        }
+    }
+}

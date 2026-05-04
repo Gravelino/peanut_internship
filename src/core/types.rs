@@ -816,3 +816,368 @@ impl Add for TokenAmount {
             .expect("token amount decimals mismatch in add")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADDR_1: &str = "0x0000000000000000000000000000000000000001";
+    const ADDR_CHECKSUM: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
+
+    // ── Address ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn address_lower_returns_lowercase_hex() {
+        let addr = Address::new(ADDR_CHECKSUM).unwrap();
+        let lower = addr.lower();
+        assert_eq!(lower, lower.to_lowercase());
+        assert!(lower.starts_with("0x"));
+    }
+
+    #[test]
+    fn address_from_eth_address_round_trips() {
+        let original = Address::new(ADDR_1).unwrap();
+        let eth_addr = original.as_eth_address();
+        let reconstructed = Address::from_eth_address(eth_addr);
+        assert_eq!(original, reconstructed);
+    }
+
+    #[test]
+    fn address_try_from_str_valid() {
+        let addr: Result<Address, _> = ADDR_CHECKSUM.try_into();
+        assert!(addr.is_ok());
+    }
+
+    #[test]
+    fn address_try_from_str_invalid() {
+        let addr: Result<Address, _> = "not_an_address".try_into();
+        assert!(addr.is_err());
+    }
+
+    #[test]
+    fn address_checksum_and_lower_are_consistent() {
+        let addr = Address::new(ADDR_CHECKSUM).unwrap();
+        assert_eq!(
+            addr.checksum().to_lowercase(),
+            addr.lower().to_lowercase()
+        );
+    }
+
+    #[test]
+    fn address_display_matches_checksum() {
+        let addr = Address::new(ADDR_CHECKSUM).unwrap();
+        assert_eq!(format!("{addr}"), addr.checksum());
+    }
+
+    // ── TokenAmount ────────────────────────────────────────────────────────
+
+    #[test]
+    fn token_amount_eth_constructor_sets_decimals_and_symbol() {
+        let amount = TokenAmount::eth(1_000u64);
+        assert_eq!(amount.decimals, ETH_DECIMALS);
+        assert_eq!(amount.symbol.as_deref(), Some(ETH_SYMBOL));
+        assert_eq!(amount.raw, U256::from(1_000u64));
+    }
+
+    #[test]
+    fn token_amount_from_eth_zero_is_valid() {
+        let amount = TokenAmount::from_eth("0").unwrap();
+        assert_eq!(amount.raw, U256::zero());
+        assert_eq!(amount.decimals, ETH_DECIMALS);
+    }
+
+    #[test]
+    fn token_amount_from_human_rejects_negative() {
+        assert!(TokenAmount::from_eth("-1").is_err());
+    }
+
+    #[test]
+    fn token_amount_from_human_rejects_too_many_decimals() {
+        // 18 decimals → "0.0000000000000000001" has 19 decimal places
+        assert!(TokenAmount::from_human("0.0000000000000000001", 18, None).is_err());
+    }
+
+    #[test]
+    fn token_amount_from_human_rejects_non_numeric() {
+        assert!(TokenAmount::from_eth("abc").is_err());
+    }
+
+    #[test]
+    fn token_amount_checked_mul_decimal_scales_correctly() {
+        let one_eth = TokenAmount::from_eth("1").unwrap();
+        let half = one_eth.checked_mul_decimal(Decimal::new(5, 1)).unwrap();
+        assert_eq!(half.human(), Some(Decimal::new(5, 1)));
+    }
+
+    #[test]
+    fn token_amount_checked_mul_decimal_rejects_negative_factor() {
+        let amount = TokenAmount::from_eth("1").unwrap();
+        assert!(amount.checked_mul_decimal(Decimal::from(-1)).is_err());
+    }
+
+    #[test]
+    fn token_amount_checked_mul_int_scales_raw() {
+        let one_eth = TokenAmount::from_eth("2").unwrap();
+        let three_eth = one_eth.checked_mul_int(3).unwrap();
+        assert_eq!(three_eth.human(), Some(Decimal::from(6)));
+    }
+
+    #[test]
+    fn token_amount_add_operator_works_same_decimals() {
+        let a = TokenAmount::from_eth("1").unwrap();
+        let b = TokenAmount::from_eth("2").unwrap();
+        let sum = a + b;
+        assert_eq!(sum.human(), Some(Decimal::from(3)));
+    }
+
+    #[test]
+    fn token_amount_display_includes_symbol() {
+        let amount = TokenAmount::from_eth("1.5").unwrap();
+        let display = format!("{amount}");
+        assert!(display.contains("ETH") || display.contains("1.5"));
+    }
+
+    #[test]
+    fn token_amount_display_without_symbol_shows_value() {
+        let amount = TokenAmount::from_human("2.5", 6, None).unwrap();
+        let display = format!("{amount}");
+        assert!(display.contains("2.5"));
+    }
+
+    // ── TransactionStatus ──────────────────────────────────────────────────
+
+    #[test]
+    fn transaction_status_display_variants() {
+        assert_eq!(format!("{}", TransactionStatus::Success), "SUCCESS");
+        assert_eq!(format!("{}", TransactionStatus::Failed), "FAILED");
+        assert_eq!(format!("{}", TransactionStatus::Pending), "PENDING");
+    }
+
+    // ── GasPriority ────────────────────────────────────────────────────────
+
+    #[test]
+    fn gas_priority_from_str_valid_all_cases() {
+        assert_eq!("low".parse::<GasPriority>().unwrap(), GasPriority::Low);
+        assert_eq!("medium".parse::<GasPriority>().unwrap(), GasPriority::Medium);
+        assert_eq!("high".parse::<GasPriority>().unwrap(), GasPriority::High);
+        // Case-insensitive
+        assert_eq!("HIGH".parse::<GasPriority>().unwrap(), GasPriority::High);
+        assert_eq!("Low".parse::<GasPriority>().unwrap(), GasPriority::Low);
+    }
+
+    #[test]
+    fn gas_priority_from_str_invalid_returns_error() {
+        assert!("ultra".parse::<GasPriority>().is_err());
+        assert!("".parse::<GasPriority>().is_err());
+    }
+
+    // ── BlockId ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_id_from_str_and_display_round_trips() {
+        assert_eq!("latest".parse::<BlockId>().unwrap(), BlockId::Latest);
+        assert_eq!("pending".parse::<BlockId>().unwrap(), BlockId::Pending);
+        assert_eq!(format!("{}", BlockId::Latest), "latest");
+        assert_eq!(format!("{}", BlockId::Pending), "pending");
+    }
+
+    #[test]
+    fn block_id_from_str_invalid_returns_error() {
+        assert!("finalized".parse::<BlockId>().is_err());
+    }
+
+    // ── TransactionRequest ─────────────────────────────────────────────────
+
+    #[test]
+    fn transaction_request_contract_call_has_no_value_or_gas() {
+        let addr = Address::new(ADDR_1).unwrap();
+        let data = vec![0xde, 0xad, 0xbe, 0xef];
+        let req = TransactionRequest::contract_call(addr.clone(), data.clone(), MAINNET_CHAIN_ID);
+        assert_eq!(req.to, addr);
+        assert_eq!(req.value, TokenAmount::eth(0u64));
+        assert_eq!(req.nonce, None);
+        assert_eq!(req.gas_limit, None);
+        assert_eq!(req.chain_id, MAINNET_CHAIN_ID);
+        assert_eq!(req.data, Bytes::from(data));
+    }
+
+    #[test]
+    fn transaction_request_validate_rejects_zero_chain_id() {
+        let addr = Address::new(ADDR_1).unwrap();
+        let req = TransactionRequest {
+            to: addr,
+            value: TokenAmount::eth(0u64),
+            data: Bytes::new(),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id: 0,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn transaction_request_validate_rejects_low_gas_limit() {
+        let addr = Address::new(ADDR_1).unwrap();
+        let req = TransactionRequest {
+            to: addr,
+            value: TokenAmount::eth(0u64),
+            data: Bytes::new(),
+            nonce: None,
+            gas_limit: Some(1_000), // below MIN_GAS_LIMIT
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id: MAINNET_CHAIN_ID,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn transaction_request_validate_rejects_priority_exceeding_max_fee() {
+        let addr = Address::new(ADDR_1).unwrap();
+        let req = TransactionRequest {
+            to: addr,
+            value: TokenAmount::eth(0u64),
+            data: Bytes::new(),
+            nonce: None,
+            gas_limit: Some(MIN_GAS_LIMIT),
+            max_fee_per_gas: Some(U256::from(1_000_000_000u64)),
+            max_priority_fee: Some(U256::from(2_000_000_000u64)),
+            chain_id: MAINNET_CHAIN_ID,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn transaction_request_validate_passes_for_valid_request() {
+        let addr = Address::new(ADDR_1).unwrap();
+        let req = TransactionRequest {
+            to: addr,
+            value: TokenAmount::eth(0u64),
+            data: Bytes::new(),
+            nonce: Some(1),
+            gas_limit: Some(MIN_GAS_LIMIT),
+            max_fee_per_gas: Some(U256::from(2_000_000_000u64)),
+            max_priority_fee: Some(U256::from(1_000_000_000u64)),
+            chain_id: MAINNET_CHAIN_ID,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn transaction_request_to_dict_contains_chain_id() {
+        let addr = Address::new(ADDR_1).unwrap();
+        let req = TransactionRequest::contract_call(addr, vec![], MAINNET_CHAIN_ID);
+        let dict = req.to_dict();
+        assert!(dict.contains_key("chainId") || dict.contains_key("chain_id"));
+    }
+
+    // ── TransactionReceipt ─────────────────────────────────────────────────
+
+    #[test]
+    fn transaction_receipt_tx_fee_multiplies_gas_used_and_price() {
+        let receipt = TransactionReceipt {
+            tx_hash: "0xabc".into(),
+            block_number: 100,
+            status: true,
+            gas_used: U256::from(21_000u64),
+            effective_gas_price: U256::from(1_000_000_000u64), // 1 Gwei
+            logs: vec![],
+        };
+        let fee = receipt.tx_fee();
+        // 21000 * 1e9 = 21000 Gwei in wei
+        assert_eq!(fee.raw, U256::from(21_000u64) * U256::from(1_000_000_000u64));
+        assert_eq!(fee.decimals, ETH_DECIMALS);
+    }
+
+    #[test]
+    fn transaction_receipt_from_web3_parses_valid_json() {
+        let json = serde_json::json!({
+            "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": 12345678,
+            "status": "0x1",
+            "gasUsed": "0x5208",  // 21000 in hex
+            "effectiveGasPrice": "0x3b9aca00",  // 1 Gwei in hex
+            "logs": []
+        });
+        let receipt = TransactionReceipt::from_web3(&json).unwrap();
+        assert!(receipt.status);
+        assert_eq!(receipt.block_number, 12_345_678);
+        assert_eq!(receipt.gas_used, U256::from(21_000u64));
+    }
+
+    #[test]
+    fn transaction_receipt_deserialize_status_from_bool() {
+        let json = serde_json::json!({
+            "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": 1,
+            "status": false,
+            "gasUsed": "21000",
+            "effectiveGasPrice": "1000000000",
+            "logs": []
+        });
+        let receipt = TransactionReceipt::from_web3(&json).unwrap();
+        assert!(!receipt.status);
+    }
+
+    #[test]
+    fn transaction_receipt_deserialize_status_from_integer() {
+        let json = serde_json::json!({
+            "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": 1,
+            "status": 1,
+            "gasUsed": "21000",
+            "effectiveGasPrice": "1000000000",
+            "logs": []
+        });
+        let receipt = TransactionReceipt::from_web3(&json).unwrap();
+        assert!(receipt.status);
+    }
+
+    // ── GasPrice ───────────────────────────────────────────────────────────
+
+    fn make_gas_price() -> GasPrice {
+        GasPrice {
+            base_fee: U256::from(10_000_000_000u64), // 10 Gwei
+            priority_fee_low: U256::from(1_000_000_000u64),
+            priority_fee_medium: U256::from(2_000_000_000u64),
+            priority_fee_high: U256::from(3_000_000_000u64),
+        }
+    }
+
+    #[test]
+    fn gas_price_get_max_fee_low_priority_uses_low_tip() {
+        let gas = make_gas_price();
+        let max_fee = gas.get_max_fee(GasPriority::Low, DEFAULT_GAS_BUFFER_BPS);
+        // buffered base = ceil(10_000_000_000 * 12000 / 10000) + 1_000_000_000 priority_low
+        assert!(max_fee > gas.priority_fee_low);
+    }
+
+    #[test]
+    fn gas_price_get_max_fee_high_greater_than_low() {
+        let gas = make_gas_price();
+        let low = gas.get_max_fee(GasPriority::Low, DEFAULT_GAS_BUFFER_BPS);
+        let high = gas.get_max_fee(GasPriority::High, DEFAULT_GAS_BUFFER_BPS);
+        assert!(high > low);
+    }
+
+    #[test]
+    fn gas_price_get_max_fee_below_min_buffer_falls_back_to_default() {
+        let gas = make_gas_price();
+        // buffer_bps=0 is below MIN_GAS_BUFFER_BPS, should use DEFAULT_GAS_BUFFER_BPS
+        let fee_zero_buffer = gas.get_max_fee(GasPriority::Medium, 0);
+        let fee_default = gas.get_max_fee(GasPriority::Medium, DEFAULT_GAS_BUFFER_BPS);
+        assert_eq!(fee_zero_buffer, fee_default);
+    }
+
+    #[test]
+    fn gas_price_get_max_fee_medium_is_between_low_and_high() {
+        let gas = make_gas_price();
+        let low = gas.get_max_fee(GasPriority::Low, DEFAULT_GAS_BUFFER_BPS);
+        let mid = gas.get_max_fee(GasPriority::Medium, DEFAULT_GAS_BUFFER_BPS);
+        let high = gas.get_max_fee(GasPriority::High, DEFAULT_GAS_BUFFER_BPS);
+        assert!(low <= mid);
+        assert!(mid <= high);
+    }
+}
