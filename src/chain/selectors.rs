@@ -110,3 +110,126 @@ pub fn decode_event_topic(topic: &str) -> &'static str {
         _ => "Unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── known_selectors ────────────────────────────────────────────────────
+
+    #[test]
+    fn known_selectors_contains_erc20_transfer() {
+        let selectors = known_selectors();
+        assert_eq!(
+            selectors.get("0xa9059cbb").map(String::as_str),
+            Some("transfer(address,uint256)")
+        );
+    }
+
+    #[test]
+    fn known_selectors_contains_erc20_approve() {
+        let selectors = known_selectors();
+        assert_eq!(
+            selectors.get("0x095ea7b3").map(String::as_str),
+            Some("approve(address,uint256)")
+        );
+    }
+
+    #[test]
+    fn known_selectors_contains_uniswap_v2_swap() {
+        let selectors = known_selectors();
+        assert!(selectors.contains_key("0x38ed1739"));
+        assert!(selectors["0x38ed1739"].contains("swapExactTokensForTokens"));
+    }
+
+    #[test]
+    fn known_selectors_contains_uniswap_v3_exact_input_single() {
+        let selectors = known_selectors();
+        assert!(selectors.contains_key("0x414bf389"));
+        assert!(selectors["0x414bf389"].contains("exactInputSingle"));
+    }
+
+    #[test]
+    fn known_selectors_does_not_contain_unknown_selector() {
+        let selectors = known_selectors();
+        assert!(!selectors.contains_key("0xdeadbeef"));
+    }
+
+    #[test]
+    fn known_selectors_is_not_empty() {
+        assert!(!known_selectors().is_empty());
+    }
+
+    #[test]
+    fn known_selectors_returns_same_instance_on_repeated_calls() {
+        let first = known_selectors() as *const _;
+        let second = known_selectors() as *const _;
+        assert_eq!(first, second, "should return a static reference");
+    }
+
+    // ── decode_event_topic ─────────────────────────────────────────────────
+
+    #[test]
+    fn decode_transfer_topic() {
+        let decoded = decode_event_topic(TRANSFER_TOPIC);
+        assert!(decoded.contains("Transfer"));
+        assert!(decoded.contains("address"));
+    }
+
+    #[test]
+    fn decode_approval_topic() {
+        let decoded = decode_event_topic(APPROVAL_TOPIC);
+        assert!(decoded.contains("Approval"));
+    }
+
+    #[test]
+    fn decode_swap_v2_topic() {
+        let decoded = decode_event_topic(SWAP_V2_TOPIC);
+        assert!(decoded.contains("Swap"));
+        assert!(decoded.contains("Uniswap V2"));
+    }
+
+    #[test]
+    fn decode_sync_topic() {
+        let decoded = decode_event_topic(SYNC_TOPIC);
+        assert!(decoded.contains("Sync"));
+    }
+
+    #[test]
+    fn decode_swap_v3_topic() {
+        let decoded = decode_event_topic(SWAP_V3_TOPIC);
+        assert!(decoded.contains("Swap"));
+        assert!(decoded.contains("Uniswap V3"));
+    }
+
+    #[test]
+    fn decode_weth_deposit_topic() {
+        let decoded = decode_event_topic(WETH_DEPOSIT_TOPIC);
+        assert!(decoded.contains("Deposit"));
+        assert!(decoded.contains("WETH"));
+    }
+
+    #[test]
+    fn decode_weth_withdrawal_topic() {
+        let decoded = decode_event_topic(WETH_WITHDRAWAL_TOPIC);
+        assert!(decoded.contains("Withdrawal"));
+        assert!(decoded.contains("WETH"));
+    }
+
+    #[test]
+    fn decode_weth_withdrawal_alt_topic() {
+        let decoded = decode_event_topic(WETH_WITHDRAWAL_ALT_TOPIC);
+        assert!(decoded.contains("Withdrawal"));
+        assert!(decoded.contains("Alternative"));
+    }
+
+    #[test]
+    fn decode_unknown_topic_returns_unknown() {
+        assert_eq!(decode_event_topic("0xdeadbeef"), "Unknown");
+    }
+
+    #[test]
+    fn decode_empty_topic_returns_unknown() {
+        assert_eq!(decode_event_topic(""), "Unknown");
+    }
+}
