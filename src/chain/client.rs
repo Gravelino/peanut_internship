@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{BlockNumber, Bytes, H256, U256, transaction::eip2718::TypedTransaction};
+use ethers::types::{BlockNumber, Bytes, H256, U64, U256, transaction::eip2718::TypedTransaction};
 
 use crate::core::types::{
     Address, BlockId, GasPrice, PRIORITY_FEE_LOW_DIVISOR, PRIORITY_FEE_MEDIUM_DIVISOR, TokenAmount,
@@ -247,10 +247,18 @@ impl ChainClient {
     }
 
     /// Performs a read-only call to a smart contract.
+    ///
+    /// When `BlockId::Latest` is requested, we first resolve it to a concrete
+    /// block number.  Public RPC endpoints (e.g. `arb1.arbitrum.io/rpc`)
+    /// cache `eth_call` responses keyed by the `"latest"` tag, so passing a
+    /// numeric block ID forces a fresh read every time.
     pub async fn call(&self, tx: &TransactionRequest, block: BlockId) -> ChainResult<Vec<u8>> {
         let request: Arc<TypedTransaction> = Arc::new(tx.to_ethers_typed());
         let block_number = match block {
-            BlockId::Latest => BlockNumber::Latest,
+            BlockId::Latest => {
+                let num = self.get_block_number().await?;
+                BlockNumber::Number(U64::from(num))
+            }
             BlockId::Pending => BlockNumber::Pending,
         };
 
@@ -290,6 +298,8 @@ impl ChainClient {
                         retry,
                         "Retrying RPC operation"
                     );
+                    tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(retry as u32 - 1)))
+                        .await;
                 }
                 let result = operation(Arc::clone(provider)).await;
                 match result {
