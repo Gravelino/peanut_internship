@@ -32,6 +32,7 @@
 //! ```
 
 pub mod chain;
+pub mod config;
 pub mod core;
 pub mod exchange;
 pub mod executor;
@@ -39,6 +40,7 @@ pub mod integration;
 pub mod inventory;
 pub mod observability;
 pub mod pricing;
+pub mod safety;
 pub mod strategy;
 
 pub use chain::{ChainClient, ChainError, ChainResult, RpcHealth, TransactionBuilder};
@@ -51,11 +53,12 @@ pub use core::types::{
 };
 pub use core::wallet::{WalletError, WalletManager};
 pub use exchange::{
-    AggregatedPrice, BINANCE_TESTNET_BASE_URL, BINANCE_TESTNET_WS_URL, BYBIT_TESTNET_BASE_URL,
-    BYBIT_TESTNET_WS_URL, BinanceConfig, BybitAdapter, BybitConfig, CanExecuteResult, DepthEvent,
-    DepthSnapshot, DepthUpdate, ExchangeAdapter, ExchangeClient, ExchangeConfig, ExchangeError,
-    ExchangeResult, FeeStructure, FillLevel, HttpClient, LimitInterval, LimitKey, LimitType,
-    LocalOrderBook, MyTrade, NormalizedBalance, OrderBookAnalyzer, OrderBookSnapshot, OrderResult,
+    AggregatedPrice, BINANCE_PRODUCTION_BASE_URL, BINANCE_PRODUCTION_WS_URL,
+    BINANCE_TESTNET_BASE_URL, BINANCE_TESTNET_WS_URL, BYBIT_TESTNET_BASE_URL, BYBIT_TESTNET_WS_URL,
+    BinanceConfig, BybitAdapter, BybitConfig, CanExecuteResult, DepthEvent, DepthSnapshot,
+    DepthUpdate, ExchangeAdapter, ExchangeClient, ExchangeConfig, ExchangeError, ExchangeResult,
+    FeeStructure, FillLevel, HttpClient, LimitInterval, LimitKey, LimitType, LocalOrderBook,
+    MyTrade, NormalizedBalance, OrderBookAnalyzer, OrderBookSnapshot, OrderResult,
     PortfolioSnapshot, PriceOracle, PriceSource, RateLimiter, RetryConfig, SequenceStatus,
     SkewResult, VenueSkew, WalkResult,
 };
@@ -82,6 +85,11 @@ pub use pricing::{
     PricingResult, Quote, QuoteError, QuoteResult, RouteFinder, SimulationComparison,
     SimulationResult, SimulationVerdict, SizeImpact, SizeImpactAvg, SwapParams, TradeCost,
     UniswapV2Pair, UniswapV3Pool, V3SwapQuote,
+};
+pub use safety::{
+    ABSOLUTE_MAX_DAILY_LOSS, ABSOLUTE_MAX_TRADE_USD, ABSOLUTE_MAX_TRADES_PER_HOUR,
+    ABSOLUTE_MIN_CAPITAL, DEFAULT_KILL_SWITCH_FILE, PreTradeValidator, RiskLimits, RiskManager,
+    SafetyDecision, is_kill_switch_active, safety_check,
 };
 pub use strategy::{
     Direction, FeeStructure as StrategyFees, GeneratorConfig, PriceSource as StrategyPriceSource,
