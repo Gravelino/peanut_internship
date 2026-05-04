@@ -22,6 +22,22 @@ impl Direction {
             Direction::BuyDexSellCex => "buy_dex_sell_cex",
         }
     }
+
+    /// Returns the venue where the base asset is bought.
+    pub fn buy_venue(&self) -> crate::inventory::types::Venue {
+        match self {
+            Direction::BuyCexSellDex => crate::inventory::types::Venue::Binance,
+            Direction::BuyDexSellCex => crate::inventory::types::Venue::Wallet,
+        }
+    }
+
+    /// Returns the venue where the base asset is sold.
+    pub fn sell_venue(&self) -> crate::inventory::types::Venue {
+        match self {
+            Direction::BuyCexSellDex => crate::inventory::types::Venue::Wallet,
+            Direction::BuyDexSellCex => crate::inventory::types::Venue::Binance,
+        }
+    }
 }
 
 impl std::fmt::Display for Direction {

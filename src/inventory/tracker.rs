@@ -11,10 +11,26 @@ use crate::exchange::types::{
 use crate::inventory::errors::{InventoryError, InventoryResult};
 use crate::inventory::types::Venue;
 
+/// Describes a discrepancy between tracked and actual balance for a single asset.
+#[derive(Debug, Clone)]
+pub struct BalanceMismatch {
+    /// Venue where the mismatch was detected.
+    pub venue: Venue,
+    /// Asset symbol (e.g. "ETH", "USDC").
+    pub asset: String,
+    /// Balance according to the tracker (expected).
+    pub tracked: Decimal,
+    /// Balance reported by the exchange/wallet (actual).
+    pub actual: Decimal,
+    /// Absolute difference `|tracked - actual|`.
+    pub diff: Decimal,
+}
+
 #[derive(Debug, Clone)]
 struct VenueBalance {
     free: Decimal,
     locked: Decimal,
+    reserved: Decimal,
 }
 
 /// Tracks asset balances across multiple venues and provides skew/rebalance analysis.
@@ -40,6 +56,13 @@ impl InventoryTracker {
 
     /// Replaces all balances for a CEX venue with fresh data.
     pub fn update_from_cex(&mut self, venue: Venue, balances: HashMap<String, NormalizedBalance>) {
+        let mut old_reserved = HashMap::new();
+        for ((v, asset), bal) in &self.balances {
+            if *v == venue && bal.reserved > Decimal::ZERO {
+                old_reserved.insert(asset.clone(), bal.reserved);
+            }
+        }
+
         let keys_to_remove: Vec<(Venue, String)> = self
             .balances
             .keys()
@@ -52,11 +75,13 @@ impl InventoryTracker {
         }
 
         for (asset, bal) in balances {
+            let reserved = old_reserved.get(&asset).copied().unwrap_or(Decimal::ZERO);
             self.balances.insert(
                 (venue, asset),
                 VenueBalance {
                     free: bal.free,
                     locked: bal.locked,
+                    reserved,
                 },
             );
         }
@@ -65,6 +90,13 @@ impl InventoryTracker {
 
     /// Replaces all balances for a wallet venue with fresh data (no locked amounts).
     pub fn update_from_wallet(&mut self, venue: Venue, balances: HashMap<String, Decimal>) {
+        let mut old_reserved = HashMap::new();
+        for ((v, asset), bal) in &self.balances {
+            if *v == venue && bal.reserved > Decimal::ZERO {
+                old_reserved.insert(asset.clone(), bal.reserved);
+            }
+        }
+
         let keys_to_remove: Vec<(Venue, String)> = self
             .balances
             .keys()
@@ -77,11 +109,13 @@ impl InventoryTracker {
         }
 
         for (asset, amount) in balances {
+            let reserved = old_reserved.get(&asset).copied().unwrap_or(Decimal::ZERO);
             self.balances.insert(
                 (venue, asset),
                 VenueBalance {
                     free: amount,
                     locked: Decimal::ZERO,
+                    reserved,
                 },
             );
         }
@@ -136,7 +170,7 @@ impl InventoryTracker {
     pub fn get_available(&self, venue: Venue, asset: &str) -> Option<Decimal> {
         self.balances
             .get(&(venue, asset.to_string()))
-            .map(|b| b.free)
+            .map(|b| b.free - b.reserved)
     }
 
     /// Returns the total (free + locked) balance for an asset at a venue, if known.
@@ -144,6 +178,46 @@ impl InventoryTracker {
         self.balances
             .get(&(venue, asset.to_string()))
             .map(|b| b.free + b.locked)
+    }
+
+    /// Compares tracked balances against freshly-fetched actual balances.
+    /// Returns a list of mismatches where the absolute difference exceeds
+    /// `tolerance_pct` (expressed as a percentage, e.g. `1.0` = 1%).
+    ///
+    /// This is intended to be called after each balance sync to detect
+    /// discrepancies caused by failed fills, partial fills, or external
+    /// withdrawals.
+    pub fn verify_balances(
+        &self,
+        venue: Venue,
+        actual: &HashMap<String, Decimal>,
+        tolerance_pct: Decimal,
+    ) -> Vec<BalanceMismatch> {
+        let mut mismatches = Vec::new();
+        for (asset, actual_total) in actual {
+            let tracked = self.get_total(venue, asset).unwrap_or(Decimal::ZERO);
+            if tracked == Decimal::ZERO && *actual_total == Decimal::ZERO {
+                continue;
+            }
+            let diff = (tracked - actual_total).abs();
+            let threshold = if tracked.abs() > Decimal::ZERO {
+                tracked * tolerance_pct / Decimal::from(100)
+            } else {
+                // If tracked is zero but actual is not, any non-zero actual
+                // is a mismatch.
+                Decimal::ZERO
+            };
+            if diff > threshold {
+                mismatches.push(BalanceMismatch {
+                    venue,
+                    asset: asset.clone(),
+                    tracked,
+                    actual: *actual_total,
+                    diff,
+                });
+            }
+        }
+        mismatches
     }
 
     /// Checks whether an arb trade can be executed given available balances on both venues.
@@ -246,6 +320,7 @@ impl InventoryTracker {
         let bal = self.balances.entry(key).or_insert(VenueBalance {
             free: Decimal::ZERO,
             locked: Decimal::ZERO,
+            reserved: Decimal::ZERO,
         });
 
         bal.free += delta;
@@ -328,6 +403,45 @@ impl InventoryTracker {
         let mut results: Vec<SkewResult> = assets.iter().map(|a| self.skew(a)).collect();
         results.sort_by(|a, b| a.asset.cmp(&b.asset));
         results
+    }
+
+    /// Reserves a specific amount of an asset for an in-flight trade.
+    pub fn reserve(&mut self, venue: Venue, asset: &str, amount: Decimal) -> InventoryResult<()> {
+        let key = (venue, asset.to_string());
+        let bal = self.balances.entry(key).or_insert(VenueBalance {
+            free: Decimal::ZERO,
+            locked: Decimal::ZERO,
+            reserved: Decimal::ZERO,
+        });
+
+        if bal.free - bal.reserved < amount {
+            return Err(InventoryError::InsufficientBalance(format!(
+                "Cannot reserve {} {}: only {} available",
+                amount,
+                asset,
+                bal.free - bal.reserved
+            )));
+        }
+
+        bal.reserved += amount;
+        Ok(())
+    }
+
+    /// Releases a previously reserved amount of an asset.
+    pub fn release(&mut self, venue: Venue, asset: &str, amount: Decimal) -> InventoryResult<()> {
+        let key = (venue, asset.to_string());
+        if let Some(bal) = self.balances.get_mut(&key) {
+            if bal.reserved < amount {
+                bal.reserved = Decimal::ZERO;
+            } else {
+                bal.reserved -= amount;
+            }
+            Ok(())
+        } else {
+            Err(InventoryError::InsufficientBalance(
+                "Asset not found".into(),
+            ))
+        }
     }
 }
 
@@ -693,5 +807,49 @@ mod tests {
             tracker.get_available(Venue::Binance, "USDT").unwrap(),
             Decimal::from(3996)
         );
+    }
+
+    #[test]
+    fn test_verify_balances_detects_mismatch() {
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut bals = HashMap::new();
+        bals.insert(
+            "ETH".into(),
+            NormalizedBalance {
+                free: Decimal::from(10),
+                locked: Decimal::ZERO,
+                total: Decimal::from(10),
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, bals);
+
+        // Actual balance differs by more than 1% tolerance
+        let mut actual = HashMap::new();
+        actual.insert("ETH".into(), Decimal::from(9)); // 10% diff
+        let mismatches = tracker.verify_balances(Venue::Binance, &actual, Decimal::from(1));
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].asset, "ETH");
+        assert_eq!(mismatches[0].diff, Decimal::from(1));
+    }
+
+    #[test]
+    fn test_verify_balances_within_tolerance() {
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut bals = HashMap::new();
+        bals.insert(
+            "ETH".into(),
+            NormalizedBalance {
+                free: Decimal::from(10),
+                locked: Decimal::ZERO,
+                total: Decimal::from(10),
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, bals);
+
+        // Actual balance within 1% tolerance
+        let mut actual = HashMap::new();
+        actual.insert("ETH".into(), Decimal::from(10)); // exact match
+        let mismatches = tracker.verify_balances(Venue::Binance, &actual, Decimal::from(1));
+        assert!(mismatches.is_empty());
     }
 }

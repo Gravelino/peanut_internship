@@ -36,6 +36,20 @@ pub struct DepthUpdate {
     pub asks: Vec<[String; 2]>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct BookTickerEvent {
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "b")]
+    pub bid_price: String,
+    #[serde(rename = "B")]
+    pub bid_qty: String,
+    #[serde(rename = "a")]
+    pub ask_price: String,
+    #[serde(rename = "A")]
+    pub ask_qty: String,
+}
+
 /// A parsed depth event from the Binance WebSocket stream.
 #[derive(Debug, Clone)]
 pub enum DepthEvent {
@@ -267,6 +281,15 @@ pub fn parse_depth_message(data: &str) -> ExchangeResult<DepthEvent> {
     }
 }
 
+fn stream_url(ws_url: &str, stream: &str) -> String {
+    let base = ws_url.trim_end_matches('/');
+    if base.ends_with("/ws") {
+        format!("{base}/{stream}")
+    } else {
+        format!("{base}/ws/{stream}")
+    }
+}
+
 /// Connects to the Binance depth WebSocket stream and returns a receiver of `DepthEvent`.
 ///
 /// The stream URL is `<ws_url>/ws/<symbol_lower>@depth@100ms`.
@@ -280,7 +303,7 @@ pub async fn subscribe_depth_stream(
     use tokio_tungstenite::{connect_async, tungstenite};
 
     let symbol_lower = symbol.replace('/', "").to_lowercase();
-    let url = format!("{ws_url}/ws/{symbol_lower}@depth@100ms");
+    let url = stream_url(ws_url, &format!("{symbol_lower}@depth@100ms"));
 
     info!(url = %url, "Connecting to Binance depth stream");
 
@@ -321,6 +344,62 @@ pub async fn subscribe_depth_stream(
             }
         }
         info!("Depth stream ended");
+    });
+
+    Ok(rx)
+}
+
+pub async fn subscribe_book_ticker_stream(
+    ws_url: &str,
+    symbol: &str,
+) -> ExchangeResult<tokio::sync::mpsc::Receiver<BookTickerEvent>> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::{connect_async, tungstenite};
+
+    let symbol_lower = symbol.replace('/', "").to_lowercase();
+    let url = stream_url(ws_url, &format!("{symbol_lower}@bookTicker"));
+
+    info!(url = %url, "Connecting to Binance bookTicker stream");
+
+    let (ws_stream, _) = connect_async(&url)
+        .await
+        .map_err(|e| ExchangeError::Network(format!("WS connect failed: {e}")))?;
+
+    let (_, mut read) = ws_stream.split();
+
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+    tokio::spawn(async move {
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(tungstenite::Message::Text(text)) => {
+                    match serde_json::from_str::<BookTickerEvent>(&text) {
+                        Ok(event) => {
+                            if tx.send(event).await.is_err() {
+                                debug!("Book ticker receiver dropped, stopping");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse bookTicker message");
+                        }
+                    }
+                }
+                Ok(tungstenite::Message::Ping(data)) => {
+                    debug!("Received ping: {} bytes", data.len());
+                }
+                Ok(tungstenite::Message::Close(frame)) => {
+                    warn!(frame = ?frame, "WebSocket closed by server");
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "WebSocket read error");
+                    return;
+                }
+            }
+        }
+        info!("Book ticker stream ended");
     });
 
     Ok(rx)

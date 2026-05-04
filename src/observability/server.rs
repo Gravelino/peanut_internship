@@ -230,7 +230,7 @@ mod tests {
         drop(listener);
 
         let metrics = Arc::new(Metrics::new());
-        metrics.record_execution(ExecutorState::DoneProfit, 0.25, Some(10.0));
+        metrics.record_execution(ExecutorState::Done, 0.25, Some(10.0));
         metrics.set_queue_depth(5);
 
         let m = metrics.clone();

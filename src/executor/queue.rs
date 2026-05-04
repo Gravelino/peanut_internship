@@ -231,6 +231,7 @@ pub struct QueueWorker {
     /// Optional sink that receives completed [`ExecutionContext`]s. `None`
     /// discards them (useful in tests and smoke-run setups).
     completion_sink: Option<ExecutionSink>,
+    inventory: Option<Arc<tokio::sync::RwLock<crate::inventory::tracker::InventoryTracker>>>,
 }
 
 impl QueueWorker {
@@ -250,6 +251,7 @@ impl QueueWorker {
             max_concurrent_executions: max_concurrent_executions.max(1),
             poll_interval,
             completion_sink: None,
+            inventory: None,
         }
     }
 
@@ -258,6 +260,15 @@ impl QueueWorker {
     /// the error is logged and the execution is discarded.
     pub fn with_sink(mut self, sink: ExecutionSink) -> Self {
         self.completion_sink = Some(sink);
+        self
+    }
+
+    /// Sets the inventory tracker for inventory locking (S6).
+    pub fn with_inventory(
+        mut self,
+        inv: Arc<tokio::sync::RwLock<crate::inventory::tracker::InventoryTracker>>,
+    ) -> Self {
+        self.inventory = Some(inv);
         self
     }
 
@@ -296,6 +307,48 @@ impl QueueWorker {
                 }
                 continue;
             };
+
+            // Attempt to lock inventory.
+            if let Some(inv) = &self.inventory {
+                let mut tracker = inv.write().await;
+                let buy_venue = pending.signal.direction.buy_venue();
+                let sell_venue = pending.signal.direction.sell_venue();
+                let mut parts = pending.signal.pair.split('/');
+                let base = parts.next().unwrap();
+                let quote = parts.next().unwrap();
+
+                let buy_asset = quote;
+                let buy_amount = pending.signal.size * pending.signal.cex_price;
+                let sell_asset = base;
+                let sell_amount = pending.signal.size;
+
+                let check = tracker.can_execute(
+                    buy_venue,
+                    buy_asset,
+                    buy_amount,
+                    sell_venue,
+                    sell_asset,
+                    sell_amount,
+                );
+                if !check.can_execute {
+                    warn!(
+                        pair = %pending.signal.pair,
+                        reason = ?check.reason,
+                        "Dropping popped signal due to insufficient inventory (locked by another execution)"
+                    );
+                    continue; // Skip executing this signal, lock failed
+                }
+
+                if let Err(e) = tracker.reserve(buy_venue, buy_asset, buy_amount) {
+                    warn!(pair = %pending.signal.pair, error = %e, "Failed to reserve buy amount");
+                    continue;
+                }
+                if let Err(e) = tracker.reserve(sell_venue, sell_asset, sell_amount) {
+                    warn!(pair = %pending.signal.pair, error = %e, "Failed to reserve sell amount");
+                    let _ = tracker.release(buy_venue, buy_asset, buy_amount);
+                    continue;
+                }
+            }
 
             // Acquire a concurrency slot (blocks when cap reached). Once a
             // signal has been popped, we still execute it even if shutdown is

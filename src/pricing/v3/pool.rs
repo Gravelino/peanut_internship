@@ -1,4 +1,6 @@
+use ethers::abi::{ParamType, Token as AbiToken};
 use ethers::types::U256;
+use ethers::utils::id;
 use rust_decimal::Decimal;
 
 use super::math;
@@ -13,17 +15,28 @@ use crate::pricing::errors::{PricingError, PricingResult};
 
 const EVM_WORD_LEN: usize = 32;
 
-const SLOT0_SELECTOR: [u8; 4] = [0x38, 0x50, 0xc7, 0xb6];
-const LIQUIDITY_SELECTOR: [u8; 4] = [0x1a, 0x68, 0x66, 0x50];
+const SLOT0_SELECTOR: [u8; 4] = [0x38, 0x50, 0xc7, 0xbd];
+const LIQUIDITY_SELECTOR: [u8; 4] = [0x1a, 0x68, 0x65, 0x02];
 const FEE_SELECTOR: [u8; 4] = [0xdd, 0xca, 0x3f, 0x43];
 const TOKEN0_SELECTOR: [u8; 4] = [0x0d, 0xfe, 0x16, 0x81];
 const TOKEN1_SELECTOR: [u8; 4] = [0xd2, 0x12, 0x20, 0xa7];
+
+const QUOTER_V2_EXACT_INPUT_SINGLE_SIGNATURE: &str =
+    "quoteExactInputSingle((address,address,uint256,uint24,uint160))";
+const QUOTER_V2_EXACT_OUTPUT_SINGLE_SIGNATURE: &str =
+    "quoteExactOutputSingle((address,address,uint256,uint24,uint160))";
+const QUOTER_V2_RETURN_TYPES: [ParamType; 4] = [
+    ParamType::Uint(256),
+    ParamType::Uint(160),
+    ParamType::Uint(32),
+    ParamType::Uint(256),
+];
 
 const SLOT0_RETURN_MIN: usize = EVM_WORD_LEN * 3;
 
 /// Maximum iterations in the V3 swap step loop.
 /// 2 steps covers most in-range swaps; ticks that require more are rare.
-const MAX_SWAP_STEPS: usize = 2;
+const MAX_SWAP_STEPS: usize = 50;
 
 /// Base gas cost for a V3 swap (pool entry + exit overhead).
 /// Source: Uniswap V3 audit / empirical measurement.
@@ -77,6 +90,17 @@ pub struct V3SwapQuote {
     pub gas_estimate: u64,
     /// `true` when the swap could not be fully filled within step limits.
     pub is_partial: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V3QuoterKind {
+    QuoterV2,
+}
+
+#[derive(Debug, Clone)]
+pub struct V3QuoterConfig {
+    pub address: Address,
+    pub kind: V3QuoterKind,
 }
 
 impl UniswapV3Pool {
@@ -162,6 +186,10 @@ impl UniswapV3Pool {
         while amount_remaining > 0 && current_liquidity > 0 && steps < MAX_SWAP_STEPS {
             let next_tick = tick::next_tick_boundary(current_tick, self.tick_spacing, zero_for_one);
 
+            if amount_remaining == 0 || current_liquidity == 0 {
+                break;
+            }
+
             if next_tick == current_tick {
                 break;
             }
@@ -228,6 +256,74 @@ impl UniswapV3Pool {
         V3_BASE_GAS + V3_GAS_PER_HOP * (num_hops as u128)
     }
 
+    pub async fn quote_exact_input_single(
+        &self,
+        quoter: &V3QuoterConfig,
+        client: &ChainClient,
+        amount_in: u128,
+        token_in: &Token,
+    ) -> PricingResult<u128> {
+        let token_out = self.token_out_for(token_in)?;
+        match quoter.kind {
+            V3QuoterKind::QuoterV2 => {
+                let data = encode_quoter_v2_single(
+                    QUOTER_V2_EXACT_INPUT_SINGLE_SIGNATURE,
+                    token_in,
+                    token_out,
+                    amount_in,
+                    self.fee_bps,
+                );
+                let call = TransactionRequest::contract_call(
+                    quoter.address.clone(),
+                    data,
+                    MAINNET_CHAIN_ID,
+                );
+                let raw = client
+                    .call(&call, BlockId::Latest)
+                    .await
+                    .map_err(|e| PricingError::ChainCall(e.to_string()))?;
+                decode_quoter_v2_amount(&raw)
+            }
+        }
+    }
+
+    pub async fn quote_exact_output_single(
+        &self,
+        quoter: &V3QuoterConfig,
+        client: &ChainClient,
+        amount_out: u128,
+        token_out: &Token,
+    ) -> PricingResult<u128> {
+        let token_in = if *token_out == self.token1 {
+            &self.token0
+        } else if *token_out == self.token0 {
+            &self.token1
+        } else {
+            return Err(PricingError::UnknownToken(token_out.symbol.clone()));
+        };
+        match quoter.kind {
+            V3QuoterKind::QuoterV2 => {
+                let data = encode_quoter_v2_single(
+                    QUOTER_V2_EXACT_OUTPUT_SINGLE_SIGNATURE,
+                    token_in,
+                    token_out,
+                    amount_out,
+                    self.fee_bps,
+                );
+                let call = TransactionRequest::contract_call(
+                    quoter.address.clone(),
+                    data,
+                    MAINNET_CHAIN_ID,
+                );
+                let raw = client
+                    .call(&call, BlockId::Latest)
+                    .await
+                    .map_err(|e| PricingError::ChainCall(e.to_string()))?;
+                decode_quoter_v2_amount(&raw)
+            }
+        }
+    }
+
     /// Fetches full pool state and token metadata from an on-chain V3 contract.
     pub async fn from_chain(address: Address, client: &ChainClient) -> PricingResult<Self> {
         let call = |data: Vec<u8>| {
@@ -247,8 +343,7 @@ impl UniswapV3Pool {
         }
 
         let sqrt_price_x96 = U256::from_big_endian(&slot0_raw[0..EVM_WORD_LEN]);
-        let tick_i256 = U256::from_big_endian(&slot0_raw[EVM_WORD_LEN..EVM_WORD_LEN * 2]);
-        let tick_raw = tick_i256.as_u128() as i32;
+        let tick_raw = decode_i24_from_slot(&slot0_raw[EVM_WORD_LEN..EVM_WORD_LEN * 2])?;
 
         let liquidity_raw = client
             .call(&call(LIQUIDITY_SELECTOR.to_vec()), BlockId::Latest)
@@ -331,8 +426,7 @@ impl UniswapV3Pool {
         }
 
         let sqrt_price_x96 = U256::from_big_endian(&slot0_raw[0..EVM_WORD_LEN]);
-        let tick_i256 = U256::from_big_endian(&slot0_raw[EVM_WORD_LEN..EVM_WORD_LEN * 2]);
-        let tick = tick_i256.as_u128() as i32;
+        let tick = decode_i24_from_slot(&slot0_raw[EVM_WORD_LEN..EVM_WORD_LEN * 2])?;
 
         let liquidity_raw = client
             .call(&call(LIQUIDITY_SELECTOR.to_vec()), BlockId::Latest)
@@ -346,6 +440,51 @@ impl UniswapV3Pool {
         };
 
         Ok((sqrt_price_x96, liquidity, tick))
+    }
+}
+
+fn encode_quoter_v2_single(
+    signature: &str,
+    token_in: &Token,
+    token_out: &Token,
+    amount: u128,
+    fee: u32,
+) -> Vec<u8> {
+    let selector = id(signature);
+    let mut data = Vec::with_capacity(4 + 160);
+    data.extend_from_slice(&selector[..4]);
+    data.extend_from_slice(&ethers::abi::encode(&[AbiToken::Tuple(vec![
+        AbiToken::Address(token_in.address.as_eth_address()),
+        AbiToken::Address(token_out.address.as_eth_address()),
+        AbiToken::Uint(U256::from(amount)),
+        AbiToken::Uint(U256::from(fee)),
+        AbiToken::Uint(U256::zero()),
+    ])]));
+    data
+}
+
+fn decode_quoter_v2_amount(raw: &[u8]) -> PricingResult<u128> {
+    let decoded = ethers::abi::decode(&QUOTER_V2_RETURN_TYPES, raw)
+        .map_err(|e| PricingError::AbiDecode(format!("decode QuoterV2 response: {e}")))?;
+    decoded
+        .first()
+        .and_then(|token| token.clone().into_uint())
+        .map(|value| value.as_u128())
+        .ok_or_else(|| PricingError::AbiDecode("QuoterV2 response missing amount".into()))
+}
+
+fn decode_i24_from_slot(slot: &[u8]) -> PricingResult<i32> {
+    if slot.len() != EVM_WORD_LEN {
+        return Err(PricingError::AbiDecode(format!(
+            "int24 slot returned {} bytes, expected {EVM_WORD_LEN}",
+            slot.len()
+        )));
+    }
+    let raw = ((slot[29] as i32) << 16) | ((slot[30] as i32) << 8) | slot[31] as i32;
+    if raw & 0x80_0000 != 0 {
+        Ok(raw | !0xff_ffff)
+    } else {
+        Ok(raw)
     }
 }
 
@@ -405,6 +544,19 @@ mod tests {
             spot.round_dp(12),
             (expected_price * scale_in / scale_out).round_dp(12)
         );
+    }
+    #[test]
+    fn test_v3_pool_spot_price_realistic() {
+        // Tick for ~2300 USDC/ETH (Token0=WETH, Token1=USDC)
+        // P_raw = 2300 * 10^6 / 10^18 = 2.3 * 10^-9
+        // tick = log(2.3e-9) / log(1.0001) ~= -198900
+        let tick = -198900;
+        let pool = mock_v3_pool(tick, 10u128.pow(18), 500);
+        let spot = pool.get_spot_price(&pool.token0).unwrap();
+
+        // Spot should be around 2300
+        assert!(spot > Decimal::from(2000u64));
+        assert!(spot < Decimal::from(3000u64));
     }
 
     #[test]

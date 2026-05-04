@@ -43,7 +43,7 @@ pub enum ReconcileStatus {
     /// Waiting for the tx to land (or expire).
     Pending,
     /// Tx landed with `status=1`. The corresponding execution was marked
-    /// terminal (`DoneProfit` / `DoneLoss`) by the worker.
+    /// terminal (`Done`) by the worker.
     Resolved,
     /// Tx reverted or was treated as such; unwind was attempted.
     Reverted,

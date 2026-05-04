@@ -33,4 +33,4 @@ pub use simulator::{
     AmountOutDecoder, ForkSimulation, ForkSimulator, SimulationComparison, SimulationResult,
     SimulationVerdict, SwapParams,
 };
-pub use v3::{UniswapV3Pool, V3SwapQuote};
+pub use v3::{UniswapV3Pool, V3QuoterConfig, V3QuoterKind, V3SwapQuote};

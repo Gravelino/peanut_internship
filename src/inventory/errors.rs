@@ -19,6 +19,10 @@ pub enum InventoryError {
     #[error("negative balance: {0}")]
     NegativeBalance(String),
 
+    /// Balance mismatch between tracked and actual values.
+    #[error("balance mismatch: {0}")]
+    BalanceMismatch(String),
+
     /// No price available to convert an asset to USD.
     #[error("no price for USD valuation: {0}")]
     NoPriceForUsd(String),

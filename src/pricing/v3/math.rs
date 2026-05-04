@@ -44,7 +44,7 @@ pub fn max_tick() -> i32 {
     MAX_TICK
 }
 
-fn full_mul(a: U256, b: U256) -> [u64; 8] {
+fn full_mul_shr_128(a: U256, b: U256) -> U256 {
     let a_l = a.0;
     let b_l = b.0;
     let mut p = [0u128; 8];
@@ -57,94 +57,11 @@ fn full_mul(a: U256, b: U256) -> [u64; 8] {
         }
         p[i + 4] += carry;
     }
-    [
-        p[0] as u64,
-        p[1] as u64,
-        p[2] as u64,
-        p[3] as u64,
-        p[4] as u64,
-        p[5] as u64,
-        p[6] as u64,
-        p[7] as u64,
-    ]
-}
-
-fn full_mul_shr_128(a: U256, b: U256) -> U256 {
-    let p = full_mul(a, b);
-    U256([p[2], p[3], p[4], p[5]])
+    U256([p[2] as u64, p[3] as u64, p[4] as u64, p[5] as u64])
 }
 
 fn hex(s: &str) -> U256 {
     U256::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
-}
-
-fn mul_div_round_up(a: U256, b: U256, d: U256, label: &'static str) -> PricingResult<U256> {
-    if d.is_zero() {
-        return Err(PricingError::ArithmeticOverflow(label));
-    }
-    if d == U256_ONE {
-        let p = full_mul(a, b);
-        let lo_nonzero = p[0] != 0 || p[1] != 0;
-        let hi = U256([p[2], p[3], p[4], p[5]]);
-        Ok(if lo_nonzero { hi + U256_ONE } else { hi })
-    } else if b == U256_ONE {
-        let (q, r) = a.div_mod(d);
-        Ok(if r.is_zero() { q } else { q + U256_ONE })
-    } else if a == U256_ONE {
-        let (q, r) = b.div_mod(d);
-        Ok(if r.is_zero() { q } else { q + U256_ONE })
-    } else {
-        let p = full_mul(a, b);
-        let q = div512_256(&p, &d);
-        let qd = full_mul(q, d);
-        let has_rem = p != qd;
-        Ok(if has_rem { q + U256_ONE } else { q })
-    }
-}
-
-fn div512_256(dividend: &[u64; 8], divisor: &U256) -> U256 {
-    if divisor.is_zero() {
-        return U256::zero();
-    }
-    let d0 = divisor.0[0] as u128;
-    let d1 = divisor.0[1] as u128;
-    if divisor.0[2] == 0 && divisor.0[3] == 0 {
-        let d = d0 | (d1 << 64);
-        if d == 0 {
-            return U256::zero();
-        }
-        let mut rem = 0u128;
-        let mut q = [0u64; 8];
-        for i in (0..8).rev() {
-            let cur = (rem << 64) | (dividend[i] as u128);
-            q[i] = (cur / d) as u64;
-            rem = cur % d;
-        }
-        return U256([q[0], q[1], q[2], q[3]]);
-    }
-    let mut result = U256::zero();
-    let mut remainder = U256::zero();
-    for i in (0..8).rev() {
-        remainder <<= 64;
-        remainder |= U256::from(dividend[i]);
-        let digit = remainder / *divisor;
-        remainder -= digit * *divisor;
-        if i < 4 {
-            result |= digit << (i * 64);
-        }
-    }
-    result
-}
-
-fn shr_round_up(val: U256, n: usize, _label: &str) -> PricingResult<U256> {
-    let result = val >> n;
-    let mask = (U256_ONE << n) - U256_ONE;
-    let should_round = (val & mask) > U256::zero();
-    Ok(if should_round {
-        result + U256_ONE
-    } else {
-        result
-    })
 }
 
 /// Computes the sqrt price ratio (Q64.96) at the given tick index.
@@ -254,33 +171,46 @@ pub fn get_tick_at_sqrt_ratio(sqrt_price: U256) -> PricingResult<i32> {
     Ok(hi)
 }
 
+use primitive_types::U512;
+
+fn to_u512(x: U256) -> U512 {
+    let mut bytes = [0u8; 32];
+    x.to_little_endian(&mut bytes);
+    U512::from_little_endian(&bytes)
+}
+
+fn from_u512(x: U512) -> U256 {
+    let bytes = x.to_little_endian();
+    U256::from_little_endian(&bytes[0..32])
+}
+
 fn get_amount0_delta(a: U256, b: U256, liq: u128, up: bool) -> PricingResult<u128> {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    let l = U256::from(liq);
-    let num1 = l << 96;
-    let num = if up {
-        mul_div_round_up(num1, hi - lo, hi, "a0_num")?
-    } else {
-        num1 * (hi - lo) / hi
-    };
-    let r = if up {
-        shr_round_up(num, 96, "a0_shr")?
-    } else {
-        num >> 96
-    };
-    Ok(r.as_u128())
+    if lo.is_zero() {
+        return Ok(0);
+    }
+    let l = U512::from(liq);
+    let diff = to_u512(hi - lo);
+    let lo_512 = to_u512(lo);
+    let hi_512 = to_u512(hi);
+
+    // amount0 = (L * 2^96 * (hi - lo)) / (hi * lo)
+    let num = (l << 96) * diff;
+    let den = hi_512 * lo_512;
+
+    let res = if up { (num + den - 1) / den } else { num / den };
+    Ok(from_u512(res).as_u128())
 }
 
 fn get_amount1_delta(a: U256, b: U256, liq: u128, up: bool) -> PricingResult<u128> {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    let l = U256::from(liq);
-    let q = q96();
-    let r = if up {
-        mul_div_round_up(l, hi - lo, q, "a1_up")?
-    } else {
-        l * (hi - lo) / q
-    };
-    Ok(r.as_u128())
+    let l = U512::from(liq);
+    let diff = to_u512(hi - lo);
+    let q = U512::from(1) << 96;
+
+    let num = l * diff;
+    let res = if up { (num + q - 1) / q } else { num / q };
+    Ok(from_u512(res).as_u128())
 }
 
 /// Computes the amount of token0 between two sqrt prices for a given liquidity (unsigned, rounded down).
@@ -369,35 +299,42 @@ fn next_sqrt0(cur: U256, liq: u128, amt: u128, add: bool) -> PricingResult<U256>
     if amt == 0 {
         return Ok(cur);
     }
-    let l = U256::from(liq);
+    let l = U512::from(liq);
+    let cur_512 = to_u512(cur);
+    let amt_512 = U512::from(amt);
     let n1 = l << 96;
+
     if add {
-        let prod = n1
-            .checked_mul(cur)
-            .ok_or(PricingError::ArithmeticOverflow("ns0"))?;
-        let den = n1 + U256::from(amt) * cur;
-        Ok(prod / den)
+        // next = (L * 2^96 * cur) / (L * 2^96 + amt * cur)
+        let num = n1 * cur_512;
+        let den = n1 + amt_512 * cur_512;
+        Ok(from_u512(num / den))
     } else {
-        let prod = n1
-            .checked_mul(cur)
-            .ok_or(PricingError::ArithmeticOverflow("ns0"))?;
-        let den = n1 - U256::from(amt) * cur;
+        // next = (L * 2^96 * cur) / (L * 2^96 - amt * cur)
+        let num = n1 * cur_512;
+        let den = n1 - amt_512 * cur_512;
         if den.is_zero() {
             return Err(PricingError::ArithmeticOverflow("ns0_z"));
         }
-        Ok(prod / den)
+        Ok(from_u512(num / den))
     }
 }
 
 fn next_sqrt1(cur: U256, liq: u128, amt: u128, add: bool) -> PricingResult<U256> {
+    let cur_512 = to_u512(cur);
+    let amt_512 = U512::from(amt);
+    let l = U512::from(liq);
+
     if add {
-        Ok(cur + (U256::from(amt) << 96) / U256::from(liq))
+        // next = cur + (amt * 2^96) / L
+        Ok(from_u512(cur_512 + (amt_512 << 96) / l))
     } else {
-        let d = (U256::from(amt) << 96) / U256::from(liq);
-        if d >= cur {
+        // next = cur - (amt * 2^96) / L
+        let d = (amt_512 << 96) / l;
+        if d >= cur_512 {
             return Err(PricingError::ArithmeticOverflow("ns1"));
         }
-        Ok(cur - d)
+        Ok(from_u512(cur_512 - d))
     }
 }
 
