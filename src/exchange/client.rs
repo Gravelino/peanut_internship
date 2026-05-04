@@ -7,11 +7,10 @@ use tracing::{debug, info, warn};
 
 use crate::core::types::{
     BINANCE_ERR_INSUFFICIENT_FUNDS, BINANCE_ERR_INVALID_QUANTITY, BINANCE_ERR_INVALID_SYMBOL,
-    BINANCE_ERR_RATE_LIMIT, BINANCE_RECV_WINDOW_MS, BINANCE_WEIGHT_ACCOUNT,
-    BINANCE_WEIGHT_DEPTH_100, BINANCE_WEIGHT_DEPTH_500, BINANCE_WEIGHT_DEPTH_1000,
-    BINANCE_WEIGHT_DEPTH_5000, BINANCE_WEIGHT_EXCHANGE_INFO, BINANCE_WEIGHT_MY_TRADES,
-    BINANCE_WEIGHT_ORDER, BINANCE_WEIGHT_ORDER_STATUS, BINANCE_WEIGHT_SERVER_TIME,
-    BINANCE_WEIGHT_TRADE_FEE,
+    BINANCE_ERR_RATE_LIMIT, BINANCE_WEIGHT_ACCOUNT, BINANCE_WEIGHT_DEPTH_100,
+    BINANCE_WEIGHT_DEPTH_500, BINANCE_WEIGHT_DEPTH_1000, BINANCE_WEIGHT_DEPTH_5000,
+    BINANCE_WEIGHT_EXCHANGE_INFO, BINANCE_WEIGHT_MY_TRADES, BINANCE_WEIGHT_ORDER,
+    BINANCE_WEIGHT_ORDER_STATUS, BINANCE_WEIGHT_SERVER_TIME, BINANCE_WEIGHT_TRADE_FEE,
 };
 use crate::exchange::config::BinanceConfig;
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
@@ -385,7 +384,7 @@ impl BinanceClient {
 
     /// Fetches the account balance for all non-zero assets.
     pub(crate) async fn fetch_balance(&self) -> ExchangeResult<HashMap<String, NormalizedBalance>> {
-        let query = format!("recvWindow={}", BINANCE_RECV_WINDOW_MS);
+        let query = format!("recvWindow={}", self.config.recv_window);
         let signed = self.sign_request(&query)?;
 
         let url = format!(
@@ -437,7 +436,7 @@ impl BinanceClient {
             side.to_uppercase(),
             amount,
             price,
-            BINANCE_RECV_WINDOW_MS,
+            self.config.recv_window,
         );
 
         let signed = self.sign_request(&query)?;
@@ -465,7 +464,7 @@ impl BinanceClient {
             side.to_uppercase(),
             amount,
             price,
-            BINANCE_RECV_WINDOW_MS,
+            self.config.recv_window,
         );
 
         let signed = self.sign_request(&query)?;
@@ -491,7 +490,7 @@ impl BinanceClient {
             symbol.replace('/', ""),
             side.to_uppercase(),
             amount,
-            BINANCE_RECV_WINDOW_MS,
+            self.config.recv_window,
         );
 
         let signed = self.sign_request(&query)?;
@@ -515,7 +514,7 @@ impl BinanceClient {
             "symbol={}&orderId={}&recvWindow={}",
             symbol.replace('/', ""),
             order_id,
-            BINANCE_RECV_WINDOW_MS,
+            self.config.recv_window,
         );
 
         let signed = self.sign_request(&query)?;
@@ -539,7 +538,7 @@ impl BinanceClient {
             "symbol={}&orderId={}&recvWindow={}",
             symbol.replace('/', ""),
             order_id,
-            BINANCE_RECV_WINDOW_MS,
+            self.config.recv_window,
         );
 
         let signed = self.sign_request(&query)?;
@@ -558,7 +557,7 @@ impl BinanceClient {
         let query = format!(
             "symbol={}&recvWindow={}",
             symbol.replace('/', ""),
-            BINANCE_RECV_WINDOW_MS
+            self.config.recv_window
         );
         let signed = self.sign_request(&query)?;
         let url = format!(
@@ -596,7 +595,7 @@ impl BinanceClient {
             "symbol={}&limit={}&recvWindow={}",
             symbol.replace('/', ""),
             limit,
-            BINANCE_RECV_WINDOW_MS,
+            self.config.recv_window,
         );
         let signed = self.sign_request(&query)?;
         let url = format!(
