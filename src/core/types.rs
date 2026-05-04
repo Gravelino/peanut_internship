@@ -1071,7 +1071,8 @@ mod tests {
         let addr = Address::new(ADDR_1).unwrap();
         let req = TransactionRequest::contract_call(addr, vec![], MAINNET_CHAIN_ID);
         let dict = req.to_dict();
-        assert!(dict.contains_key("chainId") || dict.contains_key("chain_id"));
+        assert!(dict.contains_key("chainId"));
+        assert!(!dict.contains_key("chain_id"));
     }
 
     // ── TransactionReceipt ─────────────────────────────────────────────────
