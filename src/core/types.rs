@@ -857,10 +857,7 @@ mod tests {
     #[test]
     fn address_checksum_and_lower_are_consistent() {
         let addr = Address::new(ADDR_CHECKSUM).unwrap();
-        assert_eq!(
-            addr.checksum().to_lowercase(),
-            addr.lower().to_lowercase()
-        );
+        assert_eq!(addr.checksum().to_lowercase(), addr.lower().to_lowercase());
     }
 
     #[test]
@@ -959,7 +956,10 @@ mod tests {
     #[test]
     fn gas_priority_from_str_valid_all_cases() {
         assert_eq!("low".parse::<GasPriority>().unwrap(), GasPriority::Low);
-        assert_eq!("medium".parse::<GasPriority>().unwrap(), GasPriority::Medium);
+        assert_eq!(
+            "medium".parse::<GasPriority>().unwrap(),
+            GasPriority::Medium
+        );
         assert_eq!("high".parse::<GasPriority>().unwrap(), GasPriority::High);
         // Case-insensitive
         assert_eq!("HIGH".parse::<GasPriority>().unwrap(), GasPriority::High);
@@ -1089,7 +1089,10 @@ mod tests {
         };
         let fee = receipt.tx_fee();
         // 21000 * 1e9 = 21000 Gwei in wei
-        assert_eq!(fee.raw, U256::from(21_000u64) * U256::from(1_000_000_000u64));
+        assert_eq!(
+            fee.raw,
+            U256::from(21_000u64) * U256::from(1_000_000_000u64)
+        );
         assert_eq!(fee.decimals, ETH_DECIMALS);
     }
 
