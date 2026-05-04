@@ -1,13 +1,13 @@
 //! Webhook-based alerting (S7b).
 //!
 //! An alerter pushes selected [`AlertEvent`]s to an external HTTP endpoint
-//! (Slack / Discord / generic JSON). The sink is decoupled from callers via
+//! (Telegram Bot API / generic JSON). The sink is decoupled from callers via
 //! [`AlertSink`] so the bot can swap between a `NoopSink` (default) and a
 //! [`WebhookSink`] based on config.
 //!
 //! ## Provider payloads
-//! - `Slack` / `Discord`: `{ "text": "<message>" }` — both accept this
-//!   incoming-webhook shape.
+//! - `Telegram`: `{ "chat_id": "...", "text": "<message>" }` via the
+//!   Bot API `sendMessage` endpoint.
 //! - `Generic`: full `AlertEvent` JSON.
 //!
 //! Failures during `emit` are logged and swallowed — alerting **must never**
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -26,6 +27,23 @@ use crate::executor::engine::ExecutorState;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AlertEvent {
+    /// Bot has started and is entering the main loop.
+    BotStarted {
+        /// Trading mode (dry-run / testnet / production).
+        mode: String,
+        /// Monitored pairs.
+        pairs: String,
+    },
+    /// Bot has stopped — either cleanly or via halt signal.
+    BotStopped {
+        /// Reason for shutdown (clean / kill switch / daily loss / etc.).
+        reason: String,
+    },
+    /// Kill switch file was detected.
+    KillSwitchTriggered {
+        /// Path to the kill-switch file.
+        path: String,
+    },
     /// Circuit breaker flipped from closed to open.
     BreakerOpened {
         /// Number of consecutive failures that tripped the breaker.
@@ -69,44 +87,80 @@ pub enum AlertEvent {
         /// Configured maximum daily loss threshold.
         max_daily_loss: String,
     },
+    /// Post-trade balance verification detected a mismatch between tracked
+    /// and actual balances. The bot should halt for manual investigation.
+    BalanceMismatch {
+        /// Venue where the mismatch was detected.
+        venue: String,
+        /// Asset symbol.
+        asset: String,
+        /// Tracked (expected) balance.
+        tracked: String,
+        /// Actual (reported) balance.
+        actual: String,
+        /// Absolute difference.
+        diff: String,
+    },
 }
 
 impl AlertEvent {
-    /// Human-readable single-line summary — used as the body of Slack /
-    /// Discord messages and as the `tracing` payload for [`LoggingSink`].
+    /// Human-readable single-line summary — used as the message text for
+    /// Telegram alerts and as the `tracing` payload for [`LoggingSink`].
     pub fn summary(&self) -> String {
         match self {
-            Self::BreakerOpened { failures } => {
-                format!(":rotating_light: Circuit breaker OPEN after {failures} failures")
+            Self::BotStarted { mode, pairs } => {
+                format!("🚀 Bot STARTED mode={mode} pairs={pairs}")
             }
-            Self::BreakerClosed => ":white_check_mark: Circuit breaker CLOSED (recovered)".into(),
+            Self::BotStopped { reason } => {
+                format!("🛑 Bot STOPPED reason={reason}")
+            }
+            Self::KillSwitchTriggered { path } => {
+                format!("💀 KILL SWITCH triggered path={path}")
+            }
+            Self::BreakerOpened { failures } => {
+                format!(
+                    "🚨 Circuit breaker OPEN after {failures} failures — trades blocked, cooldown active"
+                )
+            }
+            Self::BreakerClosed => {
+                "✅ Circuit breaker CLOSED — trades resumed, breaker recovered".into()
+            }
             Self::Leg2Timeout {
                 signal_id,
                 tx_hash,
                 pair,
             } => match tx_hash {
-                Some(tx) => format!(
-                    ":warning: LEG2_TIMEOUT {pair} {signal_id} (tx {tx}); reconcile enqueued"
-                ),
+                Some(tx) => {
+                    format!("⚠️ LEG2_TIMEOUT {pair} {signal_id} (tx {tx}); reconcile enqueued")
+                }
                 None => format!(
-                    ":warning: LEG2_TIMEOUT {pair} {signal_id}; NO tx_hash captured — manual review required"
+                    "⚠️ LEG2_TIMEOUT {pair} {signal_id}; NO tx_hash captured — manual review required"
                 ),
             },
             Self::ExecutionFailed {
                 signal_id,
                 pair,
                 reason,
-            } => format!(":x: FAILED {pair} {signal_id}: {reason}"),
+            } => format!("❌ FAILED {pair} {signal_id}: {reason}"),
             Self::LargeLoss {
                 signal_id,
                 pair,
                 pnl,
-            } => format!(":money_with_wings: LARGE LOSS {pair} {signal_id}: pnl={pnl}"),
+            } => format!("💸 LARGE LOSS {pair} {signal_id}: pnl={pnl}"),
             Self::DailyLossHalt {
                 cumulative_pnl,
                 max_daily_loss,
             } => format!(
-                ":no_entry: DAILY LOSS HALT — cumulative={cumulative_pnl}, threshold=-{max_daily_loss}"
+                "🚫 DAILY LOSS HALT — cumulative={cumulative_pnl}, threshold=-{max_daily_loss}"
+            ),
+            Self::BalanceMismatch {
+                venue,
+                asset,
+                tracked,
+                actual,
+                diff,
+            } => format!(
+                "⚠️ BALANCE MISMATCH {venue} {asset}: tracked={tracked} actual={actual} diff={diff}"
             ),
         }
     }
@@ -153,15 +207,14 @@ impl AlertSink for LoggingSink {
 // Webhook sink
 // ---------------------------------------------------------------------------
 
-/// Third-party formats supported by [`WebhookSink`]. All three post JSON
+/// Third-party formats supported by [`WebhookSink`]. Both post JSON
 /// over HTTP POST; the payload shape differs per provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertProvider {
-    /// Slack Incoming Webhook: `{"text": "<summary>"}`.
-    Slack,
-    /// Discord Webhook: `{"content": "<summary>"}`.
-    Discord,
+    /// Telegram Bot API `sendMessage`: `{"chat_id": "...", "text": "<summary>"}`.
+    /// The URL should be `https://api.telegram.org/bot<TOKEN>/sendMessage`.
+    Telegram,
     /// Generic: the full [`AlertEvent`] serialised as JSON.
     Generic,
 }
@@ -172,8 +225,7 @@ impl AlertProvider {
     /// start.
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "slack" => Self::Slack,
-            "discord" => Self::Discord,
+            "telegram" => Self::Telegram,
             _ => Self::Generic,
         }
     }
@@ -184,20 +236,22 @@ impl AlertProvider {
 pub struct WebhookSink {
     url: String,
     provider: AlertProvider,
+    /// Telegram `chat_id`; ignored for `Generic` provider.
+    chat_id: String,
     client: reqwest::Client,
 }
 
 /// Redacts the secret portion of a webhook URL for safe logging.
 ///
-/// Slack / Discord incoming-webhook URLs embed an authentication token in
-/// the URL path (e.g. `https://hooks.slack.com/services/T0/B0/SECRET`).
+/// Telegram Bot API URLs embed the bot token in the path
+/// (e.g. `https://api.telegram.org/bot123456:ABC-DEF/sendMessage`).
 /// Logging the full URL leaks that secret into log aggregators and
 /// backups. This helper keeps scheme+host and the first path segment so
 /// the provider is still identifiable, but masks the rest.
 ///
 /// ```text
-/// https://hooks.slack.com/services/T0/B0/SECRET
-///   → https://hooks.slack.com/services/***
+/// https://api.telegram.org/bot123456:ABC-DEF/sendMessage
+///   → https://api.telegram.org/bot***
 /// ```
 pub fn mask_webhook_url(raw: &str) -> String {
     // Lightweight, no-new-dep parser sufficient for webhook URL shapes:
@@ -213,9 +267,13 @@ pub fn mask_webhook_url(raw: &str) -> String {
     if host.is_empty() {
         return "<unparsable-url>".into();
     }
+    // Telegram Bot API URLs embed the bot token in the first path segment
+    // (e.g. `bot123456:ABC-DEF123`). Detect and mask it.
     let first_segment = path.split('/').next().unwrap_or("");
     if first_segment.is_empty() {
         format!("{scheme}://{host}/***")
+    } else if first_segment.starts_with("bot") && first_segment.contains(':') {
+        format!("{scheme}://{host}/bot***/***")
     } else {
         format!("{scheme}://{host}/{first_segment}/***")
     }
@@ -223,8 +281,13 @@ pub fn mask_webhook_url(raw: &str) -> String {
 
 impl WebhookSink {
     /// Creates a new sink. `timeout` bounds each individual HTTP request —
-    /// a default of 5s is reasonable for Slack / Discord.
-    pub fn new(url: impl Into<String>, provider: AlertProvider, timeout: Duration) -> Self {
+    /// a default of 5s is reasonable for Telegram / generic endpoints.
+    pub fn new(
+        url: impl Into<String>,
+        provider: AlertProvider,
+        chat_id: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -234,6 +297,7 @@ impl WebhookSink {
         Self {
             url: url.into(),
             provider,
+            chat_id: chat_id.into(),
             client,
         }
     }
@@ -241,11 +305,15 @@ impl WebhookSink {
     /// Builds the JSON body for a given provider + event.
     fn encode_payload(
         provider: AlertProvider,
+        chat_id: &str,
         event: &AlertEvent,
     ) -> Result<serde_json::Value, String> {
         match provider {
-            AlertProvider::Slack => Ok(serde_json::json!({ "text": event.summary() })),
-            AlertProvider::Discord => Ok(serde_json::json!({ "content": event.summary() })),
+            AlertProvider::Telegram => Ok(serde_json::json!({
+                "chat_id": chat_id,
+                "text": event.summary(),
+                "parse_mode": "HTML",
+            })),
             AlertProvider::Generic => {
                 serde_json::to_value(event).map_err(|e| format!("serialize event: {e}"))
             }
@@ -256,7 +324,7 @@ impl WebhookSink {
 #[async_trait]
 impl AlertSink for WebhookSink {
     async fn emit(&self, event: &AlertEvent) -> Result<(), String> {
-        let body = Self::encode_payload(self.provider, event)?;
+        let body = Self::encode_payload(self.provider, &self.chat_id, event)?;
         let res = self
             .client
             .post(&self.url)
@@ -325,8 +393,9 @@ pub fn evaluate_execution(
                 reason: ctx.error.clone().unwrap_or_else(|| "unknown".into()),
             });
         }
-        ExecutorState::DoneLoss => {
+        ExecutorState::Done => {
             if let Some(pnl) = ctx.actual_net_pnl
+                && pnl < Decimal::ZERO
                 && pnl.abs() >= rules.large_loss_threshold
             {
                 out.push(AlertEvent::LargeLoss {
@@ -457,23 +526,23 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_done_profit_is_silent() {
-        let ctx = mk_ctx(ExecutorState::DoneProfit, Some(Decimal::from(50)));
+    fn evaluate_done_with_profit_is_silent() {
+        let ctx = mk_ctx(ExecutorState::Done, Some(Decimal::from(50)));
         let out = evaluate_execution(&ctx, &AlertRules::default());
         assert!(out.is_empty());
     }
 
     #[test]
-    fn evaluate_done_loss_below_threshold_is_silent() {
-        let ctx = mk_ctx(ExecutorState::DoneLoss, Some(Decimal::from(-10)));
+    fn evaluate_done_with_loss_below_threshold_is_silent() {
+        let ctx = mk_ctx(ExecutorState::Done, Some(Decimal::from(-10)));
         let out = evaluate_execution(&ctx, &AlertRules::default());
         // |-10| = 10 < default 100 threshold.
         assert!(out.is_empty());
     }
 
     #[test]
-    fn evaluate_done_loss_above_threshold_emits_large_loss() {
-        let ctx = mk_ctx(ExecutorState::DoneLoss, Some(Decimal::from(-500)));
+    fn evaluate_done_with_loss_above_threshold_emits_large_loss() {
+        let ctx = mk_ctx(ExecutorState::Done, Some(Decimal::from(-500)));
         let out = evaluate_execution(&ctx, &AlertRules::default());
         assert_eq!(out.len(), 1);
         matches!(&out[0], AlertEvent::LargeLoss { pnl, .. } if pnl == "-500");
@@ -482,33 +551,27 @@ mod tests {
     // ---- WebhookSink payload encoding ---------------------------------
 
     #[test]
-    fn slack_payload_uses_text_field() {
+    fn telegram_payload_uses_text_and_chat_id() {
         let event = AlertEvent::BreakerOpened { failures: 3 };
-        let body = WebhookSink::encode_payload(AlertProvider::Slack, &event).unwrap();
+        let body = WebhookSink::encode_payload(AlertProvider::Telegram, "12345", &event).unwrap();
         assert!(body["text"].is_string());
         assert!(body["text"].as_str().unwrap().contains("breaker"));
-    }
-
-    #[test]
-    fn discord_payload_uses_content_field() {
-        let event = AlertEvent::BreakerClosed;
-        let body = WebhookSink::encode_payload(AlertProvider::Discord, &event).unwrap();
-        assert!(body["content"].is_string());
-        assert_eq!(body.get("text"), None); // must NOT use Slack field
+        assert_eq!(body["chat_id"], "12345");
+        assert_eq!(body["parse_mode"], "HTML");
     }
 
     #[test]
     fn generic_payload_preserves_kind_tag() {
         let event = AlertEvent::BreakerOpened { failures: 5 };
-        let body = WebhookSink::encode_payload(AlertProvider::Generic, &event).unwrap();
+        let body = WebhookSink::encode_payload(AlertProvider::Generic, "", &event).unwrap();
         assert_eq!(body["kind"], "breaker_opened");
         assert_eq!(body["failures"], 5);
     }
 
     #[test]
     fn provider_parse_is_case_insensitive() {
-        assert_eq!(AlertProvider::parse("Slack"), AlertProvider::Slack);
-        assert_eq!(AlertProvider::parse("DISCORD"), AlertProvider::Discord);
+        assert_eq!(AlertProvider::parse("Telegram"), AlertProvider::Telegram);
+        assert_eq!(AlertProvider::parse("TELEGRAM"), AlertProvider::Telegram);
         assert_eq!(AlertProvider::parse("custom"), AlertProvider::Generic);
     }
 
@@ -517,19 +580,12 @@ mod tests {
     // ---- URL masking --------------------------------------------------
 
     #[test]
-    fn mask_slack_url_keeps_host_and_services_segment() {
-        let url = "https://hooks.slack.com/services/T0ABC/B0DEF/supersecret";
+    fn mask_telegram_url_keeps_host_and_masks_token() {
+        let url = "https://api.telegram.org/bot123456:ABC-DEF123/sendMessage";
         let masked = mask_webhook_url(url);
-        assert_eq!(masked, "https://hooks.slack.com/services/***");
-        assert!(!masked.contains("supersecret"));
-    }
-
-    #[test]
-    fn mask_discord_url_keeps_host_and_api_segment() {
-        let url = "https://discord.com/api/webhooks/123/tokenhere";
-        let masked = mask_webhook_url(url);
-        assert_eq!(masked, "https://discord.com/api/***");
-        assert!(!masked.contains("tokenhere"));
+        assert_eq!(masked, "https://api.telegram.org/bot***/***");
+        assert!(!masked.contains("ABC-DEF123"));
+        assert!(!masked.contains("123456"));
     }
 
     #[test]
@@ -574,5 +630,103 @@ mod tests {
         let sink: Arc<dyn AlertSink> = capture.clone();
         emit_best_effort(&sink, &AlertEvent::BreakerClosed).await;
         assert_eq!(capture.events.lock().unwrap().len(), 1);
+    }
+
+    // ---- Bot lifecycle alerts ------------------------------------------
+
+    #[test]
+    fn bot_started_summary_contains_mode_and_pairs() {
+        let e = AlertEvent::BotStarted {
+            mode: "dry-run".into(),
+            pairs: "ETH/USDC".into(),
+        };
+        let s = e.summary();
+        assert!(s.contains("dry-run"));
+        assert!(s.contains("ETH/USDC"));
+        assert!(s.contains("STARTED"));
+    }
+
+    #[test]
+    fn bot_stopped_summary_contains_reason() {
+        let e = AlertEvent::BotStopped {
+            reason: "clean shutdown".into(),
+        };
+        let s = e.summary();
+        assert!(s.contains("clean shutdown"));
+        assert!(s.contains("STOPPED"));
+    }
+
+    #[test]
+    fn kill_switch_summary_contains_path() {
+        let e = AlertEvent::KillSwitchTriggered {
+            path: "/tmp/arb_bot_kill".into(),
+        };
+        let s = e.summary();
+        assert!(s.contains("/tmp/arb_bot_kill"));
+        assert!(s.contains("KILL SWITCH"));
+    }
+
+    // ---- Circuit breaker lifecycle alerts ------------------------------
+
+    #[test]
+    fn breaker_opened_summary_contains_failure_count() {
+        let e = AlertEvent::BreakerOpened { failures: 3 };
+        let s = e.summary();
+        assert!(s.contains("3"));
+        assert!(s.contains("OPEN"));
+        assert!(s.contains("blocked"));
+    }
+
+    #[test]
+    fn breaker_closed_summary_indicates_recovery() {
+        let e = AlertEvent::BreakerClosed;
+        let s = e.summary();
+        assert!(s.contains("CLOSED"));
+        assert!(s.contains("resumed"));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_lifecycle_emits_open_then_closed() {
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn AlertSink> = capture.clone();
+
+        // Simulate breaker opening
+        emit_best_effort(&sink, &AlertEvent::BreakerOpened { failures: 3 }).await;
+        // Simulate breaker closing after cooldown
+        emit_best_effort(&sink, &AlertEvent::BreakerClosed).await;
+
+        let events = capture.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], AlertEvent::BreakerOpened { failures } if *failures == 3));
+        assert!(matches!(&events[1], AlertEvent::BreakerClosed));
+    }
+
+    #[test]
+    fn daily_loss_halt_summary_contains_thresholds() {
+        let e = AlertEvent::DailyLossHalt {
+            cumulative_pnl: "-15.00".into(),
+            max_daily_loss: "10".into(),
+        };
+        let s = e.summary();
+        assert!(s.contains("-15.00"));
+        assert!(s.contains("10"));
+        assert!(s.contains("DAILY LOSS HALT"));
+    }
+
+    #[test]
+    fn balance_mismatch_summary_contains_details() {
+        let e = AlertEvent::BalanceMismatch {
+            venue: "Binance".into(),
+            asset: "ETH".into(),
+            tracked: "10".into(),
+            actual: "9".into(),
+            diff: "1".into(),
+        };
+        let s = e.summary();
+        assert!(s.contains("Binance"));
+        assert!(s.contains("ETH"));
+        assert!(s.contains("tracked=10"));
+        assert!(s.contains("actual=9"));
+        assert!(s.contains("BALANCE MISMATCH"));
     }
 }

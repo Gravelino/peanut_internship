@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn render_contains_expected_names() {
         let m = Metrics::new();
-        m.record_execution(ExecutorState::DoneProfit, 0.15, Some(12.5));
+        m.record_execution(ExecutorState::Done, 0.15, Some(12.5));
         m.record_execution(ExecutorState::Rejected, 0.001, None);
         m.record_signal_generated("ETH/USDT", "BuyCexSellDex");
         m.set_breaker_open(true);
@@ -522,11 +522,11 @@ mod tests {
     fn pnl_only_recorded_for_filled_states() {
         let m = Metrics::new();
         m.record_execution(ExecutorState::Failed, 1.0, Some(-5.0));
-        m.record_execution(ExecutorState::DoneLoss, 1.0, Some(-2.5));
+        m.record_execution(ExecutorState::Done, 1.0, Some(-2.5));
 
         let body = String::from_utf8(m.render().unwrap()).unwrap();
-        // DoneLoss observation present:
-        assert!(body.contains("peanut_realized_pnl_usd_count{state=\"DONE_LOSS\"} 1"));
+        // Done observation present:
+        assert!(body.contains("peanut_realized_pnl_usd_count{state=\"DONE\"} 1"));
         // Failed observation absent (no line with state=FAILED on pnl):
         assert!(!body.contains("peanut_realized_pnl_usd_count{state=\"FAILED\"}"));
     }
@@ -536,7 +536,7 @@ mod tests {
         // Do NOT init global; confirm metrics_handle() still works for code
         // that fires observations in test environments.
         let h = metrics_handle();
-        h.record_execution(ExecutorState::DoneProfit, 0.1, Some(1.0));
+        h.record_execution(ExecutorState::Done, 0.1, Some(1.0));
         h.set_queue_depth(0);
         // The fallback handle must be observable — if `enabled` is flipped
         // to `true` accidentally we want the test to notice.
