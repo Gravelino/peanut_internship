@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn token_amount_from_human_rejects_negative() {
-        assert!(TokenAmount::from_eth("-1").is_err());
+        assert!(TokenAmount::from_human("-1", 18, None).is_err());
     }
 
     #[test]
