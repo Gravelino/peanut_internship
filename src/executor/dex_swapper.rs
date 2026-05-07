@@ -28,18 +28,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use ethers::abi::{Token as AbiToken, encode as abi_encode};
+use ethers::abi::{ParamType, Token as AbiToken, encode as abi_encode};
 use ethers::types::U256;
+use ethers::utils::id;
 use serde_json::Value;
 use thiserror::Error;
 use tracing::{info, instrument, warn};
 
-use crate::chain::builder::TransactionBuilder;
 use crate::chain::client::ChainClient;
 use crate::chain::selectors::TRANSFER_TOPIC;
 use crate::chain::{BundleRelay, BundleRequest, BundleTx, FlashbotsConfig};
+use crate::chain::{NonceManager, SignedTransaction, TransactionBuilder};
 use crate::core::types::{
-    Address, BlockId, GasPriority, TokenAmount, TransactionRequest, WEI_PER_GWEI,
+    Address, BlockId, GasPriority, MIN_GAS_LIMIT, TokenAmount, TransactionRequest, WEI_PER_GWEI,
 };
 use crate::core::wallet::WalletManager;
 use crate::observability::metrics_handle;
@@ -52,6 +53,12 @@ use crate::observability::metrics_handle;
 
 /// `swapExactTokensForTokens(uint256,uint256,address[],address,uint256)`.
 pub const SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
+pub const GET_AMOUNTS_OUT_SELECTOR: [u8; 4] = [0xd0, 0x6c, 0xa6, 0x1f];
+pub const V3_EXACT_INPUT_SINGLE_SELECTOR: [u8; 4] = [0x41, 0x4b, 0xf3, 0x89];
+pub const V3_EXACT_INPUT_SELECTOR: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
+const QUOTER_V2_EXACT_INPUT_SIGNATURE: &str = "quoteExactInput(bytes,uint256)";
+const QUOTER_V2_EXACT_INPUT_SINGLE_SIGNATURE: &str =
+    "quoteExactInputSingle((address,address,uint256,uint24,uint160))";
 /// `approve(address,uint256)`.
 pub const ERC20_APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 /// `allowance(address,address)`.
@@ -111,6 +118,17 @@ pub struct PairTokens {
     pub quote: Address,
     /// ERC-20 decimals of the quote token.
     pub quote_decimals: u8,
+    pub pool_kind: DexPoolKind,
+    pub v3_fee: Option<u32>,
+    pub v3_path: Option<Vec<Address>>,
+    pub v3_fees: Option<Vec<u32>>,
+    pub v3_quoter: Option<Address>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DexPoolKind {
+    V2,
+    V3,
 }
 
 /// Lookup table: pair symbol (e.g. `"ETH/USDT"`) → on-chain token metadata.
@@ -162,6 +180,7 @@ pub struct SwapSubmission {
     /// Transaction hash (0x-prefixed lowercase hex) returned by
     /// `eth_sendRawTransaction`.
     pub tx_hash: String,
+    pub nonce: Option<u64>,
     /// Amount of the input token submitted to the router.
     pub amount_in: U256,
     /// Token whose `Transfer(..., recipient, amount)` logs are parsed after
@@ -170,12 +189,20 @@ pub struct SwapSubmission {
     /// Recipient expected to receive `token_out`.
     pub recipient: Address,
     pub private_bundle: Option<PrivateSwapBundle>,
+    pub pool_kind: DexPoolKind,
 }
 
 #[derive(Debug, Clone)]
 pub struct PrivateSwapBundle {
     pub bundle_hash: String,
     pub target_block: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingSwapCancelOutcome {
+    Cancelled { cancel_tx_hash: String },
+    OriginalMined { tx_hash: String, success: bool },
+    Unknown(String),
 }
 
 /// Errors surfaced by [`DexSwapper`] implementations.
@@ -199,6 +226,8 @@ pub enum SwapperError {
     /// Signing or building the transaction failed.
     #[error("tx build error: {0}")]
     TxBuild(String),
+    #[error("quote error: {0}")]
+    Quote(String),
     #[error("bundle error: {0}")]
     Bundle(String),
     #[error("bundle not included before timeout (tx {tx_hash}, target block {target_block})")]
@@ -207,6 +236,115 @@ pub enum SwapperError {
 
 /// Convenience result alias.
 pub type SwapperResult<T> = Result<T, SwapperError>;
+
+#[derive(Clone)]
+struct ReservedNonce {
+    manager: NonceManager,
+    chain_id: u64,
+    address: Address,
+    nonce: u64,
+}
+
+impl ReservedNonce {
+    async fn rollback(self) {
+        self.manager
+            .mark_failed(self.chain_id, &self.address, self.nonce)
+            .await;
+    }
+}
+
+async fn rollback_reserved_nonce(reserved: Option<ReservedNonce>) {
+    if let Some(reserved) = reserved {
+        reserved.rollback().await;
+    }
+}
+
+async fn cancel_pending_public_swap(
+    client: &ChainClient,
+    wallet: &WalletManager,
+    config: &DexSwapperConfig,
+    owner: Address,
+    submission: &SwapSubmission,
+) -> SwapperResult<PendingSwapCancelOutcome> {
+    if let Some(receipt) = client
+        .get_receipt(&submission.tx_hash)
+        .await
+        .map_err(|e| SwapperError::Chain(format!("original receipt refetch: {e}")))?
+    {
+        return Ok(PendingSwapCancelOutcome::OriginalMined {
+            tx_hash: receipt.tx_hash,
+            success: receipt.status,
+        });
+    }
+
+    let Some(nonce) = submission.nonce else {
+        return Ok(PendingSwapCancelOutcome::Unknown(
+            "cannot cancel pending swap without original nonce".into(),
+        ));
+    };
+
+    let builder = TransactionBuilder::new(client.clone(), wallet.clone())
+        .to(owner)
+        .value(TokenAmount::eth(0))
+        .nonce(nonce)
+        .gas_limit(MIN_GAS_LIMIT)
+        .chain_id(config.chain_id)
+        .with_gas_price(GasPriority::High)
+        .await
+        .map_err(|e| SwapperError::TxBuild(format!("cancel fee: {e}")))?;
+    if let Err(e) = reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), config.max_gas_gwei) {
+        return Ok(PendingSwapCancelOutcome::Unknown(format!(
+            "cancel gas cap rejected: {e}"
+        )));
+    }
+    let signed = builder
+        .build_and_sign_with_hash()
+        .await
+        .map_err(|e| SwapperError::TxBuild(format!("cancel sign: {e}")))?;
+    let cancel_tx_hash = match client.send_transaction(&signed.raw).await {
+        Ok(tx_hash) => tx_hash,
+        Err(e) => {
+            if let Some(receipt) = client
+                .get_receipt(&submission.tx_hash)
+                .await
+                .map_err(|e| SwapperError::Chain(format!("original receipt refetch: {e}")))?
+            {
+                return Ok(PendingSwapCancelOutcome::OriginalMined {
+                    tx_hash: receipt.tx_hash,
+                    success: receipt.status,
+                });
+            }
+            return Ok(PendingSwapCancelOutcome::Unknown(format!(
+                "cancel send failed: {e}"
+            )));
+        }
+    };
+    match client
+        .wait_for_receipt(&cancel_tx_hash, config.receipt_timeout_secs, 1.0)
+        .await
+    {
+        Ok(receipt) if receipt.status => Ok(PendingSwapCancelOutcome::Cancelled { cancel_tx_hash }),
+        Ok(receipt) => Ok(PendingSwapCancelOutcome::Unknown(format!(
+            "cancel tx reverted: {}",
+            receipt.tx_hash
+        ))),
+        Err(e) => {
+            if let Some(receipt) = client
+                .get_receipt(&submission.tx_hash)
+                .await
+                .map_err(|e| SwapperError::Chain(format!("original receipt refetch: {e}")))?
+            {
+                return Ok(PendingSwapCancelOutcome::OriginalMined {
+                    tx_hash: receipt.tx_hash,
+                    success: receipt.status,
+                });
+            }
+            Ok(PendingSwapCancelOutcome::Unknown(format!(
+                "cancel receipt unknown: {e}"
+            )))
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -231,9 +369,42 @@ pub trait DexSwapper: Send + Sync + std::fmt::Debug {
         recipient: &Address,
     ) -> SwapperResult<SwapSubmission>;
 
+    async fn submit_swap_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        let _ = tokens;
+        self.submit_swap(token_in, token_out, amount_in, min_out, recipient)
+            .await
+    }
+
+    async fn quote_exact_input_for_pair(
+        &self,
+        _tokens: &PairTokens,
+        _token_in: &Address,
+        _token_out: &Address,
+        _amount_in: U256,
+    ) -> SwapperResult<Option<U256>> {
+        Ok(None)
+    }
+
     /// Waits for a previously-submitted swap transaction and parses the mined
     /// receipt into a [`SwapResult`].
     async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult>;
+
+    async fn cancel_pending_swap(
+        &self,
+        _submission: &SwapSubmission,
+    ) -> SwapperResult<PendingSwapCancelOutcome> {
+        Ok(PendingSwapCancelOutcome::Unknown(
+            "pending swap cancellation is not supported by this DEX backend".into(),
+        ))
+    }
 
     /// Swaps exactly `amount_in` of `token_in` for at least `min_out` of
     /// `token_out`. `recipient` receives the output token.
@@ -280,6 +451,127 @@ pub fn build_swap_calldata(
     out
 }
 
+pub fn build_get_amounts_out_calldata(amount_in: U256, path: &[Address]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 * (3 + path.len()));
+    out.extend_from_slice(&GET_AMOUNTS_OUT_SELECTOR);
+    out.extend_from_slice(&abi_encode(&[
+        AbiToken::Uint(amount_in),
+        AbiToken::Array(
+            path.iter()
+                .map(|a| AbiToken::Address(a.as_eth_address()))
+                .collect(),
+        ),
+    ]));
+    out
+}
+
+/// Encodes `approve(spender, amount)`.
+pub fn build_v3_exact_input_single_calldata(
+    token_in: &Address,
+    token_out: &Address,
+    fee: u32,
+    recipient: &Address,
+    deadline: U256,
+    amount_in: U256,
+    min_out: U256,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 * 8);
+    out.extend_from_slice(&V3_EXACT_INPUT_SINGLE_SELECTOR);
+    out.extend_from_slice(&abi_encode(&[
+        AbiToken::Address(token_in.as_eth_address()),
+        AbiToken::Address(token_out.as_eth_address()),
+        AbiToken::Uint(U256::from(fee)),
+        AbiToken::Address(recipient.as_eth_address()),
+        AbiToken::Uint(deadline),
+        AbiToken::Uint(amount_in),
+        AbiToken::Uint(min_out),
+        AbiToken::Uint(U256::zero()),
+    ]));
+    out
+}
+
+pub fn encode_v3_path(path: &[Address], fees: &[u32]) -> Result<Vec<u8>, String> {
+    if path.len() < 2 {
+        return Err("V3 path requires at least two token addresses".into());
+    }
+    if fees.len() + 1 != path.len() {
+        return Err(format!(
+            "V3 path fee count mismatch: {} fees for {} tokens",
+            fees.len(),
+            path.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(path.len() * 20 + fees.len() * 3);
+    for (idx, token) in path.iter().enumerate() {
+        out.extend_from_slice(token.as_eth_address().as_bytes());
+        if let Some(fee) = fees.get(idx) {
+            if *fee > 0x00ff_ffff {
+                return Err(format!("V3 fee {fee} exceeds uint24"));
+            }
+            out.push((fee >> 16) as u8);
+            out.push((fee >> 8) as u8);
+            out.push(*fee as u8);
+        }
+    }
+    Ok(out)
+}
+
+pub fn build_v3_exact_input_calldata(
+    path: &[Address],
+    fees: &[u32],
+    recipient: &Address,
+    deadline: U256,
+    amount_in: U256,
+    min_out: U256,
+) -> Result<Vec<u8>, String> {
+    let encoded_path = encode_v3_path(path, fees)?;
+    let mut out = Vec::with_capacity(4 + 32 * 5 + encoded_path.len());
+    out.extend_from_slice(&V3_EXACT_INPUT_SELECTOR);
+    out.extend_from_slice(&abi_encode(&[
+        AbiToken::Bytes(encoded_path),
+        AbiToken::Address(recipient.as_eth_address()),
+        AbiToken::Uint(deadline),
+        AbiToken::Uint(amount_in),
+        AbiToken::Uint(min_out),
+    ]));
+    Ok(out)
+}
+
+pub fn build_v3_quoter_exact_input_single_calldata(
+    token_in: &Address,
+    token_out: &Address,
+    fee: u32,
+    amount_in: U256,
+) -> Vec<u8> {
+    let selector = id(QUOTER_V2_EXACT_INPUT_SINGLE_SIGNATURE);
+    let mut out = Vec::with_capacity(4 + 32 * 5);
+    out.extend_from_slice(&selector[..4]);
+    out.extend_from_slice(&abi_encode(&[AbiToken::Tuple(vec![
+        AbiToken::Address(token_in.as_eth_address()),
+        AbiToken::Address(token_out.as_eth_address()),
+        AbiToken::Uint(amount_in),
+        AbiToken::Uint(U256::from(fee)),
+        AbiToken::Uint(U256::zero()),
+    ])]));
+    out
+}
+
+pub fn build_v3_quoter_exact_input_calldata(
+    path: &[Address],
+    fees: &[u32],
+    amount_in: U256,
+) -> Result<Vec<u8>, String> {
+    let selector = id(QUOTER_V2_EXACT_INPUT_SIGNATURE);
+    let encoded_path = encode_v3_path(path, fees)?;
+    let mut out = Vec::with_capacity(4 + 32 * 3 + encoded_path.len());
+    out.extend_from_slice(&selector[..4]);
+    out.extend_from_slice(&abi_encode(&[
+        AbiToken::Bytes(encoded_path),
+        AbiToken::Uint(amount_in),
+    ]));
+    Ok(out)
+}
+
 /// Encodes `approve(spender, amount)`.
 pub fn build_approve_calldata(spender: &Address, amount: U256) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 64);
@@ -313,6 +605,57 @@ pub fn apply_slippage(expected: U256, slippage_bps: u64) -> U256 {
         .checked_mul(U256::from(remaining))
         .unwrap_or(U256::zero())
         / U256::from(BPS_FULL)
+}
+
+pub fn v3_swap_calldata_for_pair(
+    tokens: &PairTokens,
+    token_in: &Address,
+    token_out: &Address,
+    recipient: &Address,
+    deadline: U256,
+    amount_in: U256,
+    min_out: U256,
+) -> SwapperResult<Vec<u8>> {
+    match (&tokens.v3_path, &tokens.v3_fees) {
+        (Some(path), Some(fees)) => {
+            let forward = path.first().map(|first| first == token_in).unwrap_or(false)
+                && path.last().map(|last| last == token_out).unwrap_or(false);
+            let reverse = path
+                .first()
+                .map(|first| first == token_out)
+                .unwrap_or(false)
+                && path.last().map(|last| last == token_in).unwrap_or(false);
+            if !forward && !reverse {
+                return Err(SwapperError::TxBuild(
+                    "V3 route endpoints do not match requested swap direction".into(),
+                ));
+            }
+            let route_path;
+            let route_fees;
+            let (path_ref, fees_ref) = if forward {
+                (path.as_slice(), fees.as_slice())
+            } else {
+                route_path = path.iter().cloned().rev().collect::<Vec<_>>();
+                route_fees = fees.iter().cloned().rev().collect::<Vec<_>>();
+                (route_path.as_slice(), route_fees.as_slice())
+            };
+            build_v3_exact_input_calldata(
+                path_ref, fees_ref, recipient, deadline, amount_in, min_out,
+            )
+            .map_err(SwapperError::TxBuild)
+        }
+        (None, None) => {
+            let fee = tokens.v3_fee.ok_or_else(|| {
+                SwapperError::TxBuild("missing V3 fee tier for pair in address book".into())
+            })?;
+            Ok(build_v3_exact_input_single_calldata(
+                token_in, token_out, fee, recipient, deadline, amount_in, min_out,
+            ))
+        }
+        _ => Err(SwapperError::TxBuild(
+            "V3 route requires both v3_path and v3_fees".into(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +745,57 @@ pub fn decode_uint256_return(data: &[u8]) -> Result<U256, String> {
     Ok(U256::from_big_endian(&data[..32]))
 }
 
+pub fn decode_get_amounts_out_return(data: &[u8]) -> Result<U256, String> {
+    let decoded = ethers::abi::decode(&[ParamType::Array(Box::new(ParamType::Uint(256)))], data)
+        .map_err(|e| format!("decode getAmountsOut: {e}"))?;
+    decoded
+        .first()
+        .and_then(|token| token.clone().into_array())
+        .and_then(|amounts| amounts.last().cloned())
+        .and_then(|token| token.into_uint())
+        .ok_or_else(|| "getAmountsOut response missing output amount".to_string())
+}
+
+fn v3_route_for_pair(
+    tokens: &PairTokens,
+    token_in: &Address,
+    token_out: &Address,
+) -> SwapperResult<(Vec<Address>, Vec<u32>)> {
+    match (&tokens.v3_path, &tokens.v3_fees) {
+        (Some(path), Some(fees)) => {
+            let forward = path.first().map(|first| first == token_in).unwrap_or(false)
+                && path.last().map(|last| last == token_out).unwrap_or(false);
+            let reverse = path
+                .first()
+                .map(|first| first == token_out)
+                .unwrap_or(false)
+                && path.last().map(|last| last == token_in).unwrap_or(false);
+            if !forward && !reverse {
+                return Err(SwapperError::TxBuild(
+                    "V3 route endpoints do not match requested swap direction".into(),
+                ));
+            }
+            if forward {
+                Ok((path.clone(), fees.clone()))
+            } else {
+                Ok((
+                    path.iter().cloned().rev().collect(),
+                    fees.iter().cloned().rev().collect(),
+                ))
+            }
+        }
+        (None, None) => {
+            let fee = tokens.v3_fee.ok_or_else(|| {
+                SwapperError::TxBuild("missing V3 fee tier for pair in address book".into())
+            })?;
+            Ok((vec![token_in.clone(), token_out.clone()], vec![fee]))
+        }
+        _ => Err(SwapperError::TxBuild(
+            "V3 route requires both v3_path and v3_fees".into(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UniswapV2Swapper
 // ---------------------------------------------------------------------------
@@ -416,6 +810,7 @@ pub struct UniswapV2Swapper {
     client: ChainClient,
     wallet: WalletManager,
     config: Arc<DexSwapperConfig>,
+    nonce_manager: Option<NonceManager>,
 }
 
 impl std::fmt::Debug for UniswapV2Swapper {
@@ -435,13 +830,42 @@ impl UniswapV2Swapper {
             client,
             wallet,
             config: Arc::new(config),
+            nonce_manager: None,
         }
+    }
+
+    pub fn with_nonce_manager(mut self, nonce_manager: NonceManager) -> Self {
+        self.nonce_manager = Some(nonce_manager);
+        self
     }
 
     /// Returns the recipient (owner) address derived from the wallet.
     pub fn owner(&self) -> Result<Address, SwapperError> {
         Address::new(self.wallet.address())
             .map_err(|e| SwapperError::TxBuild(format!("wallet address parse: {e}")))
+    }
+
+    async fn apply_reserved_nonce(
+        &self,
+        builder: TransactionBuilder,
+    ) -> SwapperResult<(TransactionBuilder, Option<ReservedNonce>)> {
+        let Some(nonce_manager) = &self.nonce_manager else {
+            return Ok((builder, None));
+        };
+        let owner = self.owner()?;
+        let nonce = nonce_manager
+            .reserve_next(&self.client, self.config.chain_id, &owner)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("reserve nonce: {e}")))?;
+        Ok((
+            builder.nonce(nonce),
+            Some(ReservedNonce {
+                manager: nonce_manager.clone(),
+                chain_id: self.config.chain_id,
+                address: owner,
+                nonce,
+            }),
+        ))
     }
 
     /// Reads the current ERC-20 allowance owner→spender.
@@ -508,22 +932,384 @@ impl UniswapV2Swapper {
             .with_gas_price(GasPriority::Medium)
             .await
             .map_err(|e| SwapperError::TxBuild(format!("approve fee: {e}")))?;
-        reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
 
-        let receipt = builder
-            .send_and_wait(self.config.receipt_timeout_secs)
+        let signed = match builder.build_and_sign().await {
+            Ok(signed) => signed,
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                return Err(SwapperError::TxBuild(format!("approve sign: {e}")));
+            }
+        };
+        let tx_hash = self
+            .client
+            .send_transaction(&signed)
             .await
             .map_err(|e| SwapperError::Chain(format!("approve send: {e}")))?;
+        let receipt = self
+            .client
+            .wait_for_receipt(&tx_hash, self.config.receipt_timeout_secs, 1.0)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("approve receipt: {e}")))?;
         if !receipt.status {
             return Err(SwapperError::Reverted(receipt.tx_hash));
         }
         Ok(true)
     }
+
+    async fn build_signed_swap_tx(
+        &self,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+        context: &str,
+    ) -> SwapperResult<SignedTransaction> {
+        if min_out.is_zero() {
+            return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
+        }
+        self.ensure_allowance(token_in, &self.config.router, amount_in)
+            .await?;
+        let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));
+        let path = vec![token_in.clone(), token_out.clone()];
+        let calldata = build_swap_calldata(amount_in, min_out, &path, recipient, deadline);
+        let builder = TransactionBuilder::new(self.client.clone(), self.wallet.clone())
+            .to(self.config.router.clone())
+            .data(calldata)
+            .chain_id(self.config.chain_id)
+            .with_gas_estimate(Some(self.config.gas_buffer_bps))
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("{context} swap gas: {e}")))?
+            .with_gas_price(GasPriority::Medium)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("{context} swap fee: {e}")))?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
+        match builder.build_and_sign_with_hash().await {
+            Ok(signed) => Ok(signed),
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                Err(SwapperError::TxBuild(format!("{context} swap sign: {e}")))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct UniswapV3Swapper {
+    client: ChainClient,
+    wallet: WalletManager,
+    config: Arc<DexSwapperConfig>,
+    nonce_manager: Option<NonceManager>,
+}
+
+struct V3SwapTxRequest<'a> {
+    tokens: &'a PairTokens,
+    token_in: &'a Address,
+    token_out: &'a Address,
+    amount_in: U256,
+    min_out: U256,
+    recipient: &'a Address,
+}
+
+impl std::fmt::Debug for UniswapV3Swapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniswapV3Swapper")
+            .field("router", &self.config.router)
+            .field("slippage_bps", &self.config.slippage_bps)
+            .field("chain_id", &self.config.chain_id)
+            .finish()
+    }
+}
+
+impl UniswapV3Swapper {
+    pub fn new(client: ChainClient, wallet: WalletManager, config: DexSwapperConfig) -> Self {
+        Self {
+            client,
+            wallet,
+            config: Arc::new(config),
+            nonce_manager: None,
+        }
+    }
+
+    pub fn with_nonce_manager(mut self, nonce_manager: NonceManager) -> Self {
+        self.nonce_manager = Some(nonce_manager);
+        self
+    }
+
+    pub fn owner(&self) -> Result<Address, SwapperError> {
+        Address::new(self.wallet.address())
+            .map_err(|e| SwapperError::TxBuild(format!("wallet address parse: {e}")))
+    }
+
+    async fn apply_reserved_nonce(
+        &self,
+        builder: TransactionBuilder,
+    ) -> SwapperResult<(TransactionBuilder, Option<ReservedNonce>)> {
+        let Some(nonce_manager) = &self.nonce_manager else {
+            return Ok((builder, None));
+        };
+        let owner = self.owner()?;
+        let nonce = nonce_manager
+            .reserve_next(&self.client, self.config.chain_id, &owner)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("reserve nonce: {e}")))?;
+        Ok((
+            builder.nonce(nonce),
+            Some(ReservedNonce {
+                manager: nonce_manager.clone(),
+                chain_id: self.config.chain_id,
+                address: owner,
+                nonce,
+            }),
+        ))
+    }
+
+    pub async fn allowance(
+        &self,
+        token: &Address,
+        owner: &Address,
+        spender: &Address,
+    ) -> SwapperResult<U256> {
+        let data = build_allowance_calldata(owner, spender);
+        let req = TransactionRequest {
+            to: token.clone(),
+            value: TokenAmount::eth(0),
+            data: data.into(),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id: self.config.chain_id,
+        };
+        let raw = self
+            .client
+            .call(&req, BlockId::Latest)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("allowance call: {e}")))?;
+        decode_uint256_return(&raw).map_err(SwapperError::Decode)
+    }
+
+    pub async fn ensure_allowance(
+        &self,
+        token: &Address,
+        spender: &Address,
+        needed: U256,
+    ) -> SwapperResult<bool> {
+        let owner = self.owner()?;
+        let current = self.allowance(token, &owner, spender).await?;
+        if current >= needed {
+            return Ok(false);
+        }
+        info!(
+            token = %token, spender = %spender,
+            current = %current, needed = %needed,
+            "DEX V3: approving router (allowance insufficient)"
+        );
+        let calldata = build_approve_calldata(spender, U256::MAX);
+        let builder = TransactionBuilder::new(self.client.clone(), self.wallet.clone())
+            .to(token.clone())
+            .data(calldata)
+            .chain_id(self.config.chain_id)
+            .with_gas_estimate(Some(self.config.gas_buffer_bps))
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("approve gas: {e}")))?
+            .with_gas_price(GasPriority::Medium)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("approve fee: {e}")))?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
+        let signed = match builder.build_and_sign().await {
+            Ok(signed) => signed,
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                return Err(SwapperError::TxBuild(format!("approve sign: {e}")));
+            }
+        };
+        let tx_hash = self
+            .client
+            .send_transaction(&signed)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("approve send: {e}")))?;
+        let receipt = self
+            .client
+            .wait_for_receipt(&tx_hash, self.config.receipt_timeout_secs, 1.0)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("approve receipt: {e}")))?;
+        if !receipt.status {
+            return Err(SwapperError::Reverted(receipt.tx_hash));
+        }
+        Ok(true)
+    }
+
+    async fn build_signed_swap_tx_for_pair(
+        &self,
+        req: V3SwapTxRequest<'_>,
+        context: &str,
+    ) -> SwapperResult<SignedTransaction> {
+        if req.min_out.is_zero() {
+            return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
+        }
+        self.ensure_allowance(req.token_in, &self.config.router, req.amount_in)
+            .await?;
+        let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));
+        let calldata = v3_swap_calldata_for_pair(
+            req.tokens,
+            req.token_in,
+            req.token_out,
+            req.recipient,
+            deadline,
+            req.amount_in,
+            req.min_out,
+        )?;
+        let builder = TransactionBuilder::new(self.client.clone(), self.wallet.clone())
+            .to(self.config.router.clone())
+            .data(calldata)
+            .chain_id(self.config.chain_id)
+            .with_gas_estimate(Some(self.config.gas_buffer_bps))
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("{context} v3 swap gas: {e}")))?
+            .with_gas_price(GasPriority::Medium)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("{context} v3 swap fee: {e}")))?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
+        match builder.build_and_sign_with_hash().await {
+            Ok(signed) => Ok(signed),
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                Err(SwapperError::TxBuild(format!(
+                    "{context} v3 swap sign: {e}"
+                )))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum FlashbotsInner {
+    V2(UniswapV2Swapper),
+    V3(UniswapV3Swapper),
+}
+
+impl std::fmt::Debug for FlashbotsInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V2(inner) => f.debug_tuple("V2").field(inner).finish(),
+            Self::V3(inner) => f.debug_tuple("V3").field(inner).finish(),
+        }
+    }
+}
+
+impl FlashbotsInner {
+    fn client(&self) -> &ChainClient {
+        match self {
+            Self::V2(inner) => &inner.client,
+            Self::V3(inner) => &inner.client,
+        }
+    }
+
+    fn deadline_secs(&self) -> u64 {
+        match self {
+            Self::V2(inner) => inner.config.deadline_secs,
+            Self::V3(inner) => inner.config.deadline_secs,
+        }
+    }
+
+    async fn build_signed_swap_tx(
+        &self,
+        tokens: Option<&PairTokens>,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SignedTransaction> {
+        match self {
+            Self::V2(inner) => {
+                inner
+                    .build_signed_swap_tx(
+                        token_in, token_out, amount_in, min_out, recipient, "bundle",
+                    )
+                    .await
+            }
+            Self::V3(inner) => {
+                let tokens = tokens.ok_or_else(|| {
+                    SwapperError::TxBuild(
+                        "Uniswap V3 Flashbots swap requires submit_swap_for_pair".into(),
+                    )
+                })?;
+                inner
+                    .build_signed_swap_tx_for_pair(
+                        V3SwapTxRequest {
+                            tokens,
+                            token_in,
+                            token_out,
+                            amount_in,
+                            min_out,
+                            recipient,
+                        },
+                        "bundle",
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn wait_public(&self, submission: SwapSubmission) -> SwapperResult<SwapResult> {
+        match self {
+            Self::V2(inner) => inner.wait_swap(submission).await,
+            Self::V3(inner) => inner.wait_swap(submission).await,
+        }
+    }
+
+    async fn quote_exact_input_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+    ) -> SwapperResult<Option<U256>> {
+        match self {
+            Self::V2(inner) => {
+                inner
+                    .quote_exact_input_for_pair(tokens, token_in, token_out, amount_in)
+                    .await
+            }
+            Self::V3(inner) => {
+                inner
+                    .quote_exact_input_for_pair(tokens, token_in, token_out, amount_in)
+                    .await
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct FlashbotsSwapper {
-    inner: UniswapV2Swapper,
+    inner: FlashbotsInner,
     relay: Arc<dyn BundleRelay>,
     flashbots: FlashbotsConfig,
 }
@@ -545,21 +1331,27 @@ impl FlashbotsSwapper {
         flashbots: FlashbotsConfig,
     ) -> Self {
         Self {
-            inner,
+            inner: FlashbotsInner::V2(inner),
             relay,
             flashbots,
         }
     }
-}
 
-#[async_trait]
-impl DexSwapper for FlashbotsSwapper {
-    #[instrument(level = "info", skip(self), fields(
-        token_in = %token_in, token_out = %token_out,
-        amount_in = %amount_in, min_out = %min_out, recipient = %recipient
-    ))]
-    async fn submit_swap(
+    pub fn new_v3(
+        inner: UniswapV3Swapper,
+        relay: Arc<dyn BundleRelay>,
+        flashbots: FlashbotsConfig,
+    ) -> Self {
+        Self {
+            inner: FlashbotsInner::V3(inner),
+            relay,
+            flashbots,
+        }
+    }
+
+    async fn submit_bundle_swap(
         &self,
+        tokens: Option<&PairTokens>,
         token_in: &Address,
         token_out: &Address,
         amount_in: U256,
@@ -570,34 +1362,13 @@ impl DexSwapper for FlashbotsSwapper {
             return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
         }
 
-        self.inner
-            .ensure_allowance(token_in, &self.inner.config.router, amount_in)
+        let signed = self
+            .inner
+            .build_signed_swap_tx(tokens, token_in, token_out, amount_in, min_out, recipient)
             .await?;
-
-        let deadline =
-            U256::from(current_unix_ts().saturating_add(self.inner.config.deadline_secs));
-        let path = vec![token_in.clone(), token_out.clone()];
-        let calldata = build_swap_calldata(amount_in, min_out, &path, recipient, deadline);
-
-        let builder = TransactionBuilder::new(self.inner.client.clone(), self.inner.wallet.clone())
-            .to(self.inner.config.router.clone())
-            .data(calldata)
-            .chain_id(self.inner.config.chain_id)
-            .with_gas_estimate(Some(self.inner.config.gas_buffer_bps))
-            .await
-            .map_err(|e| SwapperError::TxBuild(format!("bundle swap gas: {e}")))?
-            .with_gas_price(GasPriority::Medium)
-            .await
-            .map_err(|e| SwapperError::TxBuild(format!("bundle swap fee: {e}")))?;
-        reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.inner.config.max_gas_gwei)?;
-
-        let signed = builder
-            .build_and_sign_with_hash()
-            .await
-            .map_err(|e| SwapperError::TxBuild(format!("bundle swap sign: {e}")))?;
         let current_block = self
             .inner
-            .client
+            .client()
             .get_block_number()
             .await
             .map_err(|e| SwapperError::Chain(format!("bundle current block: {e}")))?;
@@ -612,9 +1383,7 @@ impl DexSwapper for FlashbotsSwapper {
                 txs: txs.clone(),
                 target_block,
                 min_timestamp: None,
-                max_timestamp: Some(
-                    current_unix_ts().saturating_add(self.inner.config.deadline_secs),
-                ),
+                max_timestamp: Some(current_unix_ts().saturating_add(self.inner.deadline_secs())),
             };
 
             let simulation_started = Instant::now();
@@ -657,6 +1426,7 @@ impl DexSwapper for FlashbotsSwapper {
 
         Ok(SwapSubmission {
             tx_hash,
+            nonce: signed.nonce,
             amount_in,
             token_out: token_out.clone(),
             recipient: recipient.clone(),
@@ -664,19 +1434,71 @@ impl DexSwapper for FlashbotsSwapper {
                 bundle_hash: submitted.bundle_hash,
                 target_block: submitted.target_block,
             }),
+            pool_kind: tokens.map(|t| t.pool_kind).unwrap_or(DexPoolKind::V2),
         })
+    }
+}
+
+#[async_trait]
+impl DexSwapper for FlashbotsSwapper {
+    #[instrument(level = "info", skip(self), fields(
+        token_in = %token_in, token_out = %token_out,
+        amount_in = %amount_in, min_out = %min_out, recipient = %recipient
+    ))]
+    async fn submit_swap(
+        &self,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        self.submit_bundle_swap(None, token_in, token_out, amount_in, min_out, recipient)
+            .await
+    }
+
+    async fn submit_swap_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        self.submit_bundle_swap(
+            Some(tokens),
+            token_in,
+            token_out,
+            amount_in,
+            min_out,
+            recipient,
+        )
+        .await
+    }
+
+    async fn quote_exact_input_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+    ) -> SwapperResult<Option<U256>> {
+        self.inner
+            .quote_exact_input_for_pair(tokens, token_in, token_out, amount_in)
+            .await
     }
 
     #[instrument(level = "info", skip(self, submission), fields(tx = %submission.tx_hash))]
     async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult> {
-        let Some(private_bundle) = submission.private_bundle.clone() else {
-            return self.inner.wait_swap(submission).await;
+        let Some(private_bundle) = submission.private_bundle.as_ref() else {
+            return self.inner.wait_public(submission).await;
         };
         let deadline = Instant::now() + Duration::from_secs(self.flashbots.inclusion_timeout_secs);
         let receipt = loop {
             if let Some(receipt) = self
                 .inner
-                .client
+                .client()
                 .get_receipt(&submission.tx_hash)
                 .await
                 .map_err(|e| SwapperError::Chain(format!("bundle receipt: {e}")))?
@@ -685,7 +1507,7 @@ impl DexSwapper for FlashbotsSwapper {
             }
             let current_block = self
                 .inner
-                .client
+                .client()
                 .get_block_number()
                 .await
                 .map_err(|e| SwapperError::Chain(format!("bundle current block: {e}")))?;
@@ -737,6 +1559,255 @@ impl DexSwapper for FlashbotsSwapper {
             success: true,
         })
     }
+
+    async fn cancel_pending_swap(
+        &self,
+        _submission: &SwapSubmission,
+    ) -> SwapperResult<PendingSwapCancelOutcome> {
+        Ok(PendingSwapCancelOutcome::Unknown(
+            "private bundle cancellation is not supported".into(),
+        ))
+    }
+}
+
+#[derive(Clone)]
+pub struct CompositeDexSwapper {
+    v2: Arc<dyn DexSwapper>,
+    v3: Arc<dyn DexSwapper>,
+}
+
+impl std::fmt::Debug for CompositeDexSwapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositeDexSwapper").finish()
+    }
+}
+
+impl CompositeDexSwapper {
+    pub fn new(v2: Arc<dyn DexSwapper>, v3: Arc<dyn DexSwapper>) -> Self {
+        Self { v2, v3 }
+    }
+
+    fn inner_for_kind(&self, kind: DexPoolKind) -> &Arc<dyn DexSwapper> {
+        match kind {
+            DexPoolKind::V2 => &self.v2,
+            DexPoolKind::V3 => &self.v3,
+        }
+    }
+}
+
+#[async_trait]
+impl DexSwapper for CompositeDexSwapper {
+    async fn submit_swap(
+        &self,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        self.v2
+            .submit_swap(token_in, token_out, amount_in, min_out, recipient)
+            .await
+    }
+
+    async fn submit_swap_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        self.inner_for_kind(tokens.pool_kind)
+            .submit_swap_for_pair(tokens, token_in, token_out, amount_in, min_out, recipient)
+            .await
+    }
+
+    async fn quote_exact_input_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+    ) -> SwapperResult<Option<U256>> {
+        self.inner_for_kind(tokens.pool_kind)
+            .quote_exact_input_for_pair(tokens, token_in, token_out, amount_in)
+            .await
+    }
+
+    async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult> {
+        self.inner_for_kind(submission.pool_kind)
+            .wait_swap(submission)
+            .await
+    }
+
+    async fn cancel_pending_swap(
+        &self,
+        submission: &SwapSubmission,
+    ) -> SwapperResult<PendingSwapCancelOutcome> {
+        self.inner_for_kind(submission.pool_kind)
+            .cancel_pending_swap(submission)
+            .await
+    }
+}
+
+#[async_trait]
+impl DexSwapper for UniswapV3Swapper {
+    async fn submit_swap(
+        &self,
+        _token_in: &Address,
+        _token_out: &Address,
+        _amount_in: U256,
+        _min_out: U256,
+        _recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        Err(SwapperError::TxBuild(
+            "UniswapV3Swapper requires submit_swap_for_pair so fee tier is available".into(),
+        ))
+    }
+
+    #[instrument(level = "info", skip(self, tokens), fields(
+        token_in = %token_in, token_out = %token_out,
+        amount_in = %amount_in, min_out = %min_out, recipient = %recipient
+    ))]
+    async fn submit_swap_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+        min_out: U256,
+        recipient: &Address,
+    ) -> SwapperResult<SwapSubmission> {
+        if min_out.is_zero() {
+            return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
+        }
+        self.ensure_allowance(token_in, &self.config.router, amount_in)
+            .await?;
+        let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));
+        let calldata = v3_swap_calldata_for_pair(
+            tokens, token_in, token_out, recipient, deadline, amount_in, min_out,
+        )?;
+        let builder = TransactionBuilder::new(self.client.clone(), self.wallet.clone())
+            .to(self.config.router.clone())
+            .data(calldata)
+            .chain_id(self.config.chain_id)
+            .with_gas_estimate(Some(self.config.gas_buffer_bps))
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("v3 swap gas: {e}")))?
+            .with_gas_price(GasPriority::Medium)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("v3 swap fee: {e}")))?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
+        let signed = match builder.build_and_sign_with_hash().await {
+            Ok(signed) => signed,
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                return Err(SwapperError::TxBuild(format!("v3 swap sign: {e}")));
+            }
+        };
+        let tx_hash = self
+            .client
+            .send_transaction(&signed.raw)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("v3 swap send: {e}")))?;
+        Ok(SwapSubmission {
+            tx_hash,
+            nonce: signed.nonce,
+            amount_in,
+            token_out: token_out.clone(),
+            recipient: recipient.clone(),
+            private_bundle: None,
+            pool_kind: DexPoolKind::V3,
+        })
+    }
+
+    async fn quote_exact_input_for_pair(
+        &self,
+        tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+    ) -> SwapperResult<Option<U256>> {
+        let quoter = tokens
+            .v3_quoter
+            .as_ref()
+            .ok_or_else(|| SwapperError::Quote("missing V3 quoter in address book".into()))?;
+        let (path, fees) = v3_route_for_pair(tokens, token_in, token_out)?;
+        let calldata = if path.len() == 2 && fees.len() == 1 {
+            build_v3_quoter_exact_input_single_calldata(token_in, token_out, fees[0], amount_in)
+        } else {
+            build_v3_quoter_exact_input_calldata(&path, &fees, amount_in)
+                .map_err(SwapperError::Quote)?
+        };
+        let call = TransactionRequest {
+            to: quoter.clone(),
+            value: TokenAmount::eth(0),
+            data: calldata.into(),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id: self.config.chain_id,
+        };
+        let raw = self
+            .client
+            .call(&call, BlockId::Latest)
+            .await
+            .map_err(|e| SwapperError::Quote(format!("V3 quoter call: {e}")))?;
+        decode_uint256_return(&raw)
+            .map(Some)
+            .map_err(SwapperError::Quote)
+    }
+
+    #[instrument(level = "info", skip(self, submission), fields(tx = %submission.tx_hash))]
+    async fn wait_swap(&self, submission: SwapSubmission) -> SwapperResult<SwapResult> {
+        let receipt = self
+            .client
+            .wait_for_receipt(&submission.tx_hash, self.config.receipt_timeout_secs, 1.0)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("v3 swap receipt: {e}")))?;
+        if !receipt.status {
+            return Err(SwapperError::Reverted(receipt.tx_hash));
+        }
+        let amount_out =
+            sum_transfer_to(&receipt.logs, &submission.token_out, &submission.recipient);
+        if amount_out.is_zero() {
+            warn!(
+                tx = %receipt.tx_hash,
+                "DEX V3 swap mined but no matching Transfer(token_out -> recipient) log; treating as revert"
+            );
+            return Err(SwapperError::Reverted(receipt.tx_hash));
+        }
+        Ok(SwapResult {
+            tx_hash: receipt.tx_hash,
+            amount_in: submission.amount_in,
+            amount_out,
+            gas_used: receipt.gas_used,
+            success: true,
+        })
+    }
+
+    async fn cancel_pending_swap(
+        &self,
+        submission: &SwapSubmission,
+    ) -> SwapperResult<PendingSwapCancelOutcome> {
+        cancel_pending_public_swap(
+            &self.client,
+            &self.wallet,
+            &self.config,
+            self.owner()?,
+            submission,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -777,20 +1848,65 @@ impl DexSwapper for UniswapV2Swapper {
             .with_gas_price(GasPriority::Medium)
             .await
             .map_err(|e| SwapperError::TxBuild(format!("swap fee: {e}")))?;
-        reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
 
-        let tx_hash = builder
-            .send()
+        let signed = match builder.build_and_sign_with_hash().await {
+            Ok(signed) => signed,
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                return Err(SwapperError::TxBuild(format!("swap sign: {e}")));
+            }
+        };
+        let tx_hash = self
+            .client
+            .send_transaction(&signed.raw)
             .await
             .map_err(|e| SwapperError::Chain(format!("swap send: {e}")))?;
 
         Ok(SwapSubmission {
             tx_hash,
+            nonce: signed.nonce,
             amount_in,
             token_out: token_out.clone(),
             recipient: recipient.clone(),
             private_bundle: None,
+            pool_kind: DexPoolKind::V2,
         })
+    }
+
+    async fn quote_exact_input_for_pair(
+        &self,
+        _tokens: &PairTokens,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: U256,
+    ) -> SwapperResult<Option<U256>> {
+        let path = vec![token_in.clone(), token_out.clone()];
+        let calldata = build_get_amounts_out_calldata(amount_in, &path);
+        let call = TransactionRequest {
+            to: self.config.router.clone(),
+            value: TokenAmount::eth(0),
+            data: calldata.into(),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id: self.config.chain_id,
+        };
+        let raw = self
+            .client
+            .call(&call, BlockId::Latest)
+            .await
+            .map_err(|e| SwapperError::Quote(format!("V2 getAmountsOut call: {e}")))?;
+        decode_get_amounts_out_return(&raw)
+            .map(Some)
+            .map_err(SwapperError::Quote)
     }
 
     #[instrument(level = "info", skip(self, submission), fields(tx = %submission.tx_hash))]
@@ -827,6 +1943,20 @@ impl DexSwapper for UniswapV2Swapper {
             gas_used: receipt.gas_used,
             success: true,
         })
+    }
+
+    async fn cancel_pending_swap(
+        &self,
+        submission: &SwapSubmission,
+    ) -> SwapperResult<PendingSwapCancelOutcome> {
+        cancel_pending_public_swap(
+            &self.client,
+            &self.wallet,
+            &self.config,
+            self.owner()?,
+            submission,
+        )
+        .await
     }
 }
 
@@ -871,7 +2001,27 @@ fn reject_if_gas_cap_exceeded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::{BundleResult, BundleSubmission};
+    use async_trait::async_trait;
     use serde_json::json;
+
+    #[derive(Debug)]
+    struct NoopRelay;
+
+    #[async_trait]
+    impl BundleRelay for NoopRelay {
+        async fn simulate_bundle(&self, _request: &BundleRequest) -> BundleResult<()> {
+            Ok(())
+        }
+
+        async fn send_bundle(&self, request: &BundleRequest) -> BundleResult<BundleSubmission> {
+            Ok(BundleSubmission {
+                bundle_hash: "0xbundle".into(),
+                tx_hashes: request.txs.iter().map(|tx| tx.tx_hash.clone()).collect(),
+                target_block: request.target_block,
+            })
+        }
+    }
 
     fn addr(h: &str) -> Address {
         Address::new(h).unwrap()
@@ -896,6 +2046,44 @@ mod tests {
         // 4 selector + 5 head words (amountIn, amountOutMin, path offset, to,
         // deadline) + 1 length word + 2 path elements = 4 + 32 * 8.
         assert_eq!(data.len(), 4 + 32 * 8);
+    }
+
+    #[test]
+    fn v3_exact_input_single_calldata_starts_with_selector() {
+        let data = build_v3_exact_input_single_calldata(
+            &addr(WETH),
+            &addr(USDC),
+            500,
+            &addr(RECIPIENT),
+            U256::from(9_999_999u64),
+            U256::from(1_000_000u64),
+            U256::from(900_000u64),
+        );
+        assert_eq!(&data[..4], &V3_EXACT_INPUT_SINGLE_SELECTOR);
+        assert_eq!(data.len(), 4 + 32 * 8);
+    }
+
+    #[test]
+    fn v3_path_encoding_interleaves_tokens_and_uint24_fees() {
+        let path = vec![addr(WETH), addr(USDC), addr(RECIPIENT)];
+        let encoded = encode_v3_path(&path, &[500, 3000]).unwrap();
+        assert_eq!(encoded.len(), 20 + 3 + 20 + 3 + 20);
+        assert_eq!(&encoded[20..23], &[0x00, 0x01, 0xf4]);
+        assert_eq!(&encoded[43..46], &[0x00, 0x0b, 0xb8]);
+    }
+
+    #[test]
+    fn v3_exact_input_calldata_starts_with_selector() {
+        let data = build_v3_exact_input_calldata(
+            &[addr(WETH), addr(USDC), addr(RECIPIENT)],
+            &[500, 3000],
+            &addr(RECIPIENT),
+            U256::from(9_999_999u64),
+            U256::from(1_000_000u64),
+            U256::from(900_000u64),
+        )
+        .unwrap();
+        assert_eq!(&data[..4], &V3_EXACT_INPUT_SELECTOR);
     }
 
     #[test]
@@ -981,6 +2169,42 @@ mod tests {
             inclusion_timeout_secs: 30,
         };
         assert_eq!(bundle_target_blocks(100, &config), vec![101]);
+    }
+
+    #[tokio::test]
+    async fn v3_flashbots_requires_pair_metadata() {
+        unsafe {
+            std::env::set_var(
+                "DEX_SWAPPER_TEST_PRIVATE_KEY",
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            );
+        }
+        let client = ChainClient::new(vec!["http://127.0.0.1:8545".into()], 1, 0).unwrap();
+        let wallet = WalletManager::from_env("DEX_SWAPPER_TEST_PRIVATE_KEY").unwrap();
+        let inner = UniswapV3Swapper::new(client, wallet, DexSwapperConfig::default());
+        let swapper = FlashbotsSwapper::new_v3(
+            inner,
+            Arc::new(NoopRelay),
+            FlashbotsConfig {
+                relay_url: "http://relay.test".into(),
+                ..FlashbotsConfig::default()
+            },
+        );
+
+        let err = swapper
+            .submit_swap(
+                &addr(WETH),
+                &addr(USDC),
+                U256::from(1_000_000u64),
+                U256::from(900_000u64),
+                &addr(RECIPIENT),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Uniswap V3 Flashbots swap requires submit_swap_for_pair")
+        );
     }
 
     // ---- Log parsing ---------------------------------------------------
@@ -1073,6 +2297,11 @@ mod tests {
                 base_decimals: 18,
                 quote: addr(USDC),
                 quote_decimals: 6,
+                pool_kind: DexPoolKind::V2,
+                v3_fee: None,
+                v3_path: None,
+                v3_fees: None,
+                v3_quoter: None,
             },
         );
         let got = book.get("ETH/USDC").expect("present");

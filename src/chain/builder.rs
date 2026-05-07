@@ -21,6 +21,7 @@ pub struct SignedTransaction {
     pub raw: Vec<u8>,
     pub raw_hex: String,
     pub tx_hash: String,
+    pub nonce: Option<u64>,
 }
 
 /// A fluent builder for creating and sending Ethereum transactions.
@@ -160,12 +161,19 @@ impl TransactionBuilder {
     }
 
     pub async fn build_and_sign_with_hash(self) -> ChainResult<SignedTransaction> {
-        let raw = self.build_and_sign().await?;
+        let wallet = self.wallet.clone();
+        let request = self.build().await?;
+        let nonce = request.nonce;
+        let raw = wallet
+            .sign_transaction_bytes(&request)
+            .await
+            .map_err(|e| ChainError::SignTransactionFailed(e.to_string()))?;
         let hash = ethers::utils::keccak256(&raw);
         Ok(SignedTransaction {
             raw_hex: format!("0x{}", hex::encode(&raw)),
             tx_hash: format!("0x{}", hex::encode(hash)),
             raw,
+            nonce,
         })
     }
 

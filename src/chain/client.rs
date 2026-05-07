@@ -185,6 +185,22 @@ impl ChainClient {
         .map(|gas| gas.as_u64())
     }
 
+    pub async fn estimate_gas_from(
+        &self,
+        tx: &TransactionRequest,
+        from: &Address,
+    ) -> ChainResult<u64> {
+        let mut request = tx.to_ethers_typed();
+        request.set_from(from.as_eth_address());
+        let request = Arc::new(request);
+        self.with_provider(|provider| {
+            let request = Arc::clone(&request);
+            async move { provider.estimate_gas(&request, None).await }
+        })
+        .await
+        .map(|gas| gas.as_u64())
+    }
+
     /// Sends a raw signed transaction to the network.
     #[instrument(skip(self, signed_tx))]
     pub async fn send_transaction(&self, signed_tx: &[u8]) -> ChainResult<String> {

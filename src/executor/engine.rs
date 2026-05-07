@@ -6,12 +6,14 @@
 //! - **DEX-first** (when `use_flashbots = true`): DEX bundle fails at zero
 //!   cost, so we can try it first and only touch CEX after confirmation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -24,7 +26,7 @@ use crate::executor::dex_swapper::{self, DexSwapper, DexSwapperConfig, PairAddre
 use crate::executor::errors::ExecutorResult;
 use crate::executor::reconcile::{PendingReconcile, ReconcileStore};
 use crate::executor::recovery::{CircuitBreaker, ReplayProtection};
-use crate::observability::metrics_handle;
+use crate::observability::{emit_event, metrics_handle};
 use crate::strategy::fees::FeeStructure;
 use crate::strategy::signal::{Direction, Signal};
 use rust_decimal::prelude::ToPrimitive;
@@ -247,6 +249,13 @@ impl ExecutionContext {
 /// submission path.
 pub type HandleSink = Arc<std::sync::OnceLock<String>>;
 
+fn dex_pool_kind_label(pool_kind: dex_swapper::DexPoolKind) -> &'static str {
+    match pool_kind {
+        dex_swapper::DexPoolKind::V2 => "v2",
+        dex_swapper::DexPoolKind::V3 => "v3",
+    }
+}
+
 /// Outcome of [`LegExecutor::cancel_cex`]. Richer than a plain `Result`
 /// because a cancel can race with a fill (the "race-on-cancel" case) —
 /// callers need to branch on the outcome to decide whether to proceed to
@@ -315,6 +324,15 @@ pub trait LegExecutor: Send + Sync {
     /// where auto-cancel happens server-side).
     async fn cancel_cex(&self, _handle: &str) -> ExecutorResult<CancelOutcome> {
         Ok(CancelOutcome::Cancelled)
+    }
+
+    async fn cancel_dex(
+        &self,
+        _handle: &str,
+    ) -> ExecutorResult<dex_swapper::PendingSwapCancelOutcome> {
+        Ok(dex_swapper::PendingSwapCancelOutcome::Unknown(
+            "DEX cancellation is not supported by this executor".into(),
+        ))
     }
 
     /// Market-flattens a stuck leg-1 position after a leg-2 failure.
@@ -540,6 +558,7 @@ pub struct LiveLegs {
     dex: Option<Arc<dyn DexSwapper>>,
     address_book: Option<Arc<PairAddressBook>>,
     dex_config: DexSwapperConfig,
+    pending_dex_submissions: Arc<Mutex<HashMap<String, dex_swapper::SwapSubmission>>>,
     /// Address that receives DEX output tokens (typically the wallet owner).
     recipient: Option<Address>,
 }
@@ -552,6 +571,7 @@ impl LiveLegs {
             dex: None,
             address_book: None,
             dex_config: DexSwapperConfig::default(),
+            pending_dex_submissions: Arc::new(Mutex::new(HashMap::new())),
             recipient: None,
         }
     }
@@ -570,6 +590,51 @@ impl LiveLegs {
         self.dex_config = dex_config;
         self.recipient = Some(recipient);
         self
+    }
+
+    async fn unwind_dex(&self, ctx: &ExecutionContext) -> ExecutorResult<()> {
+        let Some(filled) = ctx.leg1_fill_size else {
+            return Ok(());
+        };
+        if filled <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        let mut reverse_signal = ctx.signal.clone();
+        reverse_signal.direction = match ctx.signal.direction {
+            Direction::BuyCexSellDex => Direction::BuyDexSellCex,
+            Direction::BuyDexSellCex => Direction::BuyCexSellDex,
+        };
+
+        match self
+            .execute_dex_inner(&reverse_signal, filled, None)
+            .await?
+        {
+            LegFill {
+                outcome: LegOutcome::Accepted,
+                filled: reverse_filled,
+                ..
+            } if self.meets_unwind_fill(reverse_filled, filled) => Ok(()),
+            LegFill {
+                outcome,
+                filled: reverse_filled,
+                error,
+                ..
+            } => Err(crate::executor::errors::ExecutorError::InvalidSignal(
+                format!(
+                    "DEX unwind did not fully fill: outcome={outcome:?}, filled={reverse_filled}, requested={filled}, error={}",
+                    error.unwrap_or_default()
+                ),
+            )),
+        }
+    }
+
+    fn meets_unwind_fill(&self, filled: Decimal, requested: Decimal) -> bool {
+        if requested <= Decimal::ZERO {
+            return false;
+        }
+        let allowed_bps = BPS_SCALE.saturating_sub(self.dex_config.slippage_bps);
+        filled >= requested * Decimal::from(allowed_bps) / Decimal::from(BPS_SCALE)
     }
 
     async fn execute_dex_inner(
@@ -632,8 +697,35 @@ impl LiveLegs {
 
         let min_out = dex_swapper::apply_slippage(expected_out, self.dex_config.slippage_bps);
 
+        match dex
+            .quote_exact_input_for_pair(tokens, token_in, token_out, amount_in)
+            .await
+        {
+            Ok(Some(fresh_out)) if fresh_out < min_out => {
+                return Ok(LegFill {
+                    outcome: LegOutcome::Rejected,
+                    price: Decimal::ZERO,
+                    filled: Decimal::ZERO,
+                    handle: None,
+                    error: Some(format!(
+                        "DEX preflight quote below min_out: fresh_out={fresh_out}, min_out={min_out}"
+                    )),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Ok(LegFill {
+                    outcome: LegOutcome::Rejected,
+                    price: Decimal::ZERO,
+                    filled: Decimal::ZERO,
+                    handle: None,
+                    error: Some(format!("DEX preflight quote failed: {e}")),
+                });
+            }
+        }
+
         let submission = match dex
-            .submit_swap(token_in, token_out, amount_in, min_out, recipient)
+            .submit_swap_for_pair(tokens, token_in, token_out, amount_in, min_out, recipient)
             .await
         {
             Ok(submission) => submission,
@@ -657,11 +749,22 @@ impl LiveLegs {
             }
         };
 
+        let submission_tx_hash = submission.tx_hash.clone();
+        self.pending_dex_submissions
+            .lock()
+            .await
+            .insert(submission_tx_hash.clone(), submission.clone());
         if let Some(sink) = sink {
-            let _ = sink.set(submission.tx_hash.clone());
+            let _ = sink.set(submission_tx_hash.clone());
         }
 
-        match dex.wait_swap(submission).await {
+        let wait_result = dex.wait_swap(submission).await;
+        self.pending_dex_submissions
+            .lock()
+            .await
+            .remove(&submission_tx_hash);
+
+        match wait_result {
             Ok(result) => {
                 let filled = u256_to_decimal_scaled(result.amount_out, decimals_out);
                 let price = if matches!(signal.direction, Direction::BuyCexSellDex) {
@@ -765,12 +868,50 @@ impl LegExecutor for LiveLegs {
         self.execute_dex_inner(signal, size, Some(sink)).await
     }
 
+    async fn cancel_dex(
+        &self,
+        handle: &str,
+    ) -> ExecutorResult<dex_swapper::PendingSwapCancelOutcome> {
+        let Some(ref dex) = self.dex else {
+            return Ok(dex_swapper::PendingSwapCancelOutcome::Unknown(
+                "LiveLegs: DEX swapper not configured".into(),
+            ));
+        };
+        let submission = self.pending_dex_submissions.lock().await.remove(handle);
+        let Some(submission) = submission else {
+            return Ok(dex_swapper::PendingSwapCancelOutcome::Unknown(
+                "no pending DEX submission metadata for handle".into(),
+            ));
+        };
+        let metrics = metrics_handle();
+        metrics.record_dex_pending_timeout(
+            dex_pool_kind_label(submission.pool_kind),
+            submission.private_bundle.is_some(),
+        );
+        metrics.record_dex_cancel_attempt(if submission.private_bundle.is_some() {
+            "private"
+        } else {
+            "public"
+        });
+        emit_event(
+            "dex_pending_timeout",
+            json!({
+                "tx_hash": submission.tx_hash,
+                "nonce": submission.nonce,
+                "pool_kind": dex_pool_kind_label(submission.pool_kind),
+                "private": submission.private_bundle.is_some(),
+            }),
+        );
+        dex.cancel_pending_swap(&submission)
+            .await
+            .map_err(|e| crate::executor::errors::ExecutorError::InvalidSignal(e.to_string()))
+    }
+
     async fn unwind(&self, ctx: &ExecutionContext) -> ExecutorResult<()> {
-        // Unwind flattens the leg-1 exposure by trading it out on the SAME
-        // venue we opened it on. We only need this path when leg1 was the
-        // CEX leg (DEX-first is bundled via Flashbots and never partial).
+        if ctx.leg1_venue == "dex" {
+            return self.unwind_dex(ctx).await;
+        }
         if ctx.leg1_venue != "cex" {
-            // DEX-first: nothing to unwind (bundle didn't land atomically).
             return Ok(());
         }
         let Some(filled) = ctx.leg1_fill_size else {
@@ -976,6 +1117,7 @@ impl Executor {
             return;
         };
         let Some(tx_hash) = ctx.leg2_handle.as_ref() else {
+            metrics_handle().record_reconcile_entry("missing_tx_hash");
             // No on-chain handle captured — nothing the reconciler can
             // poll. See the `leg2_timeout` docs for the follow-up on
             // two-phase swap submission needed to capture this reliably.
@@ -986,6 +1128,7 @@ impl Executor {
             return;
         };
         let Some(leg1_size) = ctx.leg1_fill_size else {
+            metrics_handle().record_reconcile_entry("missing_leg1_fill");
             return;
         };
         let entry = PendingReconcile {
@@ -1005,12 +1148,31 @@ impl Executor {
         let signal_id_log = entry.signal_id.clone();
         let tx_hash_log = entry.tx_hash.clone();
         if let Err(e) = store.add_async(entry).await {
+            metrics_handle().record_reconcile_entry("push_failed");
+            emit_event(
+                "reconcile_enqueue_failed",
+                json!({
+                    "signal_id": signal_id_log,
+                    "tx_hash": tx_hash_log,
+                    "reason": "push_failed",
+                    "error": e.to_string(),
+                }),
+            );
             tracing::error!(
                 signal = %signal_id_log,
                 error = %e,
                 "reconcile store push failed"
             );
         } else {
+            metrics_handle().record_reconcile_entry("leg2_timeout");
+            emit_event(
+                "reconcile_enqueued",
+                json!({
+                    "signal_id": signal_id_log,
+                    "tx_hash": tx_hash_log,
+                    "reason": "leg2_timeout",
+                }),
+            );
             info!(
                 signal = %signal_id_log,
                 tx = %tx_hash_log,
@@ -1312,8 +1474,114 @@ impl Executor {
             }
             Err(_) => {
                 ctx.leg2_handle = leg2_handle_sink.get().cloned();
-                // CRITICAL: DO NOT auto-unwind. Transaction may still land
-                // on-chain and create double exposure if we flatten now.
+                metrics_handle().record_leg_outcome("dex", "leg2", "timeout");
+                if ctx.leg2_handle.is_none() {
+                    metrics_handle().record_dex_pending_timeout("unknown", false);
+                }
+                if let Some(handle) = ctx.leg2_handle.clone() {
+                    match self.legs.cancel_dex(&handle).await {
+                        Ok(dex_swapper::PendingSwapCancelOutcome::Cancelled { cancel_tx_hash }) => {
+                            metrics_handle().record_dex_cancel_outcome("cancelled");
+                            emit_event(
+                                "dex_cancel_outcome",
+                                json!({
+                                    "signal_id": ctx.signal.signal_id,
+                                    "tx_hash": handle,
+                                    "outcome": "cancelled",
+                                    "cancel_tx_hash": cancel_tx_hash,
+                                }),
+                            );
+                            tracing::warn!(
+                                signal = %ctx.signal.signal_id,
+                                tx = %handle,
+                                cancel_tx = %cancel_tx_hash,
+                                "DEX leg2 timeout cancelled by same-nonce replacement; unwinding leg1"
+                            );
+                            ctx.state = ExecutorState::Unwinding;
+                            let unwind_status = self.log_unwind(&ctx).await;
+                            return ctx.fail(format!(
+                                "DEX leg2 timeout cancelled by replacement {cancel_tx_hash} - {unwind_status}"
+                            ));
+                        }
+                        Ok(dex_swapper::PendingSwapCancelOutcome::OriginalMined {
+                            tx_hash,
+                            success,
+                        }) => {
+                            if success {
+                                metrics_handle()
+                                    .record_dex_cancel_outcome("original_mined_success");
+                                emit_event(
+                                    "dex_cancel_outcome",
+                                    json!({
+                                        "signal_id": ctx.signal.signal_id,
+                                        "tx_hash": tx_hash,
+                                        "outcome": "original_mined_success",
+                                    }),
+                                );
+                                tracing::warn!(
+                                    signal = %ctx.signal.signal_id,
+                                    tx = %tx_hash,
+                                    "DEX leg2 timeout resolved: original tx mined before cancellation"
+                                );
+                                let timed_out = ctx.leg2_timeout(
+                                    "DEX leg2 timeout but original tx mined during cancel attempt; reconcile fill manually",
+                                );
+                                self.maybe_push_reconcile(&timed_out).await;
+                                return timed_out;
+                            }
+                            metrics_handle().record_dex_cancel_outcome("original_mined_reverted");
+                            emit_event(
+                                "dex_cancel_outcome",
+                                json!({
+                                    "signal_id": ctx.signal.signal_id,
+                                    "tx_hash": tx_hash,
+                                    "outcome": "original_mined_reverted",
+                                }),
+                            );
+                            ctx.state = ExecutorState::Unwinding;
+                            let unwind_status = self.log_unwind(&ctx).await;
+                            return ctx.leg2_reverted(format!(
+                                "DEX tx reverted during timeout cancel check - {unwind_status}"
+                            ));
+                        }
+                        Ok(dex_swapper::PendingSwapCancelOutcome::Unknown(reason)) => {
+                            metrics_handle().record_dex_cancel_outcome("unknown");
+                            emit_event(
+                                "dex_cancel_outcome",
+                                json!({
+                                    "signal_id": ctx.signal.signal_id,
+                                    "tx_hash": handle,
+                                    "outcome": "unknown",
+                                    "reason": reason,
+                                }),
+                            );
+                            tracing::warn!(
+                                signal = %ctx.signal.signal_id,
+                                tx = %handle,
+                                reason = %reason,
+                                "DEX leg2 timeout cancellation inconclusive"
+                            );
+                        }
+                        Err(e) => {
+                            metrics_handle().record_dex_cancel_outcome("error");
+                            emit_event(
+                                "dex_cancel_outcome",
+                                json!({
+                                    "signal_id": ctx.signal.signal_id,
+                                    "tx_hash": handle,
+                                    "outcome": "error",
+                                    "error": e.to_string(),
+                                }),
+                            );
+                            tracing::error!(
+                                signal = %ctx.signal.signal_id,
+                                tx = %handle,
+                                error = %e,
+                                "DEX leg2 timeout cancellation failed"
+                            );
+                        }
+                    }
+                }
                 tracing::error!(
                     signal = %ctx.signal.signal_id,
                     leg1_handle = ?ctx.leg1_handle,
@@ -1322,13 +1590,6 @@ impl Executor {
                 );
                 let timed_out = ctx
                     .leg2_timeout("DEX leg2 timeout; tx may still land, manual reconcile required");
-                // Push into the reconcile store when configured. Note: a
-                // tx_hash is only present if the swap path captured it
-                // before the outer timeout fired — today that requires the
-                // caller to have split the swap into `submit + wait`
-                // phases (follow-up to `DexSwapper::swap`). Entries
-                // without a tx_hash are logged and skipped — see
-                // `maybe_push_reconcile`.
                 self.maybe_push_reconcile(&timed_out).await;
                 timed_out
             }
@@ -1980,6 +2241,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leg2_timeout_cancelled_replacement_unwinds_leg1() {
+        #[derive(Debug)]
+        struct CancelledDexTimeoutLegs {
+            unwinds: Arc<Mutex<u32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LegExecutor for CancelledDexTimeoutLegs {
+            async fn execute_cex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
+                Ok(LegFill {
+                    outcome: LegOutcome::Accepted,
+                    price: signal.cex_price,
+                    filled: size,
+                    handle: Some("cex-order-1".into()),
+                    error: None,
+                })
+            }
+
+            async fn execute_dex(
+                &self,
+                _signal: &Signal,
+                _size: Decimal,
+            ) -> ExecutorResult<LegFill> {
+                unreachable!("executor should use execute_dex_tracked for cex-first leg2")
+            }
+
+            async fn execute_dex_tracked(
+                &self,
+                _signal: &Signal,
+                _size: Decimal,
+                sink: HandleSink,
+            ) -> ExecutorResult<LegFill> {
+                let _ = sink.set("0xtimeout".into());
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                unreachable!("outer timeout should fire first")
+            }
+
+            async fn cancel_dex(
+                &self,
+                handle: &str,
+            ) -> ExecutorResult<dex_swapper::PendingSwapCancelOutcome> {
+                assert_eq!(handle, "0xtimeout");
+                Ok(dex_swapper::PendingSwapCancelOutcome::Cancelled {
+                    cancel_tx_hash: "0xcancel".into(),
+                })
+            }
+
+            async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
+                *self.unwinds.lock().await += 1;
+                Ok(())
+            }
+        }
+
+        let unwinds = Arc::new(Mutex::new(0));
+        let cfg = ExecutorConfig {
+            use_flashbots: false,
+            leg1_timeout: Duration::from_millis(200),
+            leg2_timeout: Duration::from_millis(20),
+            ..ExecutorConfig::default()
+        };
+        let ex = Executor::new(
+            Arc::new(CancelledDexTimeoutLegs {
+                unwinds: Arc::clone(&unwinds),
+            }),
+            cfg,
+        );
+
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::Failed);
+        assert_eq!(ctx.leg2_handle.as_deref(), Some("0xtimeout"));
+        assert!(ctx.error.as_deref().unwrap_or("").contains("0xcancel"));
+        assert_eq!(*unwinds.lock().await, 1);
+    }
+
+    #[derive(Debug)]
+    struct TimeoutCancelBranchLegs {
+        outcome: dex_swapper::PendingSwapCancelOutcome,
+        unwinds: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LegExecutor for TimeoutCancelBranchLegs {
+        async fn execute_cex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
+            Ok(LegFill {
+                outcome: LegOutcome::Accepted,
+                price: signal.cex_price,
+                filled: size,
+                handle: Some("cex-order-1".into()),
+                error: None,
+            })
+        }
+
+        async fn execute_dex(&self, _signal: &Signal, _size: Decimal) -> ExecutorResult<LegFill> {
+            unreachable!("executor should use execute_dex_tracked for cex-first leg2")
+        }
+
+        async fn execute_dex_tracked(
+            &self,
+            _signal: &Signal,
+            _size: Decimal,
+            sink: HandleSink,
+        ) -> ExecutorResult<LegFill> {
+            let _ = sink.set("0xtimeout-branch".into());
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            unreachable!("outer timeout should fire first")
+        }
+
+        async fn cancel_dex(
+            &self,
+            handle: &str,
+        ) -> ExecutorResult<dex_swapper::PendingSwapCancelOutcome> {
+            assert_eq!(handle, "0xtimeout-branch");
+            Ok(self.outcome.clone())
+        }
+
+        async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
+            *self.unwinds.lock().await += 1;
+            Ok(())
+        }
+    }
+
+    fn timeout_cancel_branch_config() -> ExecutorConfig {
+        ExecutorConfig {
+            use_flashbots: false,
+            leg1_timeout: Duration::from_millis(200),
+            leg2_timeout: Duration::from_millis(20),
+            ..ExecutorConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn leg2_timeout_original_mined_success_pushes_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::executor::reconcile::ReconcileStore::open(dir.path().join("r.db")).unwrap(),
+        );
+        let unwinds = Arc::new(Mutex::new(0));
+        let ex = Executor::new(
+            Arc::new(TimeoutCancelBranchLegs {
+                outcome: dex_swapper::PendingSwapCancelOutcome::OriginalMined {
+                    tx_hash: "0xoriginal".into(),
+                    success: true,
+                },
+                unwinds: Arc::clone(&unwinds),
+            }),
+            timeout_cancel_branch_config(),
+        )
+        .with_reconcile_store(Arc::clone(&store));
+
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::Leg2Timeout);
+        assert_eq!(ctx.leg2_handle.as_deref(), Some("0xtimeout-branch"));
+        assert!(
+            ctx.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("original tx mined")
+        );
+        assert_eq!(*unwinds.lock().await, 0);
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tx_hash, "0xtimeout-branch");
+    }
+
+    #[tokio::test]
+    async fn leg2_timeout_original_mined_reverted_unwinds_leg1() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::executor::reconcile::ReconcileStore::open(dir.path().join("r.db")).unwrap(),
+        );
+        let unwinds = Arc::new(Mutex::new(0));
+        let ex = Executor::new(
+            Arc::new(TimeoutCancelBranchLegs {
+                outcome: dex_swapper::PendingSwapCancelOutcome::OriginalMined {
+                    tx_hash: "0xoriginal".into(),
+                    success: false,
+                },
+                unwinds: Arc::clone(&unwinds),
+            }),
+            timeout_cancel_branch_config(),
+        )
+        .with_reconcile_store(Arc::clone(&store));
+
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::Leg2Reverted);
+        assert_eq!(ctx.leg2_handle.as_deref(), Some("0xtimeout-branch"));
+        assert!(ctx.error.as_deref().unwrap_or("").contains("reverted"));
+        assert_eq!(*unwinds.lock().await, 1);
+        assert!(store.list_pending().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leg2_timeout_cancel_unknown_preserves_reconcile_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::executor::reconcile::ReconcileStore::open(dir.path().join("r.db")).unwrap(),
+        );
+        let unwinds = Arc::new(Mutex::new(0));
+        let ex = Executor::new(
+            Arc::new(TimeoutCancelBranchLegs {
+                outcome: dex_swapper::PendingSwapCancelOutcome::Unknown("no nonce".into()),
+                unwinds: Arc::clone(&unwinds),
+            }),
+            timeout_cancel_branch_config(),
+        )
+        .with_reconcile_store(Arc::clone(&store));
+
+        let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
+        assert_eq!(ctx.state, ExecutorState::Leg2Timeout);
+        assert_eq!(ctx.leg2_handle.as_deref(), Some("0xtimeout-branch"));
+        assert!(
+            ctx.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("manual reconcile")
+        );
+        assert_eq!(*unwinds.lock().await, 0);
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tx_hash, "0xtimeout-branch");
+    }
+
+    #[tokio::test]
     async fn reconcile_store_accessor_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -2169,6 +2653,7 @@ mod tests {
         behaviour: MockSwapBehaviour,
         /// Last recorded (amount_in, min_out).
         last: Arc<Mutex<Option<(U256, U256)>>>,
+        preflight_quote: Option<U256>,
     }
 
     #[derive(Debug, Clone)]
@@ -2196,11 +2681,23 @@ mod tests {
             };
             Ok(dex_swapper::SwapSubmission {
                 tx_hash: tx_hash.into(),
+                nonce: None,
                 amount_in,
                 token_out: token_out.clone(),
                 recipient: recipient.clone(),
                 private_bundle: None,
+                pool_kind: dex_swapper::DexPoolKind::V2,
             })
+        }
+
+        async fn quote_exact_input_for_pair(
+            &self,
+            _tokens: &dex_swapper::PairTokens,
+            _token_in: &Address,
+            _token_out: &Address,
+            _amount_in: U256,
+        ) -> dex_swapper::SwapperResult<Option<U256>> {
+            Ok(self.preflight_quote)
         }
 
         async fn wait_swap(
@@ -2252,6 +2749,11 @@ mod tests {
                 base_decimals: 18,
                 quote: Address::new("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap(),
                 quote_decimals: 6,
+                pool_kind: dex_swapper::DexPoolKind::V2,
+                v3_fee: None,
+                v3_path: None,
+                v3_fees: None,
+                v3_quoter: None,
             },
         );
         Arc::new(book)
@@ -2290,6 +2792,7 @@ mod tests {
             // ratio_micros = 2010 (micros = 2010e-6 = 0.00201). Good.
             behaviour: MockSwapBehaviour::FillWithRatio { ratio_micros: 2010 },
             last: Arc::new(Mutex::new(None)),
+            preflight_quote: None,
         });
         let cfg = DexSwapperConfig {
             slippage_bps: 50, // 0.5%
@@ -2316,6 +2819,7 @@ mod tests {
         let mock = Arc::new(MockSwapper {
             behaviour: MockSwapBehaviour::Revert,
             last: Arc::new(Mutex::new(None)),
+            preflight_quote: None,
         });
         let legs = live_legs_with_mock(Arc::clone(&mock), DexSwapperConfig::default());
         let sig = dex_test_signal("2010");
@@ -2324,6 +2828,55 @@ mod tests {
         assert_eq!(fill.outcome, LegOutcome::Reverted);
         assert_eq!(fill.handle.as_deref(), Some("0xdead"));
         assert_eq!(fill.filled, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn execute_dex_rejects_when_preflight_quote_below_min_out() {
+        let last = Arc::new(Mutex::new(None));
+        let mock = Arc::new(MockSwapper {
+            behaviour: MockSwapBehaviour::FillWithRatio { ratio_micros: 2010 },
+            last: Arc::clone(&last),
+            preflight_quote: Some(U256::from(1_000_000_000u64)),
+        });
+        let cfg = DexSwapperConfig {
+            slippage_bps: 50,
+            ..DexSwapperConfig::default()
+        };
+        let legs = live_legs_with_mock(mock, cfg);
+        let sig = dex_test_signal("2010");
+
+        let fill = legs.execute_dex(&sig, Decimal::ONE).await.unwrap();
+        assert_eq!(fill.outcome, LegOutcome::Rejected);
+        assert!(
+            fill.error
+                .unwrap()
+                .contains("preflight quote below min_out")
+        );
+        assert!(last.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unwind_dex_leg_runs_reverse_dex_swap() {
+        let last = Arc::new(Mutex::new(None));
+        let mock = Arc::new(MockSwapper {
+            behaviour: MockSwapBehaviour::FillWithRatio {
+                ratio_micros: 497_512_437_810_945,
+            },
+            last: Arc::clone(&last),
+            preflight_quote: None,
+        });
+        let legs = live_legs_with_mock(Arc::clone(&mock), DexSwapperConfig::default());
+        let mut ctx = ExecutionContext::new(dex_test_signal("2010"));
+        ctx.leg1_venue = "dex";
+        ctx.leg1_fill_size = Some(Decimal::ONE);
+
+        legs.unwind(&ctx).await.unwrap();
+
+        let recorded = last.lock().await.unwrap();
+        assert_eq!(recorded.0, U256::from(2_010_000_000u64));
+        let expected_min =
+            U256::from(10u64).pow(U256::from(18u64)) * U256::from(9_950u64) / U256::from(10_000u64);
+        assert_eq!(recorded.1, expected_min);
     }
 
     #[tokio::test]
@@ -2342,6 +2895,7 @@ mod tests {
         let mock = Arc::new(MockSwapper {
             behaviour: MockSwapBehaviour::FillWithRatio { ratio_micros: 2010 },
             last: Arc::new(Mutex::new(None)),
+            preflight_quote: None,
         });
         let legs = live_legs_with_mock(Arc::clone(&mock), DexSwapperConfig::default());
         let mut sig = dex_test_signal("2010");
