@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use ethers::types::{Bytes, U256};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -25,44 +26,63 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use peanut_internship_rust::chain::{ChainClient, FlashbotsConfig, FlashbotsRelayClient};
-use peanut_internship_rust::core::types::Address;
+use peanut_internship_rust::chain::{
+    ChainClient, FlashbotsConfig, FlashbotsRelayClient, NonceManager,
+};
+use peanut_internship_rust::core::types::{
+    Address, BlockId, ETH_DECIMALS, GasPriority, TokenAmount, TransactionRequest,
+};
 use peanut_internship_rust::core::wallet::WalletManager;
 use peanut_internship_rust::exchange::client::ExchangeClient;
 use peanut_internship_rust::exchange::config::BinanceConfig;
-use peanut_internship_rust::exchange::{OrderBookSnapshot, subscribe_book_ticker_stream};
+use peanut_internship_rust::exchange::{
+    DepthEvent, DepthSnapshot, LocalOrderBook, OrderBookSnapshot, SequenceStatus,
+    subscribe_book_ticker_stream, subscribe_depth_stream,
+};
 use peanut_internship_rust::executor::engine::{
     Executor, ExecutorConfig, LegExecutor, LiveLegs, SimulatedLegs,
 };
 use peanut_internship_rust::executor::queue::{QueueConfig, QueueWorker, SignalQueue};
 use peanut_internship_rust::executor::{
-    ChainReceiptProvider, DexSwapper, DexSwapperConfig, FlashbotsSwapper, PairAddressBook,
-    PairTokens, PendingReconcile, ReconcileConfig, ReconcileStore, ReconcileWorker, TickOutcome,
-    UniswapV2Swapper,
+    ChainReceiptProvider, CompositeDexSwapper, DexPoolKind, DexSwapper, DexSwapperConfig,
+    FlashbotsSwapper, PairAddressBook, PairTokens, PendingReconcile, ReconcileConfig,
+    ReconcileStore, ReconcileWorker, TickOutcome, UniswapV2Swapper, UniswapV3Swapper,
+    apply_slippage, build_allowance_calldata, build_approve_calldata, build_swap_calldata,
+    v3_swap_calldata_for_pair,
 };
 use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeJsonlLogger, TradeLeg};
+use peanut_internship_rust::inventory::rebalancer::RebalancePlanner;
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
-use peanut_internship_rust::inventory::types::Venue;
+use peanut_internship_rust::inventory::types::{RebalanceStep, Venue};
 use peanut_internship_rust::inventory::wallet::WalletBalanceFetcher;
 use peanut_internship_rust::observability::{
     AlertEvent, AlertProvider, AlertRules, AlertSink, HaltCoordinator, NoopSink, WebhookSink,
     emit_best_effort, evaluate_execution, mask_webhook_url,
 };
-use peanut_internship_rust::pricing::{V3QuoterConfig, V3QuoterKind};
+use peanut_internship_rust::pricing::{
+    AmountOutDecoder, ForkSimulator, SwapParams, V3QuoterConfig, V3QuoterKind,
+};
 use peanut_internship_rust::safety::{
     DEFAULT_KILL_SWITCH_FILE, PreTradeValidator, RiskLimits, RiskManager,
 };
-use peanut_internship_rust::strategy::fees::FeeStructure;
+use peanut_internship_rust::strategy::fees::{FeeBreakdown, FeeStructure};
 use peanut_internship_rust::strategy::generator::{
-    CexOrderBookSource, GeneratorConfig, SignalGenerator, StubPriceSource,
+    CexOrderBookSource, GeneratorConfig, MarketState, PriceSource, SignalGenerator, StubPriceSource,
 };
 use peanut_internship_rust::strategy::live_price_source::{
     AnyPriceSource, LivePoolConfig, LivePoolKind, LivePriceSource,
 };
 use peanut_internship_rust::strategy::scorer::{ScorerConfig, SignalScorer};
+use peanut_internship_rust::strategy::signal::{Direction, Signal};
+use serde_json::json;
 use tokio::sync::{Mutex, mpsc, watch};
 
 const ARBITRUM_UNISWAP_V3_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
+const ARBITRUM_UNISWAP_V3_SWAP_ROUTER: &str = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
+const UNISWAP_V3_POOL_FEE_SELECTOR: [u8; 4] = [0xdd, 0xca, 0x3f, 0x43];
+const ARBITRUM_CHAIN_ID: u64 = 42161;
+const FLASHBOTS_MAINNET_RELAY_URL: &str = "https://relay.flashbots.net";
 
 /// CLI arguments.
 #[derive(Debug, Parser)]
@@ -76,6 +96,9 @@ struct Cli {
     /// also enables this mode.
     #[arg(long, default_value_t = false, env = "PRODUCTION")]
     production: bool,
+
+    #[arg(long, default_value_t = false)]
+    check_config: bool,
 
     /// Base-asset size per leg.
     #[arg(long, default_value = "0.1", env = "ARB_SIZE")]
@@ -94,7 +117,7 @@ struct Cli {
     tick_ms: u64,
 
     /// Use the simulated leg backend instead of live exchange calls.
-    #[arg(long, default_value_t = true, env = "SIMULATION")]
+    #[arg(long, default_value_t = true, env = "SIMULATION", action = clap::ArgAction::Set)]
     simulation: bool,
 
     /// Port for the Prometheus `/metrics` endpoint. Set to 0 to disable.
@@ -146,15 +169,15 @@ struct Cli {
 
     /// Webhook URL for alerting. Empty = alerts disabled (uses NoopSink).
     /// For Telegram, use `https://api.telegram.org/bot<TOKEN>/sendMessage`.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", env = "TELEGRAM_WEBHOOK")]
     alert_webhook_url: String,
 
     /// Webhook payload format: `telegram` or `generic` (default).
-    #[arg(long, default_value = "generic")]
+    #[arg(long, default_value = "generic", env = "ALERT_PROVIDER")]
     alert_provider: String,
 
     /// Telegram chat ID for alerts. Required when `--alert-provider telegram`.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", env = "TELEGRAM_CHAT_ID")]
     alert_telegram_chat_id: String,
 
     /// Absolute-value loss (quote-asset units) that triggers a
@@ -191,6 +214,12 @@ struct Cli {
     /// DEX tx deadline in seconds from submission.
     #[arg(long, default_value_t = 60)]
     dex_deadline_secs: u64,
+
+    #[arg(long, default_value = "", env = "DEX_ROUTER")]
+    dex_router: String,
+
+    #[arg(long, default_value_t = ARBITRUM_CHAIN_ID, env = "DEX_CHAIN_ID")]
+    dex_chain_id: u64,
 
     /// Maximum EIP-1559 maxFeePerGas for live DEX transactions, in gwei.
     /// Set to 0 to disable the cap.
@@ -260,10 +289,25 @@ struct Cli {
     #[arg(long, default_value = "5", env = "FEE_GAS_USD")]
     fee_gas_usd: String,
 
+    #[arg(long, default_value = "fixed", env = "FEE_GAS_MODE")]
+    fee_gas_mode: String,
+
+    #[arg(long, default_value_t = 250_000, env = "FEE_GAS_UNITS")]
+    fee_gas_units: u64,
+
+    #[arg(long, default_value_t = 12_000, env = "FEE_GAS_BUFFER_BPS")]
+    fee_gas_buffer_bps: u64,
+
+    #[arg(long, default_value = "", env = "ANVIL_FORK_URL")]
+    anvil_fork_url: String,
+
     /// Append-only structured trade log path. Completed executions are
     /// written as one JSON object per line. Leave empty to disable.
     #[arg(long, default_value = "trades.jsonl", env = "TRADE_LOG_PATH")]
     trade_log_path: String,
+
+    #[arg(long, default_value = "events.jsonl", env = "EVENT_LOG_PATH")]
+    event_log_path: String,
 
     /// Maximum time to wait for queued/in-flight executions to finish during
     /// graceful shutdown.
@@ -301,21 +345,96 @@ struct Cli {
     /// empty to disable.
     #[arg(long, default_value = "/tmp/arb_bot_kill", env = "HALT_FILE")]
     halt_file_path: String,
+
+    /// Enable periodic inventory rebalance planning.
+    #[arg(long, default_value_t = false, env = "REBALANCE_ENABLED")]
+    rebalance_enabled: bool,
+
+    /// Keep auto-rebalance in plan-only mode.
+    #[arg(long, default_value_t = true, env = "REBALANCE_DRY_RUN")]
+    rebalance_dry_run: bool,
+
+    /// Seconds between rebalance checks.
+    #[arg(long, default_value_t = 60, env = "REBALANCE_INTERVAL_SECS")]
+    rebalance_interval_secs: u64,
+
+    /// Maximum allowed inventory skew before a rebalance plan is generated.
+    #[arg(long, default_value_t = 30.0, env = "REBALANCE_THRESHOLD_PCT")]
+    rebalance_threshold_pct: f64,
+
+    /// Quote asset used for executable rebalance trade symbols.
+    #[arg(long, default_value = "USDC", env = "REBALANCE_QUOTE_ASSET")]
+    rebalance_quote_asset: String,
+
+    /// Maximum slippage allowed for executable rebalance trade steps.
+    #[arg(long, default_value_t = 50, env = "REBALANCE_MAX_SLIPPAGE_BPS")]
+    rebalance_max_slippage_bps: u32,
+
+    /// Destination wallet address for CEX→Wallet withdrawals. Defaults to signer/wallet address.
+    #[arg(long, default_value = "", env = "REBALANCE_CEX_WITHDRAW_ADDRESS")]
+    rebalance_cex_withdraw_address: String,
+
+    /// Binance withdrawal network for CEX→Wallet withdrawals.
+    #[arg(
+        long,
+        default_value = "ARBITRUM",
+        env = "REBALANCE_CEX_WITHDRAW_NETWORK"
+    )]
+    rebalance_cex_withdraw_network: String,
+
+    /// CEX deposit address for Wallet→CEX transfers.
+    #[arg(long, default_value = "", env = "REBALANCE_CEX_DEPOSIT_ADDRESS")]
+    rebalance_cex_deposit_address: String,
+
+    /// Chain ID used for Wallet→CEX transfer transactions.
+    #[arg(long, default_value_t = 42161, env = "REBALANCE_CHAIN_ID")]
+    rebalance_chain_id: u64,
+}
+
+#[derive(Clone)]
+struct RebalanceLoopConfig {
+    dry_run: bool,
+    interval: Duration,
+    threshold_pct: f64,
+    quote_asset: String,
+    max_slippage_bps: Decimal,
+}
+
+#[derive(Clone)]
+struct RebalanceTransferContext {
+    exchange: Arc<ExchangeClient>,
+    chain: ChainClient,
+    wallet: WalletManager,
+    nonce_manager: NonceManager,
+    cex_withdraw_address: String,
+    cex_withdraw_network: String,
+    cex_deposit_address: Address,
+    token_book: HashMap<String, RebalanceTokenConfig>,
+    chain_id: u64,
+    max_gas_gwei: Option<u64>,
+}
+
+#[derive(Clone)]
+struct RebalanceTokenConfig {
+    address: Address,
+    decimals: u8,
 }
 
 struct WsCexOrderBookSource {
     exchange: Arc<ExchangeClient>,
-    snapshots: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+    depth_snapshots: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+    top_snapshots: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
     max_age: Duration,
 }
 
 impl WsCexOrderBookSource {
     async fn new(exchange: Arc<ExchangeClient>, ws_url: String, pairs: &[String]) -> Self {
-        let snapshots = Arc::new(RwLock::new(HashMap::new()));
+        let depth_snapshots = Arc::new(RwLock::new(HashMap::new()));
+        let top_snapshots = Arc::new(RwLock::new(HashMap::new()));
         for pair in pairs {
             match exchange.fetch_order_book(pair, 20).await {
                 Ok(snapshot) => {
-                    snapshots.write().await.insert(pair.clone(), snapshot);
+                    depth_snapshots.write().await.insert(pair.clone(), snapshot);
                     info!(pair, "CEX order book seeded from REST snapshot");
                 }
                 Err(error) => {
@@ -323,12 +442,14 @@ impl WsCexOrderBookSource {
                 }
             }
 
-            spawn_book_ticker_cache(ws_url.clone(), pair.clone(), Arc::clone(&snapshots));
+            spawn_book_ticker_cache(ws_url.clone(), pair.clone(), Arc::clone(&top_snapshots));
+            spawn_depth_cache(ws_url.clone(), pair.clone(), Arc::clone(&depth_snapshots));
         }
 
         Self {
             exchange,
-            snapshots,
+            depth_snapshots,
+            top_snapshots,
             max_age: Duration::from_secs(60),
         }
     }
@@ -342,15 +463,332 @@ impl CexOrderBookSource for WsCexOrderBookSource {
         limit: u32,
     ) -> peanut_internship_rust::strategy::StrategyResult<OrderBookSnapshot> {
         let now = unix_millis();
-        if let Some(snapshot) = self.snapshots.read().await.get(pair).cloned() {
+        if let Some(snapshot) = self.depth_snapshots.read().await.get(pair).cloned() {
             if now.saturating_sub(snapshot.timestamp) <= self.max_age.as_millis() as u64 {
                 return Ok(snapshot);
             }
-            warn!(pair, "CEX WS snapshot stale; falling back to REST");
+            warn!(pair, "CEX depth snapshot stale; falling back to REST");
         }
 
-        Ok(self.exchange.fetch_order_book(pair, limit).await?)
+        match self.exchange.fetch_order_book(pair, limit).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                if let Some(snapshot) = self.top_snapshots.read().await.get(pair).cloned()
+                    && now.saturating_sub(snapshot.timestamp) <= self.max_age.as_millis() as u64
+                {
+                    warn!(pair, error = %error, "CEX REST depth failed; falling back to bookTicker top-of-book");
+                    return Ok(snapshot);
+                }
+                Err(error.into())
+            }
+        }
     }
+}
+
+fn spawn_depth_cache(
+    ws_url: String,
+    pair: String,
+    snapshots: Arc<RwLock<HashMap<String, OrderBookSnapshot>>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let mut book = {
+                let existing = snapshots.read().await.get(&pair).cloned();
+                existing
+                    .as_ref()
+                    .map(local_book_from_snapshot)
+                    .unwrap_or_else(|| LocalOrderBook::new(&pair))
+            };
+
+            match subscribe_depth_stream(&ws_url, &pair).await {
+                Ok(mut rx) => {
+                    info!(pair, "CEX depth stream connected");
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            DepthEvent::Snapshot(snapshot) => {
+                                book.apply_snapshot(snapshot);
+                                snapshots
+                                    .write()
+                                    .await
+                                    .insert(pair.clone(), book.snapshot());
+                            }
+                            DepthEvent::Update(update) => match book.apply_update(update) {
+                                SequenceStatus::Applied => {
+                                    snapshots
+                                        .write()
+                                        .await
+                                        .insert(pair.clone(), book.snapshot());
+                                }
+                                SequenceStatus::Stale => {}
+                                SequenceStatus::NeedsReconnect => {
+                                    warn!(pair, "CEX depth sequence gap; reconnecting");
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                    warn!(pair, "CEX depth stream ended; reconnecting");
+                }
+                Err(error) => {
+                    warn!(pair, error = %error, "CEX depth stream connect failed");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+fn local_book_from_snapshot(snapshot: &OrderBookSnapshot) -> LocalOrderBook {
+    let mut book = LocalOrderBook::new(&snapshot.symbol);
+    book.apply_snapshot(DepthSnapshot {
+        last_update_id: 0,
+        bids: snapshot
+            .bids
+            .iter()
+            .map(|(price, qty)| [price.to_string(), qty.to_string()])
+            .collect(),
+        asks: snapshot
+            .asks
+            .iter()
+            .map(|(price, qty)| [price.to_string(), qty.to_string()])
+            .collect(),
+    });
+    book
+}
+
+fn spawn_rebalance_loop(
+    inventory: Arc<RwLock<InventoryTracker>>,
+    halt: Arc<HaltCoordinator>,
+    config: RebalanceLoopConfig,
+    transfer: Option<RebalanceTransferContext>,
+) {
+    tokio::spawn(async move {
+        info!(
+            dry_run = config.dry_run,
+            interval_s = config.interval.as_secs(),
+            threshold_pct = config.threshold_pct,
+            quote_asset = %config.quote_asset,
+            max_slippage_bps = %config.max_slippage_bps,
+            "auto-rebalance loop enabled"
+        );
+        loop {
+            if halt.is_halted() {
+                info!("auto-rebalance loop stopped because bot is halted");
+                break;
+            }
+
+            run_rebalance_check(&inventory, &config, transfer.as_ref()).await;
+            tokio::time::sleep(config.interval).await;
+        }
+    });
+}
+
+async fn run_rebalance_check(
+    inventory: &Arc<RwLock<InventoryTracker>>,
+    config: &RebalanceLoopConfig,
+    transfer: Option<&RebalanceTransferContext>,
+) {
+    let tracker_snapshot = inventory.read().await.clone();
+    let planner = RebalancePlanner::new(tracker_snapshot, config.threshold_pct);
+    let plans = planner.plan_executable_all(&config.quote_asset, config.max_slippage_bps);
+    if plans.is_empty() {
+        debug!("auto-rebalance check complete: no rebalance needed");
+        return;
+    }
+
+    let total_steps: usize = plans.values().map(Vec::len).sum();
+    info!(
+        assets = plans.len(),
+        steps = total_steps,
+        dry_run = config.dry_run,
+        "auto-rebalance plan generated"
+    );
+
+    for (asset, steps) in plans {
+        for step in steps {
+            match &step {
+                RebalanceStep::Trade(trade) => {
+                    info!(
+                        asset,
+                        venue = %trade.venue,
+                        symbol = %trade.symbol,
+                        side = %trade.side,
+                        amount = %trade.amount,
+                        max_slippage_bps = %trade.max_slippage_bps,
+                        "auto-rebalance trade step planned"
+                    );
+                }
+                RebalanceStep::Withdraw(withdraw) => {
+                    info!(
+                        asset,
+                        from = %withdraw.from_venue,
+                        to = %withdraw.to_venue,
+                        amount = %withdraw.amount,
+                        fee = %withdraw.fee,
+                        "auto-rebalance withdraw step planned"
+                    );
+                }
+            }
+            if !config.dry_run {
+                match execute_rebalance_step(&step, transfer).await {
+                    Ok(reference) => {
+                        info!(reference, "auto-rebalance step submitted");
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "auto-rebalance step execution failed");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn execute_rebalance_step(
+    step: &RebalanceStep,
+    transfer: Option<&RebalanceTransferContext>,
+) -> Result<String, String> {
+    let Some(transfer) = transfer else {
+        return Err("real rebalance transfer context is not configured".into());
+    };
+    match step {
+        RebalanceStep::Trade(_) => {
+            Err("real CEX rebalance trade execution is not wired here".into())
+        }
+        RebalanceStep::Withdraw(withdraw) => {
+            if withdraw.from_venue.is_cex() && withdraw.to_venue == Venue::Wallet {
+                execute_cex_to_wallet_withdraw(withdraw, transfer).await
+            } else if withdraw.from_venue == Venue::Wallet && withdraw.to_venue.is_cex() {
+                execute_wallet_to_cex_transfer(withdraw, transfer).await
+            } else {
+                Err(format!(
+                    "unsupported rebalance withdraw route {} -> {}",
+                    withdraw.from_venue, withdraw.to_venue
+                ))
+            }
+        }
+    }
+}
+
+async fn execute_cex_to_wallet_withdraw(
+    withdraw: &peanut_internship_rust::inventory::types::WithdrawStep,
+    transfer: &RebalanceTransferContext,
+) -> Result<String, String> {
+    let send_amount = withdraw.amount - withdraw.fee;
+    if send_amount <= Decimal::ZERO {
+        return Err(format!(
+            "withdraw amount {} is not greater than fee {}",
+            withdraw.amount, withdraw.fee
+        ));
+    }
+    transfer
+        .exchange
+        .withdraw_to_address(
+            &withdraw.asset,
+            &transfer.cex_withdraw_address,
+            send_amount,
+            &transfer.cex_withdraw_network,
+        )
+        .await
+        .map(|id| format!("binance_withdraw:{id}"))
+        .map_err(|e| e.to_string())
+}
+
+async fn execute_wallet_to_cex_transfer(
+    withdraw: &peanut_internship_rust::inventory::types::WithdrawStep,
+    transfer: &RebalanceTransferContext,
+) -> Result<String, String> {
+    let from = Address::new(transfer.wallet.address()).map_err(|e| e.to_string())?;
+    let gas = transfer
+        .chain
+        .get_gas_price()
+        .await
+        .map_err(|e| e.to_string())?;
+    let max_priority_fee = gas.priority_fee_medium;
+    let max_fee = gas.get_max_fee(GasPriority::Medium, 12_000);
+    if let Some(max_gas_gwei) = transfer.max_gas_gwei {
+        let cap = U256::from(max_gas_gwei) * U256::from(1_000_000_000u64);
+        if max_fee > cap {
+            return Err(format!(
+                "rebalance tx max_fee_per_gas {} exceeds cap {}",
+                max_fee, cap
+            ));
+        }
+    }
+
+    let mut tx = if withdraw.asset.eq_ignore_ascii_case("ETH") {
+        TransactionRequest {
+            to: transfer.cex_deposit_address.clone(),
+            value: TokenAmount::from_human(withdraw.amount, ETH_DECIMALS, Some("ETH".to_string()))
+                .map_err(|e| e.to_string())?,
+            data: Bytes::new(),
+            nonce: None,
+            gas_limit: Some(21_000),
+            max_fee_per_gas: Some(max_fee),
+            max_priority_fee: Some(max_priority_fee),
+            chain_id: transfer.chain_id,
+        }
+    } else {
+        let token = transfer
+            .token_book
+            .get(&withdraw.asset)
+            .ok_or_else(|| format!("asset {} missing from rebalance token book", withdraw.asset))?;
+        let amount = TokenAmount::from_human(
+            withdraw.amount,
+            token.decimals,
+            Some(withdraw.asset.clone()),
+        )
+        .map_err(|e| e.to_string())?;
+        TransactionRequest {
+            to: token.address.clone(),
+            value: TokenAmount::eth(0u64),
+            data: Bytes::from(erc20_transfer_calldata(
+                &transfer.cex_deposit_address,
+                amount.raw,
+            )),
+            nonce: None,
+            gas_limit: Some(100_000),
+            max_fee_per_gas: Some(max_fee),
+            max_priority_fee: Some(max_priority_fee),
+            chain_id: transfer.chain_id,
+        }
+    };
+
+    if let Ok(estimated) = transfer.chain.estimate_gas(&tx).await {
+        tx.gas_limit = Some((estimated.saturating_mul(12_000) / 10_000).max(21_000));
+    }
+    let nonce = transfer
+        .nonce_manager
+        .reserve_next(&transfer.chain, transfer.chain_id, &from)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.nonce = Some(nonce);
+    let signed = match transfer.wallet.sign_transaction_bytes(&tx).await {
+        Ok(signed) => signed,
+        Err(e) => {
+            transfer
+                .nonce_manager
+                .mark_failed(transfer.chain_id, &from, nonce)
+                .await;
+            return Err(e.to_string());
+        }
+    };
+    transfer
+        .chain
+        .send_transaction(&signed)
+        .await
+        .map(|hash| format!("wallet_tx:{hash}"))
+        .map_err(|e| e.to_string())
+}
+
+fn erc20_transfer_calldata(to: &Address, amount: U256) -> Vec<u8> {
+    let mut data = hex::decode("a9059cbb").expect("valid ERC20 transfer selector");
+    data.resize(4 + 12, 0);
+    data.extend_from_slice(&to.as_eth_address().0);
+    let mut amount_bytes = [0u8; 32];
+    amount.to_big_endian(&mut amount_bytes);
+    data.extend_from_slice(&amount_bytes);
+    data
 }
 
 fn spawn_book_ticker_cache(
@@ -418,6 +856,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let log_file_path = init_tracing(&cli.log_dir)?;
     info!(log_file = %log_file_path.display(), "file logging enabled");
+    if cli.check_config {
+        run_config_check(&cli)?;
+        info!("config check passed");
+        return Ok(());
+    }
 
     let trade_size =
         Decimal::from_str_exact(&cli.size).map_err(|e| format!("invalid --size: {e}"))?;
@@ -509,6 +952,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         info!(port = cli.metrics_port, "metrics endpoint /metrics enabled");
     }
+    if !cli.event_log_path.is_empty() {
+        peanut_internship_rust::observability::init_event_logger(&cli.event_log_path)?;
+        info!(path = %cli.event_log_path, "observability event log enabled");
+    }
 
     let production = cli.production || peanut_internship_rust::config::env_production_enabled();
     if production {
@@ -516,6 +963,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Testnet mode - fake money");
     }
+    validate_live_execution_config(&cli)?;
 
     let exchange_cfg = BinanceConfig::from_env_for(production)?;
     info!(
@@ -526,12 +974,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let cex_ws_url = exchange_cfg.ws_url.clone();
     let exchange = Arc::new(ExchangeClient::new(exchange_cfg)?);
-    let mut tracked_pairs = cli.pair.clone();
-    for p in &cli.pair {
-        if p.ends_with("/ETH") && !tracked_pairs.contains(&"ETH/USDC".to_string()) {
-            tracked_pairs.push("ETH/USDC".to_string());
-        }
-    }
+    let tracked_pairs = tracked_pairs_for_price_source(&cli.pair);
 
     let cex_order_books: Arc<dyn CexOrderBookSource> = Arc::new(
         WsCexOrderBookSource::new(Arc::clone(&exchange), cex_ws_url, &tracked_pairs).await,
@@ -547,9 +990,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // endpoints. Applied BEFORE the first tick so the inventory pre-check
     // in `SignalGenerator` has something to approve.
     if !cli.seed_inventory.is_empty() {
-        if !cli.simulation {
+        if !cli.simulation && !cli.dry_run {
             warn!(
-                "--seed-inventory used outside --simulation; synthetic balances will be overwritten by the next sync"
+                "--seed-inventory used outside --simulation/--dry-run; synthetic balances will be overwritten by the next sync"
             );
         }
         let mut guard = inventory.write().await;
@@ -570,49 +1013,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Signal generator + scorer.
     //
-    // When `--dex-address-book` contains a `pool` address for a pair AND a
-    // chain RPC is configured, we read live Uniswap V2 reserves instead of
-    // synthesising DEX prices from CEX mid. Otherwise we fall back to the
-    // deterministic `StubPriceSource` (demo-friendly, no RPC load).
+    // When `--dex-address-book` is absent, we use deterministic synthetic DEX
+    // prices. When it is present, live DEX pricing is mandatory: missing pools
+    // or RPC configuration abort startup instead of silently falling back.
     let price_source: Arc<AnyPriceSource> = {
-        let live_pools = if !cli.dex_address_book.is_empty() {
-            load_live_pool_book(&cli.dex_address_book)?
+        if cli.dex_address_book.is_empty() {
+            info!("price source: stub (synthetic DEX prices)");
+            Arc::new(AnyPriceSource::Stub(StubPriceSource::new_with_order_books(
+                Arc::clone(&cex_order_books),
+            )))
         } else {
-            Vec::new()
-        };
-        let rpc_urls = resolve_rpc_urls(&cli);
-        match (live_pools.is_empty(), rpc_urls) {
-            (false, Some(rpc_urls)) => {
-                let client = ChainClient::new(rpc_urls, 30, 3)?;
-                log_rpc_health("live price source", &client).await;
-                let live = LivePriceSource::new_with_order_books(
-                    Arc::clone(&cex_order_books),
-                    client,
-                    live_pools,
+            let live_pools = load_live_pool_book(&cli.dex_address_book, Some(&tracked_pairs))?;
+            if live_pools.is_empty() {
+                return Err(format!(
+                    "--dex-address-book {} does not contain any entries with a pool address",
+                    cli.dex_address_book
                 )
-                .await?;
-                // Start the background WS block feed so DEX prices update
-                // on every new block (same real-time pattern as CEX bookTicker).
-                let size = Decimal::from_str_exact(&cli.size).unwrap_or(Decimal::ONE);
-                if let Some(ws_url) = resolve_ws_url(&resolve_rpc_urls(&cli).unwrap_or_default()) {
-                    match live.start_block_feed(&ws_url, size).await {
-                        Ok(()) => info!(ws_url, "DEX block feed started"),
-                        Err(e) => {
-                            warn!(error = %e, "DEX block feed failed, falling back to per-tick RPC")
-                        }
+                .into());
+            }
+            let rpc_urls = resolve_rpc_urls(&cli).ok_or(
+                "--dex-address-book was provided, so --eth-rpc-url or ETH_RPC_URL is required",
+            )?;
+            let client = ChainClient::new(rpc_urls.clone(), 30, 3)?;
+            log_rpc_health("live price source", &client).await;
+            let live = LivePriceSource::new_with_order_books(
+                Arc::clone(&cex_order_books),
+                client,
+                live_pools,
+            )
+            .await?;
+            // Start the background WS block feed so DEX prices update
+            // on every new block (same real-time pattern as CEX bookTicker).
+            let size = Decimal::from_str_exact(&cli.size).unwrap_or(Decimal::ONE);
+            if let Some(ws_url) = resolve_ws_url(&rpc_urls) {
+                match live.start_block_feed(&ws_url, size).await {
+                    Ok(()) => info!(ws_url, "DEX block feed started"),
+                    Err(e) => {
+                        warn!(error = %e, "DEX block feed failed, falling back to per-tick RPC")
                     }
-                } else {
-                    warn!("No WS URL for DEX block feed, falling back to per-tick RPC");
                 }
-                info!("price source: live DEX pools");
-                Arc::new(AnyPriceSource::Live(live))
+            } else {
+                warn!("No WS URL for DEX block feed, falling back to per-tick RPC");
             }
-            _ => {
-                info!("price source: stub (synthetic DEX prices)");
-                Arc::new(AnyPriceSource::Stub(StubPriceSource::new_with_order_books(
-                    Arc::clone(&cex_order_books),
-                )))
-            }
+            info!("price source: live DEX pools");
+            Arc::new(AnyPriceSource::Live(live))
         }
     };
     let generator_config = GeneratorConfig {
@@ -627,22 +1071,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (`SignalGenerator`) and post-trade realised PnL (`Executor::calc_pnl`)
     // in lockstep — skewing one without the other is a classic source of
     // "we signalled profit but booked a loss" bugs.
+    let effective_dex_swap_bps =
+        effective_dex_fee_bps(cli.fee_dex_swap_bps, &cli.dex_address_book)?;
     let fees = FeeStructure {
         cex_taker_bps: Decimal::from(cli.fee_cex_taker_bps),
-        dex_swap_bps: Decimal::from(cli.fee_dex_swap_bps),
+        dex_swap_bps: effective_dex_swap_bps,
         gas_cost_usd: Decimal::from_str_exact(&cli.fee_gas_usd)
             .map_err(|e| format!("invalid --fee-gas-usd: {e}"))?,
+    };
+    let gas_estimator = match cli.fee_gas_mode.to_ascii_lowercase().as_str() {
+        "fixed" => GasFeeEstimator::Fixed,
+        "rpc" => {
+            let rpc_urls = resolve_rpc_urls(&cli)
+                .ok_or("--fee-gas-mode rpc requires --eth-rpc-url or ETH_RPC_URL")?;
+            GasFeeEstimator::Rpc {
+                client: ChainClient::new(rpc_urls, 30, 3)?,
+                gas_units: cli.fee_gas_units,
+                buffer_bps: cli.fee_gas_buffer_bps,
+            }
+        }
+        "estimate" => {
+            let (rpc_urls, wallet_address) = resolve_wallet_config(&cli).ok_or(
+                "--fee-gas-mode estimate requires --eth-rpc-url/ETH_RPC_URL and --wallet-address/WALLET_ADDRESS",
+            )?;
+            if cli.dex_address_book.is_empty() {
+                return Err("--fee-gas-mode estimate requires --dex-address-book".into());
+            }
+            GasFeeEstimator::Estimate {
+                client: ChainClient::new(rpc_urls, 30, 3)?,
+                fallback_gas_units: cli.fee_gas_units,
+                buffer_bps: cli.fee_gas_buffer_bps,
+                wallet: Address::new(&wallet_address)?,
+                address_book: Arc::new(load_address_book(&cli.dex_address_book)?),
+                slippage_bps: cli.dex_slippage_bps,
+                chain_id: cli.dex_chain_id,
+                v2_router: if cli.dex_router.is_empty() {
+                    DexSwapperConfig::default().router
+                } else {
+                    Address::new(&cli.dex_router)?
+                },
+                v3_router: if cli.dex_router.is_empty() {
+                    Address::new(ARBITRUM_UNISWAP_V3_SWAP_ROUTER)?
+                } else {
+                    Address::new(&cli.dex_router)?
+                },
+            }
+        }
+        "anvil" => {
+            let fork_url = resolve_anvil_fork_url(&cli)
+                .ok_or("--fee-gas-mode anvil requires --anvil-fork-url or ANVIL_FORK_URL")?;
+            let wallet_address = resolve_wallet_address(&cli)
+                .ok_or("--fee-gas-mode anvil requires --wallet-address or WALLET_ADDRESS")?;
+            if cli.dex_address_book.is_empty() {
+                return Err("--fee-gas-mode anvil requires --dex-address-book".into());
+            }
+            GasFeeEstimator::Anvil {
+                client: ChainClient::new(vec![fork_url.clone()], 30, 3)?,
+                simulator: ForkSimulator::new(&fork_url)?,
+                fallback_gas_units: cli.fee_gas_units,
+                buffer_bps: cli.fee_gas_buffer_bps,
+                wallet: Address::new(&wallet_address)?,
+                address_book: Arc::new(load_address_book(&cli.dex_address_book)?),
+                slippage_bps: cli.dex_slippage_bps,
+                chain_id: cli.dex_chain_id,
+                v2_router: if cli.dex_router.is_empty() {
+                    DexSwapperConfig::default().router
+                } else {
+                    Address::new(&cli.dex_router)?
+                },
+                v3_router: if cli.dex_router.is_empty() {
+                    Address::new(ARBITRUM_UNISWAP_V3_SWAP_ROUTER)?
+                } else {
+                    Address::new(&cli.dex_router)?
+                },
+            }
+        }
+        other => {
+            return Err(format!(
+                "invalid --fee-gas-mode '{other}', expected fixed, rpc, estimate, or anvil"
+            )
+            .into());
+        }
     };
     info!(
         min_profit_usd = %generator_config.min_profit_usd,
         min_spread_bps = %generator_config.min_spread_bps,
         cex_taker_bps = %fees.cex_taker_bps,
         dex_swap_bps = %fees.dex_swap_bps,
+        configured_dex_swap_bps = cli.fee_dex_swap_bps,
         gas_cost_usd = %fees.gas_cost_usd,
+        gas_mode = %cli.fee_gas_mode,
+        gas_units = cli.fee_gas_units,
+        gas_buffer_bps = cli.fee_gas_buffer_bps,
         "generator thresholds + fee model"
     );
     let mut generator = SignalGenerator::new(
-        price_source,
+        Arc::clone(&price_source),
         Arc::clone(&inventory),
         fees.clone(),
         generator_config,
@@ -670,48 +1194,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Executor: simulated or live legs. Wrap in `Arc` so the queue worker can
     // share it with the producer (tick) for breaker introspection.
+    let nonce_manager = NonceManager::new();
     let mut effective_use_flashbots = cli.use_flashbots;
-    let legs: Arc<dyn peanut_internship_rust::executor::engine::LegExecutor> = if cli.simulation {
+    let legs: Arc<dyn peanut_internship_rust::executor::engine::LegExecutor> = if cli.simulation
+        || cli.dry_run
+    {
         Arc::new(SimulatedLegs::default())
     } else {
         if !cli.dex_address_book.is_empty() {
             let rpc_urls = resolve_wallet_config(&cli)
                 .map(|(rpc, _)| rpc)
-                .ok_or("live DEX execution requires --eth-rpc-url or ETH_RPC_URL")?;
+                .ok_or("live DEX execution requires --eth-rpc-url/ETH_RPC_URL and --wallet-address/WALLET_ADDRESS")?;
             let chain_client = ChainClient::new(rpc_urls, 30, 3)?;
             log_rpc_health("live dex", &chain_client).await;
             let wallet = WalletManager::from_env(&cli.wallet_key_env)?;
             let recipient = Address::new(wallet.address())?;
-            let address_book = Arc::new(load_address_book(&cli.dex_address_book)?);
-            let dex_config = DexSwapperConfig {
+            let address_book = Arc::new(
+                load_address_book_with_fee_discovery(
+                    &cli.dex_address_book,
+                    &chain_client,
+                    cli.dex_chain_id,
+                )
+                .await?,
+            );
+            let (has_v2, has_v3) = live_execution_pool_kinds(&cli.dex_address_book, &cli.pair)?;
+            if has_v2 && has_v3 && !cli.dex_router.is_empty() {
+                return Err("mixed V2/V3 live execution requires --dex-router to be empty so V2 and V3 can use their own routers".into());
+            }
+            let v2_config = DexSwapperConfig {
+                router: if cli.dex_router.is_empty() {
+                    DexSwapperConfig::default().router
+                } else {
+                    Address::new(&cli.dex_router)?
+                },
                 slippage_bps: cli.dex_slippage_bps,
                 deadline_secs: cli.dex_deadline_secs,
+                chain_id: cli.dex_chain_id,
                 max_gas_gwei: (cli.max_gas_gwei > 0).then_some(cli.max_gas_gwei),
                 ..DexSwapperConfig::default()
             };
-            let base_swapper =
-                UniswapV2Swapper::new(chain_client.clone(), wallet.clone(), dex_config.clone());
-            let swapper: Arc<dyn DexSwapper> = if cli.use_flashbots {
+            let v3_config = DexSwapperConfig {
+                router: if cli.dex_router.is_empty() {
+                    Address::new(ARBITRUM_UNISWAP_V3_SWAP_ROUTER)?
+                } else {
+                    Address::new(&cli.dex_router)?
+                },
+                slippage_bps: cli.dex_slippage_bps,
+                deadline_secs: cli.dex_deadline_secs,
+                chain_id: cli.dex_chain_id,
+                max_gas_gwei: (cli.max_gas_gwei > 0).then_some(cli.max_gas_gwei),
+                ..DexSwapperConfig::default()
+            };
+            let flashbots_auth = if cli.use_flashbots {
                 match WalletManager::from_env(&cli.flashbots_auth_key_env) {
-                    Ok(auth_wallet) => {
-                        let flashbots_config = FlashbotsConfig {
-                            relay_url: cli.flashbots_relay_url.clone(),
-                            target_block_offset: cli.flashbots_target_block_offset,
-                            max_blocks_to_try: cli.flashbots_max_blocks_to_try,
-                            ..FlashbotsConfig::default()
-                        };
-                        let relay = Arc::new(FlashbotsRelayClient::new(
-                            flashbots_config.clone(),
-                            auth_wallet,
-                        ));
-                        info!(
-                            relay = %flashbots_config.relay_url,
-                            target_block_offset = flashbots_config.target_block_offset,
-                            max_blocks_to_try = flashbots_config.max_blocks_to_try,
-                            "live mode: DEX leg wired via FlashbotsSwapper"
-                        );
-                        Arc::new(FlashbotsSwapper::new(base_swapper, relay, flashbots_config))
-                    }
+                    Ok(auth_wallet) => Some(auth_wallet),
                     Err(e) if cli.require_private_dex => {
                         return Err(format!(
                             "private DEX mode requires --flashbots-auth-key-env {}: {e}",
@@ -725,23 +1261,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             error = %e,
                             "Flashbots auth wallet unavailable; falling back to CEX-first public DEX mode"
                         );
-                        Arc::new(base_swapper)
+                        None
                     }
                 }
             } else {
-                Arc::new(base_swapper)
+                None
+            };
+            let flashbots_config = FlashbotsConfig {
+                relay_url: cli.flashbots_relay_url.clone(),
+                target_block_offset: cli.flashbots_target_block_offset,
+                max_blocks_to_try: cli.flashbots_max_blocks_to_try,
+                ..FlashbotsConfig::default()
+            };
+            let build_v2_swapper = || -> Arc<dyn DexSwapper> {
+                let base_swapper =
+                    UniswapV2Swapper::new(chain_client.clone(), wallet.clone(), v2_config.clone())
+                        .with_nonce_manager(nonce_manager.clone());
+                if let Some(auth_wallet) = flashbots_auth.clone() {
+                    let relay = Arc::new(FlashbotsRelayClient::new(
+                        flashbots_config.clone(),
+                        auth_wallet,
+                    ));
+                    Arc::new(FlashbotsSwapper::new(
+                        base_swapper,
+                        relay,
+                        flashbots_config.clone(),
+                    ))
+                } else {
+                    Arc::new(base_swapper)
+                }
+            };
+            let build_v3_swapper = || -> Arc<dyn DexSwapper> {
+                let base_swapper =
+                    UniswapV3Swapper::new(chain_client.clone(), wallet.clone(), v3_config.clone())
+                        .with_nonce_manager(nonce_manager.clone());
+                if let Some(auth_wallet) = flashbots_auth.clone() {
+                    let relay = Arc::new(FlashbotsRelayClient::new(
+                        flashbots_config.clone(),
+                        auth_wallet,
+                    ));
+                    Arc::new(FlashbotsSwapper::new_v3(
+                        base_swapper,
+                        relay,
+                        flashbots_config.clone(),
+                    ))
+                } else {
+                    Arc::new(base_swapper)
+                }
+            };
+            let swapper: Arc<dyn DexSwapper> = if has_v2 && has_v3 {
+                Arc::new(CompositeDexSwapper::new(
+                    build_v2_swapper(),
+                    build_v3_swapper(),
+                ))
+            } else if has_v3 {
+                build_v3_swapper()
+            } else {
+                build_v2_swapper()
             };
             info!(
                 address_book = %cli.dex_address_book,
+                has_v2,
+                has_v3,
+                v2_router = %v2_config.router,
+                v3_router = %v3_config.router,
+                chain_id = cli.dex_chain_id,
                 slippage_bps = cli.dex_slippage_bps,
-                max_gas_gwei = ?dex_config.max_gas_gwei,
+                max_gas_gwei = ?v2_config.max_gas_gwei,
                 private_dex = effective_use_flashbots,
                 "live mode: DEX leg configured"
             );
             Arc::new(LiveLegs::new(Arc::clone(&exchange)).with_dex(
                 swapper,
                 address_book,
-                dex_config,
+                v2_config,
                 recipient,
             ))
         } else {
@@ -772,7 +1365,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use_flashbots: effective_use_flashbots,
         ..ExecutorConfig::default()
     };
-    let mut executor_builder = Executor::with_replay(legs, executor_config, replay).with_fees(fees);
+    let mut executor_builder =
+        Executor::with_replay(legs, executor_config, replay).with_fees(fees.clone());
     if let Some(ref store) = reconcile_store {
         executor_builder = executor_builder.with_reconcile_store(Arc::clone(store));
     }
@@ -873,6 +1467,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let pair_str = ctx.signal.pair.clone();
+                let duration_ms = ctx
+                    .finished_at
+                    .map(|finished| finished.duration_since(ctx.started_at).as_millis());
+                peanut_internship_rust::observability::emit_event(
+                    "execution_terminal",
+                    json!({
+                        "signal_id": ctx.signal.signal_id,
+                        "pair": ctx.signal.pair,
+                        "direction": ctx.signal.direction.to_string(),
+                        "state": ctx.state.to_string(),
+                        "error": ctx.error,
+                        "actual_net_pnl": ctx.actual_net_pnl.map(|v| v.to_string()),
+                        "duration_ms": duration_ms,
+                        "leg1_venue": ctx.leg1_venue,
+                        "leg1_handle": ctx.leg1_handle,
+                        "leg1_fill_price": ctx.leg1_fill_price.map(|v| v.to_string()),
+                        "leg1_fill_size": ctx.leg1_fill_size.map(|v| v.to_string()),
+                        "leg2_venue": ctx.leg2_venue,
+                        "leg2_handle": ctx.leg2_handle,
+                        "leg2_fill_price": ctx.leg2_fill_price.map(|v| v.to_string()),
+                        "leg2_fill_size": ctx.leg2_fill_size.map(|v| v.to_string()),
+                    }),
+                );
                 let done = ctx.state.is_filled();
                 scorer.lock().await.record_result(&pair_str, done);
                 if done {
@@ -1032,10 +1649,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let mode_str = if production {
-        "production"
-    } else if cli.dry_run {
+    let mode_str = if cli.dry_run {
         "dry-run"
+    } else if production {
+        "production"
     } else {
         "testnet"
     };
@@ -1048,6 +1665,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await;
+    peanut_internship_rust::observability::emit_event(
+        "bot_started",
+        json!({
+            "mode": mode_str,
+            "pairs": cli.pair,
+            "size": trade_size.to_string(),
+            "simulation": cli.simulation,
+            "dry_run": cli.dry_run,
+            "max_concurrent": cli.max_concurrent_executions,
+            "metrics_port": cli.metrics_port,
+        }),
+    );
     info!(
         pairs = ?cli.pair,
         size = %trade_size,
@@ -1057,14 +1686,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "bot starting"
     );
 
-    let preserve_seeded_inventory = cli.simulation && !cli.seed_inventory.is_empty();
+    let preserve_seeded_inventory =
+        (cli.simulation || cli.dry_run) && !cli.seed_inventory.is_empty();
     if preserve_seeded_inventory {
-        info!("simulation seed inventory active; skipping balance sync");
+        info!("simulation/dry-run seed inventory active; skipping balance sync");
     } else {
         sync_cex_balance(&exchange, &inventory).await;
         if let Some(ref f) = wallet_fetcher {
             sync_wallet_balance(f, &inventory).await;
         }
+    }
+
+    if cli.rebalance_enabled {
+        let transfer_context =
+            build_rebalance_transfer_context(&cli, Arc::clone(&exchange), nonce_manager.clone())?;
+        spawn_rebalance_loop(
+            Arc::clone(&inventory),
+            Arc::clone(&halt_coordinator),
+            RebalanceLoopConfig {
+                dry_run: cli.rebalance_dry_run,
+                interval: Duration::from_secs(cli.rebalance_interval_secs.max(1)),
+                threshold_pct: cli.rebalance_threshold_pct,
+                quote_asset: cli.rebalance_quote_asset.clone(),
+                max_slippage_bps: Decimal::from(cli.rebalance_max_slippage_bps),
+            },
+            transfer_context,
+        );
+    } else {
+        info!("auto-rebalance disabled");
     }
 
     let sync_interval = Duration::from_secs(cli.balance_sync_interval_secs.max(1));
@@ -1078,6 +1727,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         risk_manager: Arc::clone(&risk_manager),
         pre_trade_validator: Arc::clone(&pre_trade_validator),
         cex_order_books: Arc::clone(&cex_order_books),
+        price_source: Arc::clone(&price_source),
+        base_fees: fees.clone(),
+        gas_estimator,
+        dex_fee_included_in_quote: !cli.dex_address_book.is_empty(),
     };
 
     loop {
@@ -1096,6 +1749,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await;
+            peanut_internship_rust::observability::emit_event(
+                "bot_stopped",
+                json!({
+                    "reason": reason,
+                    "halted": true,
+                }),
+            );
             break;
         }
 
@@ -1115,6 +1775,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await;
+            peanut_internship_rust::observability::emit_event(
+                "bot_stopped",
+                json!({
+                    "reason": reason,
+                    "halted": true,
+                }),
+            );
             break;
         }
         if let Err(e) = tick_result {
@@ -1180,6 +1847,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await;
+    peanut_internship_rust::observability::emit_event(
+        "bot_stopped",
+        json!({
+            "reason": "clean shutdown",
+            "halted": halt_coordinator.is_halted(),
+        }),
+    );
     info!("main loop exited; draining queue worker");
     if worker_shutdown_tx.send(true).is_err() {
         warn!("queue worker shutdown receiver already closed");
@@ -1204,6 +1878,540 @@ struct TickDeps {
     risk_manager: Arc<Mutex<RiskManager>>,
     pre_trade_validator: Arc<PreTradeValidator>,
     cex_order_books: Arc<dyn CexOrderBookSource>,
+    price_source: Arc<AnyPriceSource>,
+    base_fees: FeeStructure,
+    gas_estimator: GasFeeEstimator,
+    dex_fee_included_in_quote: bool,
+}
+
+#[derive(Clone)]
+enum GasFeeEstimator {
+    Fixed,
+    Rpc {
+        client: ChainClient,
+        gas_units: u64,
+        buffer_bps: u64,
+    },
+    Estimate {
+        client: ChainClient,
+        fallback_gas_units: u64,
+        buffer_bps: u64,
+        wallet: Address,
+        address_book: Arc<PairAddressBook>,
+        slippage_bps: u64,
+        chain_id: u64,
+        v2_router: Address,
+        v3_router: Address,
+    },
+    Anvil {
+        client: ChainClient,
+        simulator: ForkSimulator,
+        fallback_gas_units: u64,
+        buffer_bps: u64,
+        wallet: Address,
+        address_book: Arc<PairAddressBook>,
+        slippage_bps: u64,
+        chain_id: u64,
+        v2_router: Address,
+        v3_router: Address,
+    },
+}
+
+#[derive(Clone)]
+struct GasFeeEstimate {
+    mode: &'static str,
+    gas_units: u64,
+    max_fee_gwei: Decimal,
+    eth_usd: Option<Decimal>,
+    gas_usd: Decimal,
+}
+
+impl GasFeeEstimator {
+    async fn estimate_usd(
+        &self,
+        configured_gas_usd: Decimal,
+        eth_usd: Option<Decimal>,
+    ) -> Result<GasFeeEstimate, Box<dyn std::error::Error>> {
+        match self {
+            Self::Fixed => Ok(GasFeeEstimate {
+                mode: "fixed",
+                gas_units: 0,
+                max_fee_gwei: Decimal::ZERO,
+                eth_usd: None,
+                gas_usd: configured_gas_usd,
+            }),
+            Self::Rpc {
+                client,
+                gas_units,
+                buffer_bps,
+            }
+            | Self::Estimate {
+                client,
+                fallback_gas_units: gas_units,
+                buffer_bps,
+                ..
+            }
+            | Self::Anvil {
+                client,
+                fallback_gas_units: gas_units,
+                buffer_bps,
+                ..
+            } => {
+                let eth_usd =
+                    eth_usd.ok_or("--fee-gas-mode rpc/estimate/anvil requires ETH/USDC price")?;
+                let gas_price = client.get_gas_price().await?;
+                let max_fee = gas_price.get_max_fee(GasPriority::Medium, *buffer_bps);
+                let max_fee_wei = u256_to_decimal(max_fee)?;
+                let gas_units_decimal = Decimal::from(*gas_units);
+                let wei_per_eth = Decimal::from(10u64.pow(ETH_DECIMALS as u32));
+                let gas_usd = max_fee_wei * gas_units_decimal / wei_per_eth * eth_usd;
+                Ok(GasFeeEstimate {
+                    mode: match self {
+                        Self::Estimate { .. } => "rpc-fallback",
+                        Self::Anvil { .. } => "anvil-fallback",
+                        Self::Rpc { .. } => "rpc",
+                        Self::Fixed => "fixed",
+                    },
+                    gas_units: *gas_units,
+                    max_fee_gwei: max_fee_wei / Decimal::from(1_000_000_000u64),
+                    eth_usd: Some(eth_usd),
+                    gas_usd,
+                })
+            }
+        }
+    }
+}
+
+fn u256_to_decimal(value: U256) -> Result<Decimal, Box<dyn std::error::Error>> {
+    Decimal::from_str_exact(&value.to_string())
+        .map_err(|e| format!("failed to convert U256 {value} to Decimal: {e}").into())
+}
+
+async fn gas_units_to_usd(
+    client: &ChainClient,
+    gas_units: u64,
+    buffer_bps: u64,
+    eth_usd: Decimal,
+    mode: &'static str,
+) -> Result<GasFeeEstimate, Box<dyn std::error::Error>> {
+    let gas_price = client.get_gas_price().await?;
+    let max_fee = gas_price.get_max_fee(GasPriority::Medium, buffer_bps);
+    let max_fee_wei = u256_to_decimal(max_fee)?;
+    let wei_per_eth = Decimal::from(10u64.pow(ETH_DECIMALS as u32));
+    let gas_usd = max_fee_wei * Decimal::from(gas_units) / wei_per_eth * eth_usd;
+    Ok(GasFeeEstimate {
+        mode,
+        gas_units,
+        max_fee_gwei: max_fee_wei / Decimal::from(1_000_000_000u64),
+        eth_usd: Some(eth_usd),
+        gas_usd,
+    })
+}
+
+fn decimal_to_u256_scaled(
+    value: Decimal,
+    decimals: u8,
+) -> Result<U256, Box<dyn std::error::Error>> {
+    if value < Decimal::ZERO {
+        return Err(format!("negative amount: {value}").into());
+    }
+    let scale = Decimal::from(10u64.pow(decimals as u32));
+    let scaled = (value * scale).trunc();
+    U256::from_dec_str(&scaled.to_string())
+        .map_err(|e| format!("scale overflow ({scaled}): {e}").into())
+}
+
+fn decode_u256_return(raw: &[u8]) -> Result<U256, Box<dyn std::error::Error>> {
+    if raw.len() < 32 {
+        return Err(format!("expected uint256 return, got {} bytes", raw.len()).into());
+    }
+    Ok(U256::from_big_endian(&raw[raw.len() - 32..]))
+}
+
+fn current_unix_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+async fn erc20_allowance(
+    client: &ChainClient,
+    token: &Address,
+    owner: &Address,
+    spender: &Address,
+    chain_id: u64,
+) -> Result<U256, Box<dyn std::error::Error>> {
+    let req = TransactionRequest::contract_call(
+        token.clone(),
+        build_allowance_calldata(owner, spender),
+        chain_id,
+    );
+    let raw = client.call(&req, BlockId::Latest).await?;
+    decode_u256_return(&raw)
+}
+
+async fn estimate_signal_gas(
+    estimator: &GasFeeEstimator,
+    price_source: &AnyPriceSource,
+    signal: &Signal,
+) -> Result<Option<GasFeeEstimate>, Box<dyn std::error::Error>> {
+    let (
+        client,
+        simulator,
+        fallback_gas_units,
+        buffer_bps,
+        wallet,
+        address_book,
+        slippage_bps,
+        chain_id,
+        v2_router,
+        v3_router,
+    ) = match estimator {
+        GasFeeEstimator::Estimate {
+            client,
+            fallback_gas_units,
+            buffer_bps,
+            wallet,
+            address_book,
+            slippage_bps,
+            chain_id,
+            v2_router,
+            v3_router,
+        } => (
+            client,
+            None,
+            fallback_gas_units,
+            buffer_bps,
+            wallet,
+            address_book,
+            slippage_bps,
+            chain_id,
+            v2_router,
+            v3_router,
+        ),
+        GasFeeEstimator::Anvil {
+            client,
+            simulator,
+            fallback_gas_units,
+            buffer_bps,
+            wallet,
+            address_book,
+            slippage_bps,
+            chain_id,
+            v2_router,
+            v3_router,
+        } => (
+            client,
+            Some(simulator),
+            fallback_gas_units,
+            buffer_bps,
+            wallet,
+            address_book,
+            slippage_bps,
+            chain_id,
+            v2_router,
+            v3_router,
+        ),
+        _ => return Ok(None),
+    };
+    let tokens = address_book
+        .get(&signal.pair)
+        .ok_or_else(|| format!("missing address book entry for {}", signal.pair))?;
+    let (token_in, token_out, amount_in_units, expected_out_units, decimals_in, decimals_out) =
+        match signal.direction {
+            Direction::BuyCexSellDex => (
+                &tokens.base,
+                &tokens.quote,
+                signal.size,
+                signal.size * signal.dex_price,
+                tokens.base_decimals,
+                tokens.quote_decimals,
+            ),
+            Direction::BuyDexSellCex => (
+                &tokens.quote,
+                &tokens.base,
+                signal.size * signal.dex_price,
+                signal.size,
+                tokens.quote_decimals,
+                tokens.base_decimals,
+            ),
+        };
+    let router = match tokens.pool_kind {
+        DexPoolKind::V2 => v2_router,
+        DexPoolKind::V3 => v3_router,
+    };
+    let amount_in = decimal_to_u256_scaled(amount_in_units, decimals_in)?;
+    let expected_out = decimal_to_u256_scaled(expected_out_units, decimals_out)?;
+    let min_out = apply_slippage(expected_out, *slippage_bps);
+    if min_out.is_zero() {
+        return Err("estimate gas min_out is zero".into());
+    }
+
+    let eth_usd = price_source.get_latest_price("ETH/USDC").await?;
+    let allowance = erc20_allowance(client, token_in, wallet, router, *chain_id).await?;
+    let mut approval_gas = 0u64;
+    let mut swap_gas_mode = "estimate";
+    let swap_gas = if allowance >= amount_in {
+        let deadline = U256::from(current_unix_ts().saturating_add(60));
+        let calldata = match tokens.pool_kind {
+            DexPoolKind::V2 => {
+                let path = vec![token_in.clone(), token_out.clone()];
+                build_swap_calldata(amount_in, min_out, &path, wallet, deadline)
+            }
+            DexPoolKind::V3 => v3_swap_calldata_for_pair(
+                tokens, token_in, token_out, wallet, deadline, amount_in, min_out,
+            )?,
+        };
+        if let Some(simulator) = simulator {
+            let decoder = match tokens.pool_kind {
+                DexPoolKind::V2 => AmountOutDecoder::UniswapV2Amounts,
+                DexPoolKind::V3 => AmountOutDecoder::SingleUint,
+            };
+            let result = simulator
+                .simulate_swap(
+                    router.clone(),
+                    SwapParams {
+                        calldata: Bytes::from(calldata),
+                        value: U256::zero(),
+                        gas_limit: None,
+                        decoder,
+                    },
+                    wallet.clone(),
+                )
+                .await?;
+            if !result.success {
+                return Err(format!(
+                    "anvil fork swap simulation failed: {}",
+                    result.error.unwrap_or_else(|| "unknown revert".into())
+                )
+                .into());
+            }
+            if result.gas_used == 0 {
+                return Err("anvil fork gas simulation returned zero gas".into());
+            }
+            swap_gas_mode = "anvil";
+            result.gas_used
+        } else {
+            let tx = TransactionRequest::contract_call(router.clone(), calldata, *chain_id);
+            client.estimate_gas_from(&tx, wallet).await?
+        }
+    } else {
+        let approve_tx = TransactionRequest::contract_call(
+            token_in.clone(),
+            build_approve_calldata(router, U256::MAX),
+            *chain_id,
+        );
+        approval_gas = client.estimate_gas_from(&approve_tx, wallet).await?;
+        swap_gas_mode = if simulator.is_some() {
+            "anvil+approve+fallback"
+        } else {
+            "estimate+approve+fallback"
+        };
+        *fallback_gas_units
+    };
+    let total_gas = approval_gas.saturating_add(swap_gas);
+    Ok(Some(
+        gas_units_to_usd(client, total_gas, *buffer_bps, eth_usd, swap_gas_mode).await?,
+    ))
+}
+
+fn apply_gas_estimate_to_signal(
+    signal: &mut Signal,
+    base_fees: &FeeStructure,
+    gas: &GasFeeEstimate,
+) {
+    let mut fees = base_fees.clone();
+    fees.gas_cost_usd = gas.gas_usd;
+    let breakdown = fees.breakdown(signal.notional_usd);
+    signal.expected_fees = breakdown.total_fee_usd;
+    signal.expected_net_pnl = signal.expected_gross_pnl - signal.expected_fees;
+}
+
+async fn estimate_tick_fees(
+    deps: &TickDeps,
+) -> Result<(FeeStructure, GasFeeEstimate), Box<dyn std::error::Error>> {
+    let eth_usd = match &deps.gas_estimator {
+        GasFeeEstimator::Fixed => None,
+        GasFeeEstimator::Rpc { .. }
+        | GasFeeEstimator::Estimate { .. }
+        | GasFeeEstimator::Anvil { .. } => {
+            Some(deps.price_source.get_latest_price("ETH/USDC").await?)
+        }
+    };
+    let gas = deps
+        .gas_estimator
+        .estimate_usd(deps.base_fees.gas_cost_usd, eth_usd)
+        .await?;
+    let mut fees = deps.base_fees.clone();
+    fees.gas_cost_usd = gas.gas_usd;
+    Ok((fees, gas))
+}
+
+struct ExpectedPnlPreview {
+    direction: Direction,
+    cex_price: Decimal,
+    dex_price: Decimal,
+    spread_bps: Decimal,
+    quote_usd_price: Decimal,
+    trade_value_usd: Decimal,
+    breakeven_spread_bps: Decimal,
+    expected_gross_pnl: Decimal,
+    expected_fees: Decimal,
+    fee_breakdown: FeeBreakdown,
+    expected_net_pnl: Decimal,
+}
+
+fn expected_pnl_preview(market: &MarketState, fees: &FeeStructure) -> ExpectedPnlPreview {
+    let buy_cex_better = market.spread_buy_cex_bps >= market.spread_buy_dex_bps;
+    let direction = if buy_cex_better {
+        Direction::BuyCexSellDex
+    } else {
+        Direction::BuyDexSellCex
+    };
+    let cex_price = if buy_cex_better {
+        market.cex_ask
+    } else {
+        market.cex_bid
+    };
+    let dex_price = if buy_cex_better {
+        market.dex_sell
+    } else {
+        market.dex_buy
+    };
+    let spread_bps = if buy_cex_better {
+        market.spread_buy_cex_bps
+    } else {
+        market.spread_buy_dex_bps
+    };
+    let trade_value_usd = market.size * cex_price * market.quote_usd_price;
+    let bps = Decimal::from(10_000);
+    let expected_gross_pnl = spread_bps / bps * trade_value_usd;
+    let fee_breakdown = fees.breakdown(trade_value_usd);
+    let expected_fees = fee_breakdown.total_fee_usd;
+    let expected_net_pnl = expected_gross_pnl - expected_fees;
+    ExpectedPnlPreview {
+        direction,
+        cex_price,
+        dex_price,
+        spread_bps,
+        quote_usd_price: market.quote_usd_price,
+        trade_value_usd,
+        breakeven_spread_bps: fees.breakeven_spread_bps(trade_value_usd),
+        expected_gross_pnl,
+        expected_fees,
+        fee_breakdown,
+        expected_net_pnl,
+    }
+}
+
+fn fmt_usd(value: Decimal) -> String {
+    format!("${:.6}", value.round_dp(6))
+}
+
+fn fmt_bps(value: Decimal) -> String {
+    format!("{:.2} bps", value.round_dp(2))
+}
+
+fn fmt_qty(value: Decimal) -> String {
+    format!("{:.6}", value.round_dp(6))
+}
+
+fn fmt_price(value: Decimal) -> String {
+    format!("{:.9}", value.round_dp(9))
+}
+
+fn fmt_optional_usd(value: Option<Decimal>) -> String {
+    value.map(fmt_usd).unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_gas_units(gas: &GasFeeEstimate) -> String {
+    if gas.gas_units == 0 {
+        "-".to_string()
+    } else {
+        gas.gas_units.to_string()
+    }
+}
+
+fn fmt_max_fee_gwei(gas: &GasFeeEstimate) -> String {
+    if gas.gas_units == 0 {
+        "-".to_string()
+    } else {
+        format!("{} gwei", fmt_qty(gas.max_fee_gwei))
+    }
+}
+
+fn fmt_dex_fee_mode(included_in_quote: bool) -> &'static str {
+    if included_in_quote {
+        "included in quote"
+    } else {
+        "explicit bps"
+    }
+}
+
+fn render_dry_run_opportunity(
+    pair: &str,
+    market: &MarketState,
+    preview: &ExpectedPnlPreview,
+    gas: &GasFeeEstimate,
+    dex_fee_included_in_quote: bool,
+) -> String {
+    format!(
+        "\n┌─ 🧪 DRY RUN OPPORTUNITY ─────────────────────────────────────\n\
+         │ pair         │ {pair}\n\
+         │ status       │ no_signal\n\
+         │ direction    │ {direction}\n\
+         │ size         │ {size}\n\
+         │ notional     │ {notional}\n\
+         │ quote/USD    │ {quote_usd}\n\
+         ├─ Prices ─────────────────────────────────────────────\n\
+         │ CEX bid/ask  │ {cex_bid} / {cex_ask}\n\
+         │ DEX buy/sell │ {dex_buy} / {dex_sell}\n\
+         │ best CEX/DEX │ {best_cex} / {best_dex}\n\
+         ├─ Edge ───────────────────────────────────────────────\n\
+         │ best spread  │ {best_spread}\n\
+         │ buy CEX      │ {buy_cex_bps}\n\
+         │ buy DEX      │ {buy_dex_bps}\n\
+         │ breakeven    │ {breakeven}\n\
+         ├─ Fees ───────────────────────────────────────────────\n\
+         │ CEX taker    │ {cex_fee}\n\
+         │ DEX pool     │ {dex_fee} ({dex_fee_mode})\n\
+         │ gas          │ {gas_fee} ({gas_mode})\n\
+         │ gas units    │ {gas_units}\n\
+         │ max fee      │ {max_fee_gwei}\n\
+         │ ETH/USD      │ {gas_eth_usd}\n\
+         │ total fees   │ {fees} / {fee_bps}\n\
+         ├─ Expected PnL ───────────────────────────────────────\n\
+         │ gross        │ {gross}\n\
+         │ net          │ {net}\n\
+         └──────────────────────────────────────────────────────",
+        direction = preview.direction,
+        size = fmt_qty(market.size),
+        notional = fmt_usd(preview.trade_value_usd),
+        quote_usd = fmt_usd(preview.quote_usd_price),
+        cex_bid = fmt_price(market.cex_bid),
+        cex_ask = fmt_price(market.cex_ask),
+        dex_buy = fmt_price(market.dex_buy),
+        dex_sell = fmt_price(market.dex_sell),
+        best_cex = fmt_price(preview.cex_price),
+        best_dex = fmt_price(preview.dex_price),
+        best_spread = fmt_bps(preview.spread_bps),
+        buy_cex_bps = fmt_bps(market.spread_buy_cex_bps),
+        buy_dex_bps = fmt_bps(market.spread_buy_dex_bps),
+        breakeven = fmt_bps(preview.breakeven_spread_bps),
+        cex_fee = fmt_usd(preview.fee_breakdown.cex_fee_usd),
+        dex_fee = fmt_usd(preview.fee_breakdown.dex_fee_usd),
+        dex_fee_mode = fmt_dex_fee_mode(dex_fee_included_in_quote),
+        gas_fee = fmt_usd(preview.fee_breakdown.gas_fee_usd),
+        gas_mode = gas.mode,
+        gas_units = fmt_gas_units(gas),
+        max_fee_gwei = fmt_max_fee_gwei(gas),
+        gas_eth_usd = fmt_optional_usd(gas.eth_usd),
+        gross = fmt_usd(preview.expected_gross_pnl),
+        fees = fmt_usd(preview.expected_fees),
+        fee_bps = fmt_bps(preview.fee_breakdown.total_fee_bps),
+        net = fmt_usd(preview.expected_net_pnl),
+    )
 }
 
 #[derive(Clone)]
@@ -1302,6 +2510,9 @@ async fn tick(
         }
     }
 
+    let (tick_fees, gas_estimate) = estimate_tick_fees(deps).await?;
+    generator.set_fees(tick_fees.clone());
+
     for pair in pairs {
         let (maybe_signal, maybe_market) = match generator.generate(pair, size).await {
             Ok(s) => s,
@@ -1315,21 +2526,17 @@ async fn tick(
             None => {
                 if deps.dry_run {
                     if let Some(m) = maybe_market {
-                        if deps.verbose {
-                            info!(
+                        let preview = expected_pnl_preview(&m, &tick_fees);
+                        info!(
+                            "{}",
+                            render_dry_run_opportunity(
                                 pair,
-                                size = %m.size,
-                                cex_bid = %m.cex_bid,
-                                cex_ask = %m.cex_ask,
-                                dex_buy = %m.dex_buy,
-                                dex_sell = %m.dex_sell,
-                                buy_cex_bps = %m.spread_buy_cex_bps,
-                                buy_dex_bps = %m.spread_buy_dex_bps,
-                                "DRY_RUN no_signal"
-                            );
-                        } else {
-                            debug!(pair, size = %m.size, "DRY_RUN no_signal");
-                        }
+                                &m,
+                                &preview,
+                                &gas_estimate,
+                                deps.dex_fee_included_in_quote
+                            )
+                        );
                     } else {
                         if deps.verbose {
                             info!(pair, size = %size, "DRY_RUN no_signal (no market info)");
@@ -1340,13 +2547,28 @@ async fn tick(
             }
         };
 
+        let mut signal_gas_estimate = gas_estimate.clone();
+        if let Some(exact_gas) =
+            estimate_signal_gas(&deps.gas_estimator, deps.price_source.as_ref(), &signal).await?
+        {
+            apply_gas_estimate_to_signal(&mut signal, &deps.base_fees, &exact_gas);
+            signal_gas_estimate = exact_gas;
+        }
+
         let validation = deps.pre_trade_validator.validate_signal(&signal);
         if !validation.allowed() {
             warn!(
                 pair,
+                status = "rejected_pre_trade",
                 reason = validation.reason(),
+                direction = %signal.direction,
+                size = %signal.size,
+                notional_usd = %signal.notional_usd,
                 spread_bps = %signal.spread_bps,
-                "pre-trade validation failed"
+                expected_gross_pnl_usd = %signal.expected_gross_pnl,
+                expected_fees_usd = %signal.expected_fees,
+                expected_net_pnl_usd = %signal.expected_net_pnl,
+                "⛔ trade rejected"
             );
             continue;
         }
@@ -1355,9 +2577,16 @@ async fn tick(
         if !risk_decision.allowed() {
             warn!(
                 pair,
+                status = "rejected_risk",
                 reason = risk_decision.reason(),
+                direction = %signal.direction,
+                size = %signal.size,
+                notional_usd = %signal.notional_usd,
                 spread_bps = %signal.spread_bps,
-                "risk check failed"
+                expected_gross_pnl_usd = %signal.expected_gross_pnl,
+                expected_fees_usd = %signal.expected_fees,
+                expected_net_pnl_usd = %signal.expected_net_pnl,
+                "⛔ trade rejected"
             );
             continue;
         }
@@ -1381,10 +2610,17 @@ async fn tick(
         if signal.score < min_score {
             info!(
                 pair,
+                status = "skipped_low_score",
+                direction = %signal.direction,
                 spread_bps = %signal.spread_bps,
                 size = %signal.size,
+                notional_usd = %signal.notional_usd,
                 score = %signal.score,
-                "skipped: score below threshold"
+                min_score = %min_score,
+                expected_gross_pnl_usd = %signal.expected_gross_pnl,
+                expected_fees_usd = %signal.expected_fees,
+                expected_net_pnl_usd = %signal.expected_net_pnl,
+                "🟡 trade skipped"
             );
             continue;
         }
@@ -1392,26 +2628,34 @@ async fn tick(
         if deps.dry_run {
             info!(
                 pair,
+                status = "would_trade",
                 direction = %signal.direction,
                 size = %signal.size,
+                notional_usd = %signal.notional_usd,
                 cex_price = %signal.cex_price,
                 dex_price = %signal.dex_price,
                 spread_bps = %signal.spread_bps,
-                expected_gross_pnl = %signal.expected_gross_pnl,
-                expected_fees = %signal.expected_fees,
-                expected_net_pnl = %signal.expected_net_pnl,
+                expected_gross_pnl_usd = %signal.expected_gross_pnl,
+                expected_fees_usd = %signal.expected_fees,
+                expected_net_pnl_usd = %signal.expected_net_pnl,
+                gas_mode = signal_gas_estimate.mode,
+                gas_units = signal_gas_estimate.gas_units,
+                gas_fee_usd = %signal_gas_estimate.gas_usd,
+                max_fee_gwei = %signal_gas_estimate.max_fee_gwei,
                 score = %signal.score,
-                "DRY_RUN would_trade"
+                "✅ DRY_RUN would_trade"
             );
             continue;
         }
 
         info!(
             pair,
+            status = "enqueue",
             spread_bps = %signal.spread_bps,
             score = %signal.score,
             direction = %signal.direction,
-            "enqueue"
+            expected_net_pnl_usd = %signal.expected_net_pnl,
+            "🚀 enqueue"
         );
 
         // Enqueue for the worker to pick up. Push returns `false` when the
@@ -1502,6 +2746,12 @@ struct AddressBookEntry {
     pool: Option<String>,
     #[serde(default = "default_pool_type")]
     pool_type: String,
+    #[serde(default, alias = "fee", alias = "fee_tier", alias = "fee_bps")]
+    v3_fee: Option<u32>,
+    #[serde(default)]
+    v3_path: Option<Vec<String>>,
+    #[serde(default, alias = "fees", alias = "fee_path", alias = "v3_fee_path")]
+    v3_fees: Option<Vec<u32>>,
     #[serde(default)]
     quoter: Option<String>,
     #[serde(default = "default_quoter_type")]
@@ -1516,6 +2766,434 @@ fn default_quoter_type() -> String {
     "quoter_v2".to_string()
 }
 
+fn parse_optional_v3_path(
+    raw: Option<Vec<String>>,
+) -> Result<Option<Vec<Address>>, Box<dyn std::error::Error>> {
+    raw.map(|path| {
+        path.into_iter()
+            .map(|address| Address::new(&address).map_err(|e| e.into()))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
+    })
+    .transpose()
+}
+
+fn run_config_check(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    Decimal::from_str_exact(&cli.size).map_err(|e| format!("invalid --size: {e}"))?;
+    Decimal::from_str_exact(&cli.max_daily_loss_usd)
+        .map_err(|e| format!("invalid --max-daily-loss-usd: {e}"))?;
+    Decimal::from_str_exact(&cli.initial_capital_usd)
+        .map_err(|e| format!("invalid --initial-capital-usd: {e}"))?;
+    Decimal::from_str_exact(&cli.risk_max_trade_usd)
+        .map_err(|e| format!("invalid --risk-max-trade-usd: {e}"))?;
+    Decimal::from_str_exact(&cli.risk_max_daily_loss_usd)
+        .map_err(|e| format!("invalid --risk-max-daily-loss-usd: {e}"))?;
+    Decimal::from_str_exact(&cli.fee_gas_usd).map_err(|e| format!("invalid --fee-gas-usd: {e}"))?;
+    match cli.fee_gas_mode.to_ascii_lowercase().as_str() {
+        "fixed" => {}
+        "rpc" => {
+            resolve_rpc_urls(cli)
+                .ok_or("--fee-gas-mode rpc requires --eth-rpc-url or ETH_RPC_URL")?;
+        }
+        "estimate" => {
+            resolve_wallet_config(cli).ok_or(
+                "--fee-gas-mode estimate requires --eth-rpc-url/ETH_RPC_URL and --wallet-address/WALLET_ADDRESS",
+            )?;
+            if cli.dex_address_book.is_empty() {
+                return Err("--fee-gas-mode estimate requires --dex-address-book".into());
+            }
+        }
+        "anvil" => {
+            resolve_anvil_fork_url(cli)
+                .ok_or("--fee-gas-mode anvil requires --anvil-fork-url or ANVIL_FORK_URL")?;
+            resolve_wallet_address(cli)
+                .ok_or("--fee-gas-mode anvil requires --wallet-address or WALLET_ADDRESS")?;
+            if cli.dex_address_book.is_empty() {
+                return Err("--fee-gas-mode anvil requires --dex-address-book".into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "invalid --fee-gas-mode '{other}', expected fixed, rpc, estimate, or anvil"
+            )
+            .into());
+        }
+    }
+    effective_dex_fee_bps(cli.fee_dex_swap_bps, &cli.dex_address_book)?;
+    validate_live_execution_config(cli)?;
+    if !cli.dex_address_book.is_empty() {
+        let _address_book = load_address_book(&cli.dex_address_book)?;
+        let tracked_pairs = tracked_pairs_for_price_source(&cli.pair);
+        let _live_pools = load_live_pool_book(&cli.dex_address_book, Some(&tracked_pairs))?;
+        if !cli.simulation && !cli.dry_run {
+            let (has_v2, has_v3) = live_execution_pool_kinds(&cli.dex_address_book, &cli.pair)?;
+            if has_v2 && has_v3 && !cli.dex_router.is_empty() {
+                return Err("mixed V2/V3 live execution requires --dex-router to be empty so V2 and V3 can use their own routers".into());
+            }
+            if cli.dex_router.is_empty() && has_v2 {
+                let _ = DexSwapperConfig::default().router;
+            } else if !cli.dex_router.is_empty() {
+                Address::new(&cli.dex_router).map_err(|e| format!("invalid --dex-router: {e}"))?;
+            }
+            resolve_rpc_urls(cli).ok_or(
+                "live DEX execution requires --eth-rpc-url or ETH_RPC_URL in --check-config",
+            )?;
+            WalletManager::from_env(&cli.wallet_key_env)
+                .map_err(|e| format!("invalid live DEX wallet config: {e}"))?;
+            if cli.use_flashbots || cli.require_private_dex {
+                WalletManager::from_env(&cli.flashbots_auth_key_env).map_err(|e| {
+                    format!(
+                        "private DEX mode requires --flashbots-auth-key-env {}: {e}",
+                        cli.flashbots_auth_key_env
+                    )
+                })?;
+            }
+        }
+    }
+    if !cli.simulation {
+        let production = cli.production || peanut_internship_rust::config::env_production_enabled();
+        BinanceConfig::from_env_for(production)
+            .map_err(|e| format!("invalid Binance configuration: {e}"))?;
+    }
+    if cli.rebalance_enabled && !cli.rebalance_dry_run {
+        if resolve_rpc_urls(cli).is_none() {
+            return Err("live rebalance requires --eth-rpc-url or ETH_RPC_URL".into());
+        }
+        WalletManager::from_env(&cli.wallet_key_env)
+            .map_err(|e| format!("invalid rebalance wallet config: {e}"))?;
+        if cli.rebalance_cex_deposit_address.is_empty() {
+            return Err("live rebalance requires --rebalance-cex-deposit-address or REBALANCE_CEX_DEPOSIT_ADDRESS".into());
+        }
+        Address::new(&cli.rebalance_cex_deposit_address)
+            .map_err(|e| format!("invalid rebalance CEX deposit address: {e}"))?;
+        if !cli.rebalance_cex_withdraw_address.is_empty() {
+            Address::new(&cli.rebalance_cex_withdraw_address)
+                .map_err(|e| format!("invalid rebalance CEX withdraw address: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn effective_dex_fee_bps(
+    configured_bps: u64,
+    dex_address_book: &str,
+) -> Result<Decimal, Box<dyn std::error::Error>> {
+    if dex_address_book.is_empty() {
+        return Ok(Decimal::from(configured_bps));
+    }
+    if configured_bps != 0 {
+        return Err(format!(
+            "--fee-dex-swap-bps must be 0 when --dex-address-book is set because live DEX quotes already include pool fees; configured {configured_bps}"
+        )
+        .into());
+    }
+    Ok(Decimal::ZERO)
+}
+
+fn validate_live_execution_config(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.simulation || cli.dry_run {
+        return Ok(());
+    }
+    validate_flashbots_relay_chain(cli)?;
+    if cli.max_concurrent_executions != 1 {
+        return Err(
+            "live execution requires --max-concurrent-executions 1 until inventory reservations and nonce manager are implemented"
+                .into(),
+        );
+    }
+    if cli.dex_address_book.is_empty() {
+        return Err(
+            "live execution requires --dex-address-book; otherwise DEX leg is not implemented"
+                .into(),
+        );
+    }
+    if cli.reconcile_db.is_empty() {
+        return Err("live execution requires --reconcile-db so LEG2_TIMEOUT entries survive restart and can be audited".into());
+    }
+    validate_live_dex_pool_compatibility(&cli.dex_address_book, &cli.pair)?;
+    validate_live_cex_pair_symbols(&cli.pair)?;
+    validate_live_asset_symbol_uniqueness(&cli.dex_address_book, &cli.pair)?;
+    validate_live_known_token_symbols(&cli.dex_address_book, &cli.pair, cli.dex_chain_id)?;
+    if cli.rebalance_enabled && !cli.rebalance_dry_run {
+        return Err(
+            "live rebalance execution is implemented but not production-enabled; keep REBALANCE_DRY_RUN=true until withdrawal/deposit confirmation tracking and allowlists are added"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_flashbots_relay_chain(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.use_flashbots
+        && cli.dex_chain_id != 1
+        && cli.flashbots_relay_url.trim_end_matches('/') == FLASHBOTS_MAINNET_RELAY_URL
+    {
+        return Err(format!(
+            "default Flashbots relay {FLASHBOTS_MAINNET_RELAY_URL} is Ethereum mainnet-only; set --use-flashbots=false for chain {} public DEX mode or provide a chain-specific private relay via --flashbots-relay-url",
+            cli.dex_chain_id
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_live_dex_pool_compatibility(
+    path: &str,
+    pairs: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    for pair in pairs {
+        let entry = raw.get(pair).ok_or_else(|| {
+            format!("live execution pair '{pair}' missing from --dex-address-book")
+        })?;
+        if entry.pool.as_deref().unwrap_or_default().is_empty() {
+            return Err(
+                format!("live execution pair '{pair}' has no pool in --dex-address-book").into(),
+            );
+        }
+        let kind = match entry.pool_type.to_ascii_lowercase().as_str() {
+            "v2" => DexPoolKind::V2,
+            "v3" => {
+                match (&entry.v3_path, &entry.v3_fees) {
+                    (Some(path), Some(fees)) => {
+                        if path.len() < 2 {
+                            return Err(format!(
+                                "live execution pair '{pair}' has v3_path with fewer than 2 tokens"
+                            )
+                            .into());
+                        }
+                        if fees.len() + 1 != path.len() {
+                            return Err(format!(
+                                "live execution pair '{pair}' has v3_fees length {}, expected {} for v3_path length {}",
+                                fees.len(),
+                                path.len().saturating_sub(1),
+                                path.len()
+                            )
+                            .into());
+                        }
+                        let route = parse_optional_v3_path(Some(path.clone()))?
+                            .ok_or("v3_path parse returned no route")?;
+                        let base = Address::new(&entry.base)?;
+                        let quote = Address::new(&entry.quote)?;
+                        let starts_base_ends_quote =
+                            route.first() == Some(&base) && route.last() == Some(&quote);
+                        let starts_quote_ends_base =
+                            route.first() == Some(&quote) && route.last() == Some(&base);
+                        if !starts_base_ends_quote && !starts_quote_ends_base {
+                            return Err(format!(
+                                "live execution pair '{pair}' v3_path endpoints must match pair base/quote token addresses"
+                            )
+                            .into());
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(format!(
+                            "live execution pair '{pair}' uses V3 route but must provide both v3_path and v3_fees"
+                        )
+                        .into());
+                    }
+                }
+                let _ = entry.v3_fee;
+                DexPoolKind::V3
+            }
+            other => {
+                return Err(format!(
+                    "live execution pair '{pair}' has unsupported pool_type '{other}'"
+                )
+                .into());
+            }
+        };
+        let _ = kind;
+    }
+    Ok(())
+}
+
+fn validate_live_cex_pair_symbols(pairs: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    for pair in pairs {
+        let (base, quote) = pair.split_once('/').ok_or_else(|| {
+            format!("live execution pair '{pair}' missing '/' separator for CEX symbol mapping")
+        })?;
+        for asset in [base, quote] {
+            if asset.is_empty() || !asset.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(format!(
+                    "live execution pair '{pair}' contains CEX-incompatible asset symbol '{asset}'; Binance symbol mapping only supports alphanumeric asset symbols"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_known_token_symbols(
+    path: &str,
+    pairs: &[String],
+    chain_id: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if chain_id != ARBITRUM_CHAIN_ID {
+        return Ok(());
+    }
+    let native_usdc = Address::new(ARBITRUM_NATIVE_USDC)?;
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    for pair in pairs {
+        let entry = raw.get(pair).ok_or_else(|| {
+            format!("live execution pair '{pair}' missing from --dex-address-book")
+        })?;
+        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
+            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
+        })?;
+        for (symbol, address) in [(base_symbol, &entry.base), (quote_symbol, &entry.quote)] {
+            if symbol.eq_ignore_ascii_case("USDC") {
+                let parsed = Address::new(address)?;
+                if parsed != native_usdc {
+                    return Err(format!(
+                        "live execution pair '{pair}' uses symbol USDC for token {}; on Arbitrum live CEX↔DEX accounting requires native USDC {ARBITRUM_NATIVE_USDC}; use a distinct symbol such as USDC_E for bridged USDC.e",
+                        parsed
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_asset_symbol_uniqueness(
+    path: &str,
+    pairs: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let mut by_symbol: HashMap<String, (String, String)> = HashMap::new();
+    for pair in pairs {
+        let entry = raw.get(pair).ok_or_else(|| {
+            format!("live execution pair '{pair}' missing from --dex-address-book")
+        })?;
+        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
+            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
+        })?;
+        for (symbol, address) in [(base_symbol, &entry.base), (quote_symbol, &entry.quote)] {
+            let key = symbol.to_ascii_uppercase();
+            let parsed = Address::new(address)?;
+            let lower = parsed.lower();
+            if let Some((seen_address, seen_pair)) = by_symbol.get(&key) {
+                if seen_address != &lower {
+                    return Err(format!(
+                        "live execution asset symbol '{key}' maps to multiple token addresses across selected pairs: {seen_address} in {seen_pair}, {lower} in {pair}; use distinct symbols such as USDC and USDC_E"
+                    )
+                    .into());
+                }
+            } else {
+                by_symbol.insert(key, (lower, pair.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn live_execution_pool_kinds(
+    path: &str,
+    pairs: &[String],
+) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let mut has_v2 = false;
+    let mut has_v3 = false;
+    for pair in pairs {
+        let entry = raw.get(pair).ok_or_else(|| {
+            format!("live execution pair '{pair}' missing from --dex-address-book")
+        })?;
+        match entry.pool_type.to_ascii_lowercase().as_str() {
+            "v2" => has_v2 = true,
+            "v3" => has_v3 = true,
+            other => {
+                return Err(format!(
+                    "live execution pair '{pair}' has unsupported pool_type '{other}'"
+                )
+                .into());
+            }
+        }
+    }
+    Ok((has_v2, has_v3))
+}
+
+fn build_rebalance_transfer_context(
+    cli: &Cli,
+    exchange: Arc<ExchangeClient>,
+    nonce_manager: NonceManager,
+) -> Result<Option<RebalanceTransferContext>, Box<dyn std::error::Error>> {
+    if cli.rebalance_dry_run {
+        return Ok(None);
+    }
+    let rpc_urls = resolve_rpc_urls(cli)
+        .ok_or("live rebalance requires --eth-rpc-url or ETH_RPC_URL for Wallet→CEX transfers")?;
+    let chain = ChainClient::new(rpc_urls, 30, 3)?;
+    let wallet = WalletManager::from_env(&cli.wallet_key_env)?;
+    let cex_withdraw_address = if cli.rebalance_cex_withdraw_address.is_empty() {
+        wallet.address()
+    } else {
+        cli.rebalance_cex_withdraw_address.clone()
+    };
+    Address::new(&cex_withdraw_address)
+        .map_err(|e| format!("invalid rebalance CEX withdraw address: {e}"))?;
+    if cli.rebalance_cex_deposit_address.is_empty() {
+        return Err("live rebalance requires --rebalance-cex-deposit-address or REBALANCE_CEX_DEPOSIT_ADDRESS".into());
+    }
+    let cex_deposit_address = Address::new(&cli.rebalance_cex_deposit_address)
+        .map_err(|e| format!("invalid rebalance CEX deposit address: {e}"))?;
+    let token_book = if cli.dex_address_book.is_empty() {
+        HashMap::new()
+    } else {
+        load_rebalance_token_book(&cli.dex_address_book)?
+    };
+    info!(
+        cex_withdraw_address = %cex_withdraw_address,
+        cex_withdraw_network = %cli.rebalance_cex_withdraw_network,
+        cex_deposit_address = %cex_deposit_address,
+        chain_id = cli.rebalance_chain_id,
+        token_count = token_book.len(),
+        "live auto-rebalance transfer context configured"
+    );
+    Ok(Some(RebalanceTransferContext {
+        exchange,
+        chain,
+        wallet,
+        nonce_manager,
+        cex_withdraw_address,
+        cex_withdraw_network: cli.rebalance_cex_withdraw_network.clone(),
+        cex_deposit_address,
+        token_book,
+        chain_id: cli.rebalance_chain_id,
+        max_gas_gwei: (cli.max_gas_gwei > 0).then_some(cli.max_gas_gwei),
+    }))
+}
+
+fn load_rebalance_token_book(
+    path: &str,
+) -> Result<HashMap<String, RebalanceTokenConfig>, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let mut out = HashMap::new();
+    for (pair, entry) in raw {
+        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
+            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
+        })?;
+        out.entry(base_symbol.to_ascii_uppercase())
+            .or_insert(RebalanceTokenConfig {
+                address: Address::new(&entry.base)?,
+                decimals: entry.base_decimals,
+            });
+        out.entry(quote_symbol.to_ascii_uppercase())
+            .or_insert(RebalanceTokenConfig {
+                address: Address::new(&entry.quote)?,
+                decimals: entry.quote_decimals,
+            });
+    }
+    Ok(out)
+}
+
 fn load_address_book(path: &str) -> Result<PairAddressBook, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
@@ -1528,6 +3206,90 @@ fn load_address_book(path: &str) -> Result<PairAddressBook, Box<dyn std::error::
                 base_decimals: entry.base_decimals,
                 quote: Address::new(&entry.quote)?,
                 quote_decimals: entry.quote_decimals,
+                pool_kind: match entry.pool_type.to_ascii_lowercase().as_str() {
+                    "v2" => DexPoolKind::V2,
+                    "v3" => DexPoolKind::V3,
+                    other => {
+                        return Err(format!(
+                            "pair has unsupported pool_type '{other}', expected 'v2' or 'v3'"
+                        )
+                        .into());
+                    }
+                },
+                v3_fee: entry.v3_fee,
+                v3_path: parse_optional_v3_path(entry.v3_path)?,
+                v3_fees: entry.v3_fees,
+                v3_quoter: entry.quoter.as_deref().map(Address::new).transpose()?,
+            },
+        );
+    }
+    Ok(book)
+}
+
+async fn discover_v3_pool_fee(
+    chain: &ChainClient,
+    pool: &Address,
+    chain_id: u64,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let call = TransactionRequest::contract_call(
+        pool.clone(),
+        UNISWAP_V3_POOL_FEE_SELECTOR.to_vec(),
+        chain_id,
+    );
+    let raw = chain
+        .call(&call, BlockId::Latest)
+        .await
+        .map_err(|e| format!("V3 pool fee() call failed for {pool}: {e}"))?;
+    if raw.len() < 32 {
+        return Err(format!("V3 pool fee() returned {} bytes, expected 32", raw.len()).into());
+    }
+    let bytes: [u8; 32] = raw[..32]
+        .try_into()
+        .map_err(|_| "V3 pool fee() return conversion failed")?;
+    Ok(U256::from_big_endian(&bytes).as_u64() as u32)
+}
+
+async fn load_address_book_with_fee_discovery(
+    path: &str,
+    chain: &ChainClient,
+    chain_id: u64,
+) -> Result<PairAddressBook, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let mut book = PairAddressBook::new();
+    for (pair, entry) in raw {
+        let pool_kind = match entry.pool_type.to_ascii_lowercase().as_str() {
+            "v2" => DexPoolKind::V2,
+            "v3" => DexPoolKind::V3,
+            other => {
+                return Err(format!(
+                    "pair has unsupported pool_type '{other}', expected 'v2' or 'v3'"
+                )
+                .into());
+            }
+        };
+        let v3_fee =
+            if pool_kind == DexPoolKind::V3 && entry.v3_fee.is_none() && entry.v3_path.is_none() {
+                let pool = entry
+                    .pool
+                    .as_deref()
+                    .ok_or_else(|| format!("pair '{pair}' missing pool for V3 fee discovery"))?;
+                Some(discover_v3_pool_fee(chain, &Address::new(pool)?, chain_id).await?)
+            } else {
+                entry.v3_fee
+            };
+        book.insert(
+            pair,
+            PairTokens {
+                base: Address::new(&entry.base)?,
+                base_decimals: entry.base_decimals,
+                quote: Address::new(&entry.quote)?,
+                quote_decimals: entry.quote_decimals,
+                pool_kind,
+                v3_fee,
+                v3_path: parse_optional_v3_path(entry.v3_path)?,
+                v3_fees: entry.v3_fees,
+                v3_quoter: entry.quoter.as_deref().map(Address::new).transpose()?,
             },
         );
     }
@@ -1541,12 +3303,20 @@ type LivePoolEntry = LivePoolConfig;
 /// [`LivePriceSource::new`]. Silently skips entries without a pool so the
 /// file can serve both the swapper (which only needs token metadata) and
 /// the live pricer (which additionally needs the pool address).
-fn load_live_pool_book(path: &str) -> Result<Vec<LivePoolEntry>, Box<dyn std::error::Error>> {
+fn load_live_pool_book(
+    path: &str,
+    pair_filter: Option<&[String]>,
+) -> Result<Vec<LivePoolEntry>, Box<dyn std::error::Error>> {
     use peanut_internship_rust::core::types::Token;
     let content = std::fs::read_to_string(path)?;
     let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
     let mut out = Vec::new();
     for (pair, entry) in raw {
+        if let Some(filter) = pair_filter
+            && !filter.iter().any(|wanted| wanted == &pair)
+        {
+            continue;
+        }
         let Some(pool_str) = entry.pool.as_deref() else {
             continue;
         };
@@ -1608,19 +3378,47 @@ fn load_live_pool_book(path: &str) -> Result<Vec<LivePoolEntry>, Box<dyn std::er
     Ok(out)
 }
 
+fn tracked_pairs_for_price_source(pairs: &[String]) -> Vec<String> {
+    let mut tracked_pairs = pairs.to_vec();
+    for pair in pairs {
+        if pair.ends_with("/ETH") && !tracked_pairs.contains(&"ETH/USDC".to_string()) {
+            tracked_pairs.push("ETH/USDC".to_string());
+        }
+    }
+    tracked_pairs
+}
+
 /// Resolves `(rpc_url, wallet_address)` from CLI first, then env vars.
 /// Returns `None` when either is empty — caller skips wallet sync.
 fn resolve_wallet_config(cli: &Cli) -> Option<(Vec<String>, String)> {
     let rpc_urls = resolve_rpc_urls(cli).unwrap_or_default();
+    let addr = resolve_wallet_address(cli).unwrap_or_default();
+    if rpc_urls.is_empty() || addr.is_empty() {
+        None
+    } else {
+        Some((rpc_urls, addr))
+    }
+}
+
+fn resolve_wallet_address(cli: &Cli) -> Option<String> {
     let addr = if cli.wallet_address.is_empty() {
         std::env::var("WALLET_ADDRESS").unwrap_or_default()
     } else {
         cli.wallet_address.clone()
     };
-    if rpc_urls.is_empty() || addr.is_empty() {
+    if addr.is_empty() { None } else { Some(addr) }
+}
+
+fn resolve_anvil_fork_url(cli: &Cli) -> Option<String> {
+    let fork_url = if cli.anvil_fork_url.is_empty() {
+        std::env::var("ANVIL_FORK_URL").unwrap_or_default()
+    } else {
+        cli.anvil_fork_url.clone()
+    };
+    if fork_url.is_empty() {
         None
     } else {
-        Some((rpc_urls, addr))
+        Some(fork_url)
     }
 }
 
@@ -1935,5 +3733,349 @@ mod seed_tests {
                 "http://c".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn effective_dex_fee_requires_explicit_zero_with_live_address_book_quotes() {
+        assert_eq!(effective_dex_fee_bps(30, "").unwrap(), Decimal::from(30));
+        assert_eq!(
+            effective_dex_fee_bps(0, "configs/address_book_arbitrum.json").unwrap(),
+            Decimal::ZERO
+        );
+        assert!(effective_dex_fee_bps(30, "configs/address_book_arbitrum.json").is_err());
+    }
+
+    #[test]
+    fn tracked_pairs_adds_eth_usdc_conversion_once() {
+        assert_eq!(
+            tracked_pairs_for_price_source(&["LINK/ETH".to_string()]),
+            vec!["LINK/ETH".to_string(), "ETH/USDC".to_string()]
+        );
+        assert_eq!(
+            tracked_pairs_for_price_source(&["LINK/ETH".to_string(), "ETH/USDC".to_string()]),
+            vec!["LINK/ETH".to_string(), "ETH/USDC".to_string()]
+        );
+    }
+
+    fn write_address_book(body: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, body.as_bytes()).unwrap();
+        file
+    }
+
+    #[test]
+    fn live_dex_validation_accepts_v2_pool() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v2"
+                }
+            }"#,
+        );
+        assert!(
+            validate_live_dex_pool_compatibility(
+                file.path().to_str().unwrap(),
+                &["ETH/USDC".to_string()]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn live_dex_validation_accepts_v3_pool_with_fee() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3",
+                    "fee": 500
+                }
+            }"#,
+        );
+        assert!(
+            validate_live_dex_pool_compatibility(
+                file.path().to_str().unwrap(),
+                &["ETH/USDC".to_string()]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn live_dex_validation_accepts_v3_pool_without_fee_for_discovery() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3"
+                }
+            }"#,
+        );
+        assert!(
+            validate_live_dex_pool_compatibility(
+                file.path().to_str().unwrap(),
+                &["ETH/USDC".to_string()],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn load_live_pool_book_filters_to_tracked_pairs() {
+        let file = write_address_book(
+            r#"{
+                "LINK/ETH": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 18,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3",
+                    "fee": 3000
+                },
+                "GMX/ETH": {
+                    "base": "0x0000000000000000000000000000000000000004",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 18,
+                    "pool": "0x0000000000000000000000000000000000000005",
+                    "pool_type": "v3",
+                    "fee": 10000
+                }
+            }"#,
+        );
+        let tracked = vec!["LINK/ETH".to_string()];
+        let pools = load_live_pool_book(file.path().to_str().unwrap(), Some(&tracked)).unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].pair_name, "LINK/ETH");
+    }
+
+    #[test]
+    fn live_dex_validation_accepts_mixed_v2_v3_pools() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v2"
+                },
+                "WBTC/USDC": {
+                    "base": "0x0000000000000000000000000000000000000004",
+                    "base_decimals": 8,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000005",
+                    "pool_type": "v3",
+                    "fee": 500
+                }
+            }"#,
+        );
+        assert!(
+            validate_live_dex_pool_compatibility(
+                file.path().to_str().unwrap(),
+                &["ETH/USDC".to_string(), "WBTC/USDC".to_string()],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn live_dex_validation_rejects_v3_route_fee_mismatch() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3",
+                    "v3_path": [
+                        "0x0000000000000000000000000000000000000001",
+                        "0x0000000000000000000000000000000000000004",
+                        "0x0000000000000000000000000000000000000002"
+                    ],
+                    "v3_fees": [500]
+                }
+            }"#,
+        );
+        let err = validate_live_dex_pool_compatibility(
+            file.path().to_str().unwrap(),
+            &["ETH/USDC".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("v3_fees length"));
+    }
+
+    #[test]
+    fn live_dex_validation_rejects_v3_route_endpoint_mismatch() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3",
+                    "v3_path": [
+                        "0x0000000000000000000000000000000000000001",
+                        "0x0000000000000000000000000000000000000004",
+                        "0x0000000000000000000000000000000000000005"
+                    ],
+                    "v3_fees": [500, 3000]
+                }
+            }"#,
+        );
+        let err = validate_live_dex_pool_compatibility(
+            file.path().to_str().unwrap(),
+            &["ETH/USDC".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("v3_path endpoints"));
+    }
+
+    #[test]
+    fn live_asset_validation_rejects_symbol_address_collision() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3",
+                    "fee": 500
+                },
+                "ARB/USDC": {
+                    "base": "0x0000000000000000000000000000000000000004",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000005",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000006",
+                    "pool_type": "v3",
+                    "fee": 500
+                }
+            }"#,
+        );
+        let err = validate_live_asset_symbol_uniqueness(
+            file.path().to_str().unwrap(),
+            &["ETH/USDC".to_string(), "ARB/USDC".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("maps to multiple token addresses"));
+    }
+
+    #[test]
+    fn live_known_token_validation_rejects_arbitrum_usdc_e_alias() {
+        let file = write_address_book(
+            r#"{
+                "ARB/USDC": {
+                    "base": "0x912ce59144191c1204e64559fe8253a0e49e6548",
+                    "base_decimals": 18,
+                    "quote": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+                    "quote_decimals": 6,
+                    "pool": "0xcda53b1f66614552f834ceef361a8d12a0b8dad8",
+                    "pool_type": "v3",
+                    "fee": 500
+                }
+            }"#,
+        );
+        let err = validate_live_known_token_symbols(
+            file.path().to_str().unwrap(),
+            &["ARB/USDC".to_string()],
+            ARBITRUM_CHAIN_ID,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("USDC_E"));
+    }
+
+    #[test]
+    fn live_cex_pair_validation_rejects_non_alphanumeric_asset_symbol() {
+        let err = validate_live_cex_pair_symbols(&["ARB/USDC_E".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CEX-incompatible"));
+    }
+
+    #[test]
+    fn flashbots_mainnet_relay_rejected_for_arbitrum() {
+        let cli = Cli::parse_from([
+            "arb_bot",
+            "--simulation=false",
+            "--dry-run=false",
+            "--dex-chain-id",
+            "42161",
+        ]);
+        let err = validate_flashbots_relay_chain(&cli)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mainnet-only"));
+    }
+
+    #[test]
+    fn live_dex_validation_rejects_missing_pair() {
+        let file = write_address_book(
+            r#"{
+                "WBTC/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 8,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v2"
+                }
+            }"#,
+        );
+        let err = validate_live_dex_pool_compatibility(
+            file.path().to_str().unwrap(),
+            &["ETH/USDC".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing from --dex-address-book"));
+    }
+
+    #[test]
+    fn live_dex_validation_rejects_missing_pool() {
+        let file = write_address_book(
+            r#"{
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool_type": "v2"
+                }
+            }"#,
+        );
+        let err = validate_live_dex_pool_compatibility(
+            file.path().to_str().unwrap(),
+            &["ETH/USDC".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no pool"));
     }
 }
