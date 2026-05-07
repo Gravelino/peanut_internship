@@ -64,7 +64,7 @@ impl RiskManager {
 
     pub fn check_pre_trade(&mut self, signal: &Signal) -> SafetyDecision {
         self.reset_hour_if_needed();
-        let trade_value = signal.size * signal.cex_price;
+        let trade_value = signal.notional_usd;
 
         if trade_value > self.limits.max_trade_usd {
             return SafetyDecision::Blocked {

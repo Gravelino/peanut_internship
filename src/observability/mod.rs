@@ -4,6 +4,7 @@
 //! (S7b), structured event logs (S8 adjacent).
 
 pub mod alerts;
+pub mod events;
 pub mod metrics;
 pub mod server;
 
@@ -11,5 +12,6 @@ pub use alerts::{
     AlertEvent, AlertProvider, AlertRules, AlertSink, LoggingSink, NoopSink, WebhookSink,
     emit_best_effort, evaluate_execution, mask_webhook_url,
 };
+pub use events::{JsonlEventLogger, ObservabilityEvent, emit_event, init_event_logger};
 pub use metrics::{Metrics, init_metrics, metrics_handle};
 pub use server::{HaltCoordinator, serve_metrics, serve_metrics_with_halt};
