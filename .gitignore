@@ -38,6 +38,7 @@ Cargo.lock
 .idea/
 .vs/
 .vscode/
+.windsurf
 *.swp
 *.swo
 
