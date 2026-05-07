@@ -96,7 +96,8 @@ cargo run --bin arb_bot -- \
     --replay-db data/replay.db \
     --reconcile-db data/reconcile.db \
     --alert-webhook-url "$SLACK_WEBHOOK" --alert-provider slack \
-    --metrics-port 9090
+    --metrics-port 9090 \
+    --event-log-path logs/events.jsonl
 ```
 
 Key flags:
@@ -110,8 +111,9 @@ Key flags:
 - **`--require-private-dex true|false`** — when true, missing Flashbots auth or missing DEX address book is a startup error. Set false to allow fallback to public DEX / CEX-first mode.
 - **`--replay-db <path>`** — SQLite journal so the signal-id replay window survives restarts (stretch S8).
 - **`--reconcile-db <path>`** — SQLite store of `LEG2_TIMEOUT` entries. A background worker polls each entry's receipt, marks it `Resolved` / `Reverted` / `Expired`, and on revert fires `LegExecutor::unwind_position` to flatten leg 1 (stretch S3 + A2).
-- **`--alert-webhook-url` / `--alert-provider`** — Generic, Slack, or Discord adapter. The full URL is **never** logged — `mask_webhook_url` keeps only host + first path segment.
+- **`--alert-webhook-url` / `--alert-provider`** — Generic, Slack, or Telegram adapter. The full URL is **never** logged — `mask_webhook_url` keeps only host + first path segment. Can also be set via `ALERT_WEBHOOK_URL`, `ALERT_PROVIDER`, and `ALERT_TELEGRAM_CHAT_ID`.
 - **`--metrics-port`** — Prometheus exporter port (S7a). Set `0` to disable the HTTP endpoint. Scrape `http://<host>:<port>/metrics`.
+- **`--event-log-path <path>`** — append-only JSONL observability log for daily reporting. Set empty to disable. Captures bot lifecycle, terminal executions, DEX pending timeout/cancel outcomes, and reconcile lifecycle events.
 
 Flashbots behaviour:
 - The private DEX swapper builds and signs the Uniswap V2 swap transaction locally, simulates it with `eth_callBundle`, then submits the raw signed transaction bundle with `eth_sendBundle`.
@@ -126,6 +128,64 @@ Flashbots Prometheus metrics:
 - `peanut_flashbots_bundle_simulation_seconds`
 - `peanut_flashbots_bundle_inclusion_blocks`
 - `peanut_flashbots_relay_errors_total`
+
+Daily-report JSONL event types:
+- `bot_started` / `bot_stopped`
+- `execution_terminal`
+- `dex_pending_timeout`
+- `dex_cancel_outcome`
+- `reconcile_enqueued`
+- `reconcile_enqueue_failed`
+- `reconcile_resolved`
+- `reconcile_inspect_error`
+
+Generate a daily report from the JSONL event log:
+
+```sh
+cargo run --bin daily_report -- \
+    --events logs/events.jsonl \
+    --trade-log trades.jsonl \
+    --reconcile-db data/reconcile.db \
+    --metrics-snapshot reports/metrics.prom \
+    --compare-report reports/2026-05-06/daily.json \
+    --date 2026-05-07 \
+    --format markdown \
+    --output reports/2026-05-07.md \
+    --alert-summary-output reports/2026-05-07-alert.json \
+    --alert-summary-format telegram \
+    --alert-telegram-chat-id "$TELEGRAM_CHAT_ID"
+
+cargo run --bin daily_report -- --events logs/events.jsonl --format json
+cargo run --bin daily_report -- --events logs/events.jsonl --format csv --output reports/latest.csv
+cargo run --bin daily_report -- --events logs/events.jsonl --format html --output reports/latest.html
+cargo run --bin daily_report -- --events logs/events.jsonl --fail-on-health yellow --output reports/latest.md
+```
+
+The report summarizes bot lifecycle, terminal executions, realized PnL from `execution_terminal`, optional trade-log PnL from `ArbRecord` JSONL, DEX pending timeout/cancel safety, reconcile outcomes, optional reconcile DB open/manual-review entries, optional Prometheus text snapshots for Flashbots/DEX/reconcile counters, a numeric `risk_score`, and top risk causes. Output formats are Markdown, JSON, CSV, and standalone HTML. Use `--compare-report reports/YYYY-MM-DD/daily.json` for day-over-day deltas, `--alert-summary-output alert.json` to write a compact alert payload for external notifiers, and `--fail-on-health yellow` or `--fail-on-health red` in cron/CI jobs to exit with status `2` after writing the report when the health threshold is met.
+
+`--alert-summary-format structured` writes the structured daily alert summary and includes a nested `telegram_payload`. `--alert-summary-format telegram` writes a Telegram Bot API `sendMessage` JSON body directly: `{ "chat_id": "...", "text": "...", "parse_mode": "HTML", "disable_web_page_preview": true }`. Pair it with `--alert-telegram-chat-id` or `TELEGRAM_CHAT_ID`, then post it to the existing Telegram webhook URL from a separate notifier job.
+
+For a repeatable archive workflow that captures metrics and writes Markdown, JSON, and HTML artifacts under `reports/YYYY-MM-DD/`, use `.windsurf/workflows/daily-report.md`.
+
+### Live readiness pre-flight
+
+Before switching from simulation/dry-run to live execution, run the read-only readiness checker:
+
+```sh
+cargo run --bin live_readiness -- \
+    --config configs/address_book_arbitrum.json \
+    --reconcile-db data/reconcile.db \
+    --events logs/events.jsonl \
+    --metrics-snapshot reports/latest/metrics.prom \
+    --eth-rpc-url "$ETH_RPC_URL" \
+    --wallet-address "$WALLET_ADDRESS" \
+    --simulation=false \
+    --dry-run=false \
+    --max-gas-gwei 1 \
+    --format markdown
+```
+
+`live_readiness` validates address-book router/token/pool sanity, expected chain id, RPC health, wallet native/ERC-20 balances, token allowances to the configured router, reconcile DB open entries, recent observability events, selected Prometheus metrics, halt file state, and live risk caps. It only uses read-only RPC calls and exits with status `2` when any check is `FAIL` unless `--no-fail` is set. If RPC or wallet inputs are omitted, live chain/balance/allowance checks are marked `SKIP` while local config, DB, event, metrics, and risk checks still run. A missing event log is a `WARN` for fresh deployments; `simulation=true` is a `FAIL` because the checker is intended to gate live readiness, so pass `--simulation=false` for the final pre-live run. For a repeatable checklist, use `.windsurf/workflows/live-readiness.md`.
 
 The bot respects a circuit breaker (N failures in a rolling window → cool-off), a replay window that REJECTS duplicate signal ids, and a configurable `max_concurrent_executions` cap. A `ctrl-c` cleanly shuts down the reconcile worker loop.
 
@@ -278,8 +338,14 @@ flowchart LR
 | File | Purpose |
 |------|---------|
 | `metrics.rs` | Prometheus counters / histograms (`init_metrics`, `metrics_handle`) |
+| `events.rs` | Append-only JSONL event logger (`init_event_logger`, `emit_event`) for daily reports |
 | `server.rs` | Hyper-based `/metrics` exporter (`serve_metrics`) |
 | `alerts.rs` | `AlertEvent`, `AlertSink` (`Noop` / `Logging` / `Webhook`), provider adapters (Generic / Slack / Discord), `mask_webhook_url`, `evaluate_execution` rule engine |
+
+#### bin/
+| File | Purpose |
+|------|---------|
+| `daily_report.rs` | Daily operations report generator from JSONL observability events; supports Markdown, JSON, and CSV output |
 
 #### safety/
 | File | Purpose |
