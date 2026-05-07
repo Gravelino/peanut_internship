@@ -40,5 +40,5 @@ pub use types::{
 };
 pub use ws::{
     BookTickerEvent, DepthEvent, DepthSnapshot, DepthUpdate, LocalOrderBook, SequenceStatus,
-    subscribe_book_ticker_stream,
+    subscribe_book_ticker_stream, subscribe_depth_stream,
 };

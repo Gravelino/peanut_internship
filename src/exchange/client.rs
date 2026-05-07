@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use hmac::{Hmac, KeyInit, Mac};
 use rust_decimal::Decimal;
 use sha2::Sha256;
+use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use crate::core::types::{
@@ -41,6 +42,135 @@ fn sign_query(query: &str, secret: &str) -> String {
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(query.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+#[derive(Debug, Clone, Default)]
+struct BinanceSymbolFilters {
+    min_qty: Option<Decimal>,
+    max_qty: Option<Decimal>,
+    step_size: Option<Decimal>,
+    min_price: Option<Decimal>,
+    max_price: Option<Decimal>,
+    tick_size: Option<Decimal>,
+    min_notional: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NormalizedLimitOrder {
+    quantity: Decimal,
+    price: Decimal,
+}
+
+fn decimal_filter(value: &serde_json::Value) -> ExchangeResult<Option<Decimal>> {
+    let Some(raw) = value.as_str() else {
+        return Ok(None);
+    };
+    let parsed = Decimal::from_str(raw)
+        .map_err(|e| ExchangeError::DecimalParse(format!("decimal parse: {e}")))?;
+    Ok((parsed > Decimal::ZERO).then_some(parsed))
+}
+
+fn parse_symbol_filters(symbol_info: &serde_json::Value) -> ExchangeResult<BinanceSymbolFilters> {
+    let filters = symbol_info["filters"]
+        .as_array()
+        .ok_or_else(|| missing_field_err("filters"))?;
+    let mut out = BinanceSymbolFilters::default();
+    for filter in filters {
+        match filter["filterType"].as_str().unwrap_or_default() {
+            "LOT_SIZE" => {
+                out.min_qty = decimal_filter(&filter["minQty"])?;
+                out.max_qty = decimal_filter(&filter["maxQty"])?;
+                out.step_size = decimal_filter(&filter["stepSize"])?;
+            }
+            "PRICE_FILTER" => {
+                out.min_price = decimal_filter(&filter["minPrice"])?;
+                out.max_price = decimal_filter(&filter["maxPrice"])?;
+                out.tick_size = decimal_filter(&filter["tickSize"])?;
+            }
+            "MIN_NOTIONAL" | "NOTIONAL" => {
+                out.min_notional = decimal_filter(&filter["minNotional"])?
+                    .or(decimal_filter(&filter["notional"])?)
+                    .or(out.min_notional);
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn floor_to_step(value: Decimal, step: Decimal) -> Decimal {
+    if step <= Decimal::ZERO {
+        return value;
+    }
+    (value / step).trunc() * step
+}
+
+fn normalize_limit_order(
+    symbol: &str,
+    amount: f64,
+    price: f64,
+    filters: &BinanceSymbolFilters,
+) -> ExchangeResult<NormalizedLimitOrder> {
+    let quantity = Decimal::from_f64_retain(amount).ok_or_else(|| {
+        ExchangeError::OrderRejected(format!("{symbol} invalid quantity {amount}"))
+    })?;
+    let price = Decimal::from_f64_retain(price)
+        .ok_or_else(|| ExchangeError::OrderRejected(format!("{symbol} invalid price {price}")))?;
+    let quantity = filters
+        .step_size
+        .map(|step| floor_to_step(quantity, step))
+        .unwrap_or(quantity);
+    let price = filters
+        .tick_size
+        .map(|tick| floor_to_step(price, tick))
+        .unwrap_or(price);
+    if quantity <= Decimal::ZERO {
+        return Err(ExchangeError::OrderRejected(format!(
+            "{symbol} quantity becomes zero after LOT_SIZE normalization"
+        )));
+    }
+    if price <= Decimal::ZERO {
+        return Err(ExchangeError::OrderRejected(format!(
+            "{symbol} price becomes zero after PRICE_FILTER normalization"
+        )));
+    }
+    if let Some(min_qty) = filters.min_qty
+        && quantity < min_qty
+    {
+        return Err(ExchangeError::OrderRejected(format!(
+            "{symbol} quantity {quantity} below minQty {min_qty}"
+        )));
+    }
+    if let Some(max_qty) = filters.max_qty
+        && quantity > max_qty
+    {
+        return Err(ExchangeError::OrderRejected(format!(
+            "{symbol} quantity {quantity} above maxQty {max_qty}"
+        )));
+    }
+    if let Some(min_price) = filters.min_price
+        && price < min_price
+    {
+        return Err(ExchangeError::OrderRejected(format!(
+            "{symbol} price {price} below minPrice {min_price}"
+        )));
+    }
+    if let Some(max_price) = filters.max_price
+        && price > max_price
+    {
+        return Err(ExchangeError::OrderRejected(format!(
+            "{symbol} price {price} above maxPrice {max_price}"
+        )));
+    }
+    if let Some(min_notional) = filters.min_notional {
+        let notional = quantity * price;
+        if notional < min_notional {
+            return Err(ExchangeError::OrderRejected(format!(
+                "{symbol} notional {notional} below minNotional {min_notional}"
+            )));
+        }
+    }
+    Ok(NormalizedLimitOrder { quantity, price })
 }
 
 /// Client for interacting with exchange REST APIs.
@@ -189,6 +319,23 @@ impl ExchangeClient {
         }
     }
 
+    pub async fn withdraw_to_address(
+        &self,
+        asset: &str,
+        address: &str,
+        amount: Decimal,
+        network: &str,
+    ) -> ExchangeResult<String> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => {
+                b.withdraw_to_address(asset, address, amount, network).await
+            }
+            ExchangeClientInner::Bybit(_) => Err(ExchangeError::Config(
+                "withdraw_to_address is only implemented for Binance".into(),
+            )),
+        }
+    }
+
     /// Returns a reference to the underlying Binance configuration.
     ///
     /// Panics if the client is not a Binance client.
@@ -298,6 +445,24 @@ impl BinanceClient {
         }
 
         Ok(())
+    }
+
+    async fn fetch_symbol_filters(&self, symbol: &str) -> ExchangeResult<BinanceSymbolFilters> {
+        let normalized_symbol = symbol.replace('/', "");
+        let url = format!(
+            "{}/api/v3/exchangeInfo?symbol={}",
+            self.config.base_url, normalized_symbol
+        );
+        let resp = self.get_json(&url, BINANCE_WEIGHT_EXCHANGE_INFO).await?;
+        self.check_api_error(&resp)?;
+        let symbols = resp["symbols"]
+            .as_array()
+            .ok_or_else(|| missing_field_err("symbols"))?;
+        let symbol_info = symbols
+            .iter()
+            .find(|entry| entry["symbol"].as_str() == Some(normalized_symbol.as_str()))
+            .ok_or_else(|| ExchangeError::InvalidSymbol(normalized_symbol.clone()))?;
+        parse_symbol_filters(symbol_info)
     }
 
     /// Fetches the order book snapshot for the given symbol and depth limit.
@@ -458,19 +623,27 @@ impl BinanceClient {
         amount: f64,
         price: f64,
     ) -> ExchangeResult<OrderResult> {
+        let filters = self.fetch_symbol_filters(symbol).await?;
+        let normalized = normalize_limit_order(symbol, amount, price, &filters)?;
         let query = format!(
             "symbol={}&side={}&type=LIMIT&timeInForce=IOC&quantity={}&price={}&recvWindow={}",
             symbol.replace('/', ""),
             side.to_uppercase(),
-            amount,
-            price,
+            normalized.quantity,
+            normalized.price,
             self.config.recv_window,
         );
 
         let signed = self.sign_request(&query)?;
         let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
 
-        debug!(symbol, side, amount, price, "Placing LIMIT IOC order");
+        debug!(
+            symbol,
+            side,
+            amount = %normalized.quantity,
+            price = %normalized.price,
+            "Placing LIMIT IOC order"
+        );
 
         let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
         self.check_api_error(&resp)?;
@@ -649,6 +822,34 @@ impl BinanceClient {
         }
 
         Ok(trades)
+    }
+
+    pub(crate) async fn withdraw_to_address(
+        &self,
+        asset: &str,
+        address: &str,
+        amount: Decimal,
+        network: &str,
+    ) -> ExchangeResult<String> {
+        let query = format!(
+            "coin={}&address={}&amount={}&network={}&recvWindow={}",
+            asset.to_uppercase(),
+            address,
+            amount,
+            network,
+            self.config.recv_window,
+        );
+        let signed = self.sign_request(&query)?;
+        let url = format!(
+            "{}/sapi/v1/capital/withdraw/apply?{}&{}",
+            self.config.base_url, query, signed
+        );
+        let resp = self.post_json(&url, BINANCE_WEIGHT_ACCOUNT).await?;
+        self.check_api_error(&resp)?;
+        resp["id"]
+            .as_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| missing_field_err("id"))
     }
 
     fn sign_request(&self, query: &str) -> ExchangeResult<String> {
@@ -840,6 +1041,43 @@ mod tests {
     fn test_parse_decimal_null() {
         let val = serde_json::Value::Null;
         assert!(BinanceClient::parse_decimal(&val).is_err());
+    }
+
+    #[test]
+    fn normalize_limit_order_applies_lot_tick_and_min_notional() {
+        let filters = BinanceSymbolFilters {
+            min_qty: Some(Decimal::from_str_exact("0.001").unwrap()),
+            max_qty: None,
+            step_size: Some(Decimal::from_str_exact("0.001").unwrap()),
+            min_price: None,
+            max_price: None,
+            tick_size: Some(Decimal::from_str_exact("0.01").unwrap()),
+            min_notional: Some(Decimal::from_str_exact("10").unwrap()),
+        };
+        let normalized = normalize_limit_order("ETHUSDC", 0.123456, 3456.789, &filters).unwrap();
+        assert_eq!(
+            normalized.quantity,
+            Decimal::from_str_exact("0.123").unwrap()
+        );
+        assert_eq!(
+            normalized.price,
+            Decimal::from_str_exact("3456.78").unwrap()
+        );
+    }
+
+    #[test]
+    fn normalize_limit_order_rejects_below_min_notional() {
+        let filters = BinanceSymbolFilters {
+            min_qty: Some(Decimal::from_str_exact("0.001").unwrap()),
+            max_qty: None,
+            step_size: Some(Decimal::from_str_exact("0.001").unwrap()),
+            min_price: None,
+            max_price: None,
+            tick_size: Some(Decimal::from_str_exact("0.01").unwrap()),
+            min_notional: Some(Decimal::from_str_exact("10").unwrap()),
+        };
+        let err = normalize_limit_order("ETHUSDC", 0.001, 1000.0, &filters).unwrap_err();
+        assert!(err.to_string().contains("below minNotional"));
     }
 
     #[test]
