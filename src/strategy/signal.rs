@@ -64,6 +64,8 @@ pub struct Signal {
     pub spread_bps: Decimal,
     /// Base-asset size of one leg.
     pub size: Decimal,
+    /// USD notional of one leg.
+    pub notional_usd: Decimal,
 
     /// Gross PnL in USD before fees.
     pub expected_gross_pnl: Decimal,
@@ -132,6 +134,7 @@ impl Signal {
             dex_price: params.dex_price,
             spread_bps: params.spread_bps,
             size: params.size,
+            notional_usd: params.size * params.cex_price,
             expected_gross_pnl: params.expected_gross_pnl,
             expected_fees: params.expected_fees,
             expected_net_pnl: params.expected_net_pnl,
