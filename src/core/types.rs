@@ -39,6 +39,9 @@ pub const MAINNET_CHAIN_ID: u64 = 1;
 /// Chain ID for Sepolia Testnet.
 pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
 
+/// Chain ID for Arbitrum One.
+pub const ARBITRUM_CHAIN_ID: u64 = 42161;
+
 /// Multiplier to convert Gwei to Wei.
 pub const WEI_PER_GWEI: u128 = 1_000_000_000;
 

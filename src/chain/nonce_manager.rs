@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use crate::chain::client::ChainClient;
 use crate::chain::errors::ChainResult;
-use crate::core::types::{Address, BlockId};
+use crate::core::types::{Address, BlockId, ARBITRUM_CHAIN_ID};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NonceKey {
@@ -117,7 +117,7 @@ mod tests {
         let manager = NonceManager::new();
         let address = addr("0x0000000000000000000000000000000000000001");
         let key = NonceKey {
-            chain_id: 42161,
+            chain_id: ARBITRUM_CHAIN_ID,
             address: address.lower(),
         };
         manager.states.lock().await.insert(
@@ -127,7 +127,7 @@ mod tests {
             },
         );
 
-        manager.mark_failed(42161, &address, 9).await;
+        manager.mark_failed(ARBITRUM_CHAIN_ID, &address, 9).await;
         assert_eq!(manager.states.lock().await[&key].next_nonce, Some(9));
     }
 
@@ -136,7 +136,7 @@ mod tests {
         let manager = NonceManager::new();
         let address = addr("0x0000000000000000000000000000000000000001");
         let key = NonceKey {
-            chain_id: 42161,
+            chain_id: ARBITRUM_CHAIN_ID,
             address: address.lower(),
         };
         manager.states.lock().await.insert(
@@ -146,7 +146,7 @@ mod tests {
             },
         );
 
-        manager.mark_failed(42161, &address, 9).await;
+        manager.mark_failed(ARBITRUM_CHAIN_ID, &address, 9).await;
         assert_eq!(manager.states.lock().await[&key].next_nonce, Some(12));
     }
 }

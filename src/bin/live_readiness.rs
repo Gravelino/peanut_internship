@@ -9,13 +9,12 @@ use clap::Parser;
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::U256;
 use peanut_internship_rust::chain::ChainClient;
-use peanut_internship_rust::core::types::{Address, BlockId, TransactionRequest};
+use peanut_internship_rust::core::types::{Address, BlockId, TransactionRequest, ARBITRUM_CHAIN_ID};
 use rusqlite::Connection;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ARBITRUM_UNISWAP_V3_SWAP_ROUTER: &str = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
 const BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 const ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
