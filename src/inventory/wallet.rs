@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::chain::ChainClient;
 use crate::core::types::{
-    Address, BlockId, DECIMAL_BASE, ETH_DECIMALS, MAINNET_CHAIN_ID, RPC_RETRIES, RPC_TIMEOUT_SECS,
+    Address, BlockId, DECIMAL_BASE, ETH_DECIMALS, MAINNET_CHAIN_ID, ARBITRUM_CHAIN_ID, RPC_RETRIES, RPC_TIMEOUT_SECS,
     TransactionRequest,
 };
 use crate::inventory::errors::{InventoryError, InventoryResult};
@@ -25,12 +25,29 @@ const WELL_KNOWN_TOKENS: &[(&str, &str, u8)] = &[
     ("FDUSD", "0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409", 18),
 ];
 
+/// Well-known ERC-20 tokens on Arbitrum One (chain ID [`ARBITRUM_CHAIN_ID`]).
+const WELL_KNOWN_TOKENS_ARBITRUM: &[(&str, &str, u8)] = &[
+    ("ETH", "", 18),
+    ("WETH", "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", 18),
+    ("USDT", "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", 6),
+    ("USDC", "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6),
+    ("USDC.e", "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8", 6),
+    ("LINK", "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4", 18),
+    ("ARB", "0x912CE59144191C1204E64559FE8253a0e49E6548", 18),
+    ("GMX", "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", 18),
+    ("PENDLE", "0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8", 18),
+    ("LDO", "0x13Ad51ed4F1B7e9Dc168d8a00cB3f4dDD85EFA60", 18),
+    ("DAI", "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", 18),
+    ("WBTC", "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", 8),
+];
+
 /// Fetches native and ERC-20 token balances for an on-chain wallet.
 #[derive(Clone)]
 pub struct WalletBalanceFetcher {
     chain_client: ChainClient,
     wallet_address: Address,
-    tokens: Vec<(&'static str, &'static str, u8)>,
+    tokens: Vec<(String, String, u8)>,
+    chain_id: u64,
 }
 
 impl std::fmt::Debug for WalletBalanceFetcher {
@@ -61,14 +78,44 @@ impl WalletBalanceFetcher {
         Ok(Self {
             chain_client,
             wallet_address,
-            tokens: WELL_KNOWN_TOKENS.to_vec(),
+            tokens: WELL_KNOWN_TOKENS
+                .iter()
+                .map(|(s, a, d)| (s.to_string(), a.to_string(), *d))
+                .collect(),
+            chain_id: MAINNET_CHAIN_ID,
         })
     }
 
     /// Replaces the default token list with a custom one (symbol, address, decimals).
     pub fn with_tokens(mut self, tokens: Vec<(&'static str, &'static str, u8)>) -> Self {
+        self.tokens = tokens
+            .into_iter()
+            .map(|(s, a, d)| (s.to_string(), a.to_string(), d))
+            .collect();
+        self
+    }
+
+    /// Replaces the default token list with dynamically built entries.
+    pub fn with_tokens_dynamic(mut self, tokens: Vec<(String, String, u8)>) -> Self {
         self.tokens = tokens;
         self
+    }
+
+    /// Sets the chain ID for `eth_call` requests (default: Ethereum mainnet).
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
+
+    /// Returns the appropriate default token list for the given chain ID.
+    pub fn default_tokens_for_chain(chain_id: u64) -> Vec<(String, String, u8)> {
+        let list = match chain_id {
+            ARBITRUM_CHAIN_ID => WELL_KNOWN_TOKENS_ARBITRUM,
+            _ => WELL_KNOWN_TOKENS,
+        };
+        list.iter()
+            .map(|(s, a, d)| (s.to_string(), a.to_string(), *d))
+            .collect()
     }
 
     /// Returns the monitored wallet address.
@@ -143,7 +190,7 @@ impl WalletBalanceFetcher {
         let wallet_bytes = self.wallet_address.as_eth_address().0;
         calldata.extend_from_slice(&wallet_bytes);
 
-        let call = TransactionRequest::contract_call(addr, calldata, MAINNET_CHAIN_ID);
+        let call = TransactionRequest::contract_call(addr, calldata, self.chain_id);
 
         let result = self
             .chain_client

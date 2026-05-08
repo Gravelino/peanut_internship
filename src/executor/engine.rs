@@ -816,9 +816,7 @@ impl LegExecutor for LiveLegs {
             Direction::BuyCexSellDex => "buy",
             Direction::BuyDexSellCex => "sell",
         };
-        // IOC with a 10 bp cross-the-book buffer.
-        let buffer = Decimal::new(1001, 3); // 1.001
-        let price = signal.cex_price * buffer;
+        let price = cex_ioc_cross_price(side, signal.cex_price);
         // Convert to f64 for the exchange API. A None conversion would mean the
         // Decimal doesn't fit in f64 — never silently send a zero order; abort.
         let amount_f = size.to_f64().ok_or_else(|| {
@@ -835,11 +833,12 @@ impl LegExecutor for LiveLegs {
             .exchange
             .create_limit_ioc_order(&signal.pair, side, amount_f, price_f)
             .await?;
-        // Binance-flavoured status mapping. `filled` and `partially_filled`
+        // Binance-flavoured status mapping. `FILLED` and `PARTIALLY_FILLED`
         // are both "Accepted" from our state machine's perspective; the
         // engine applies the min-fill threshold above this layer.
-        let outcome = match result.status.as_str() {
-            "filled" | "partially_filled" => LegOutcome::Accepted,
+        let status_upper = result.status.to_uppercase();
+        let outcome = match status_upper.as_str() {
+            "FILLED" | "PARTIALLY_FILLED" => LegOutcome::Accepted,
             _ => LegOutcome::Rejected,
         };
         Ok(LegFill {
@@ -972,6 +971,13 @@ fn u256_to_decimal_scaled(value: U256, decimals: u8) -> Decimal {
     raw / scale
 }
 
+fn cex_ioc_cross_price(side: &str, reference_price: Decimal) -> Decimal {
+    match side {
+        "sell" => reference_price * Decimal::new(999, 3),
+        _ => reference_price * Decimal::new(1001, 3),
+    }
+}
+
 /// Tunables for the executor.
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -1008,7 +1014,7 @@ impl Default for ExecutorConfig {
     fn default() -> Self {
         let min_fill = Decimal::new(8, 1); // 0.8
         Self {
-            leg1_timeout: Duration::from_secs(5),
+            leg1_timeout: Duration::from_secs(10),
             leg2_timeout: Duration::from_secs(60),
             min_fill_ratio: min_fill,
             partial_proceed_min_ratio: min_fill,
@@ -1871,6 +1877,13 @@ mod tests {
             leg2_timeout: Duration::from_millis(200),
             ..ExecutorConfig::default()
         }
+    }
+
+    #[test]
+    fn cex_ioc_cross_price_crosses_correct_side() {
+        let reference = Decimal::from(100);
+        assert_eq!(cex_ioc_cross_price("buy", reference), Decimal::new(1001, 1));
+        assert_eq!(cex_ioc_cross_price("sell", reference), Decimal::new(999, 1));
     }
 
     #[tokio::test]
