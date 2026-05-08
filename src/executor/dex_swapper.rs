@@ -63,6 +63,16 @@ const QUOTER_V2_EXACT_INPUT_SINGLE_SIGNATURE: &str =
 pub const ERC20_APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 /// `allowance(address,address)`.
 pub const ERC20_ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
+/// `balanceOf(address)`.
+pub const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+/// `deposit()` — WETH wrap function (payable, no args).
+pub const WETH_DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
+
+/// Known WETH contract addresses by chain. Used to auto-wrap native ETH.
+const KNOWN_WETH_ADDRESSES: &[&str] = &[
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", // Arbitrum
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", // Ethereum Mainnet
+];
 
 /// Total basis points (100%).
 const BPS_FULL: u64 = 10_000;
@@ -1159,6 +1169,106 @@ impl UniswapV3Swapper {
         Ok(true)
     }
 
+    /// Returns `true` if `token` is a known WETH contract.
+    fn is_weth(token: &Address) -> bool {
+        let lower = token.lower();
+        KNOWN_WETH_ADDRESSES
+            .iter()
+            .any(|addr| lower == *addr)
+    }
+
+    /// Fetches the ERC-20 balance of `token` held by `owner`.
+    async fn erc20_balance(
+        &self,
+        token: &Address,
+        owner: &Address,
+    ) -> SwapperResult<U256> {
+        let mut calldata = ERC20_BALANCE_OF_SELECTOR.to_vec();
+        calldata.extend_from_slice(&abi_encode(&[
+            AbiToken::Address(owner.as_eth_address()),
+        ]));
+        let req = TransactionRequest {
+            to: token.clone(),
+            value: TokenAmount::eth(0),
+            data: calldata.into(),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee: None,
+            chain_id: self.config.chain_id,
+        };
+        let raw = self
+            .client
+            .call(&req, BlockId::Latest)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("balanceOf call: {e}")))?;
+        decode_uint256_return(&raw).map_err(SwapperError::Decode)
+    }
+
+    /// If `token_in` is WETH and the wallet doesn't hold enough, wraps
+    /// native ETH by calling `WETH.deposit{value: shortfall}()`.
+    async fn ensure_weth_balance(
+        &self,
+        token_in: &Address,
+        needed: U256,
+    ) -> SwapperResult<bool> {
+        if !Self::is_weth(token_in) {
+            return Ok(false);
+        }
+        let owner = self.owner()?;
+        let current = self.erc20_balance(token_in, &owner).await?;
+        if current >= needed {
+            return Ok(false);
+        }
+        let shortfall = needed - current;
+        info!(
+            weth = %token_in, current = %current, needed = %needed,
+            shortfall = %shortfall,
+            "DEX V3: wrapping native ETH → WETH (insufficient WETH balance)"
+        );
+        let calldata = WETH_DEPOSIT_SELECTOR.to_vec();
+        let builder = TransactionBuilder::new(self.client.clone(), self.wallet.clone())
+            .to(token_in.clone())
+            .value(TokenAmount::eth(shortfall))
+            .data(calldata)
+            .chain_id(self.config.chain_id)
+            .with_gas_estimate(Some(self.config.gas_buffer_bps))
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("weth deposit gas: {e}")))?
+            .with_gas_price(GasPriority::Medium)
+            .await
+            .map_err(|e| SwapperError::TxBuild(format!("weth deposit fee: {e}")))?;
+        let (builder, reserved_nonce) = self.apply_reserved_nonce(builder).await?;
+        if let Err(e) =
+            reject_if_gas_cap_exceeded(builder.max_fee_per_gas(), self.config.max_gas_gwei)
+        {
+            rollback_reserved_nonce(reserved_nonce).await;
+            return Err(e);
+        }
+        let signed = match builder.build_and_sign().await {
+            Ok(signed) => signed,
+            Err(e) => {
+                rollback_reserved_nonce(reserved_nonce).await;
+                return Err(SwapperError::TxBuild(format!("weth deposit sign: {e}")));
+            }
+        };
+        let tx_hash = self
+            .client
+            .send_transaction(&signed)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("weth deposit send: {e}")))?;
+        let receipt = self
+            .client
+            .wait_for_receipt(&tx_hash, self.config.receipt_timeout_secs, 1.0)
+            .await
+            .map_err(|e| SwapperError::Chain(format!("weth deposit receipt: {e}")))?;
+        if !receipt.status {
+            return Err(SwapperError::Reverted(receipt.tx_hash));
+        }
+        info!(tx = %receipt.tx_hash, wrapped = %shortfall, "WETH deposit confirmed");
+        Ok(true)
+    }
+
     async fn build_signed_swap_tx_for_pair(
         &self,
         req: V3SwapTxRequest<'_>,
@@ -1167,6 +1277,8 @@ impl UniswapV3Swapper {
         if req.min_out.is_zero() {
             return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
         }
+        self.ensure_weth_balance(req.token_in, req.amount_in)
+            .await?;
         self.ensure_allowance(req.token_in, &self.config.router, req.amount_in)
             .await?;
         let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));
@@ -1683,6 +1795,8 @@ impl DexSwapper for UniswapV3Swapper {
         if min_out.is_zero() {
             return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
         }
+        self.ensure_weth_balance(token_in, amount_in)
+            .await?;
         self.ensure_allowance(token_in, &self.config.router, amount_in)
             .await?;
         let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));

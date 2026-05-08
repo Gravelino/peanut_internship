@@ -31,6 +31,7 @@ use peanut_internship_rust::chain::{
 };
 use peanut_internship_rust::core::types::{
     Address, BlockId, ETH_DECIMALS, GasPriority, TokenAmount, TransactionRequest,
+    ARBITRUM_CHAIN_ID,
 };
 use peanut_internship_rust::core::wallet::WalletManager;
 use peanut_internship_rust::exchange::client::ExchangeClient;
@@ -81,7 +82,6 @@ const ARBITRUM_UNISWAP_V3_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697
 const ARBITRUM_UNISWAP_V3_SWAP_ROUTER: &str = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
 const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const UNISWAP_V3_POOL_FEE_SELECTOR: [u8; 4] = [0xdd, 0xca, 0x3f, 0x43];
-const ARBITRUM_CHAIN_ID: u64 = 42161;
 const FLASHBOTS_MAINNET_RELAY_URL: &str = "https://relay.flashbots.net";
 
 /// CLI arguments.
@@ -387,7 +387,7 @@ struct Cli {
     rebalance_cex_deposit_address: String,
 
     /// Chain ID used for Wallet→CEX transfer transactions.
-    #[arg(long, default_value_t = 42161, env = "REBALANCE_CHAIN_ID")]
+    #[arg(long, default_value_t = ARBITRUM_CHAIN_ID, env = "REBALANCE_CHAIN_ID")]
     rebalance_chain_id: u64,
 }
 
@@ -1165,6 +1165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gas_buffer_bps = cli.fee_gas_buffer_bps,
         "generator thresholds + fee model"
     );
+    let configured_min_profit_usd = generator_config.min_profit_usd;
     let mut generator = SignalGenerator::new(
         Arc::clone(&price_source),
         Arc::clone(&inventory),
@@ -1638,7 +1639,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wallet_fetcher = match resolve_wallet_config(&cli) {
         Some((rpc_urls, addr)) => match WalletBalanceFetcher::new_multi(rpc_urls.clone(), &addr) {
             Ok(f) => {
-                info!(wallet = %addr, rpc_endpoints = rpc_urls.len(), "wallet balance fetcher enabled");
+                let chain_id = cli.dex_chain_id;
+                let tokens = WalletBalanceFetcher::default_tokens_for_chain(chain_id);
+                let f = f.with_chain_id(chain_id).with_tokens_dynamic(tokens);
+                info!(wallet = %addr, rpc_endpoints = rpc_urls.len(), chain_id, "wallet balance fetcher enabled");
                 Some(f)
             }
             Err(e) => {
@@ -1731,6 +1735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_fees: fees.clone(),
         gas_estimator,
         dex_fee_included_in_quote: !cli.dex_address_book.is_empty(),
+        min_profit_usd: configured_min_profit_usd,
     };
 
     loop {
@@ -1882,6 +1887,7 @@ struct TickDeps {
     base_fees: FeeStructure,
     gas_estimator: GasFeeEstimator,
     dex_fee_included_in_quote: bool,
+    min_profit_usd: Decimal,
 }
 
 #[derive(Clone)]
@@ -2194,7 +2200,19 @@ async fn estimate_signal_gas(
             result.gas_used
         } else {
             let tx = TransactionRequest::contract_call(router.clone(), calldata, *chain_id);
-            client.estimate_gas_from(&tx, wallet).await?
+            match client.estimate_gas_from(&tx, wallet).await {
+                Ok(gas) => gas,
+                Err(e) => {
+                    debug!(
+                        pair = %signal.pair,
+                        error = %e,
+                        fallback = *fallback_gas_units,
+                        "swap gas estimation failed (wallet may lack WETH); using fallback"
+                    );
+                    swap_gas_mode = "estimate-fallback";
+                    *fallback_gas_units
+                }
+            }
         }
     } else {
         let approve_tx = TransactionRequest::contract_call(
@@ -2256,13 +2274,18 @@ struct ExpectedPnlPreview {
     quote_usd_price: Decimal,
     trade_value_usd: Decimal,
     breakeven_spread_bps: Decimal,
+    missing_profit_usd: Decimal,
     expected_gross_pnl: Decimal,
     expected_fees: Decimal,
     fee_breakdown: FeeBreakdown,
     expected_net_pnl: Decimal,
 }
 
-fn expected_pnl_preview(market: &MarketState, fees: &FeeStructure) -> ExpectedPnlPreview {
+fn expected_pnl_preview(
+    market: &MarketState,
+    fees: &FeeStructure,
+    min_profit_usd: Decimal,
+) -> ExpectedPnlPreview {
     let buy_cex_better = market.spread_buy_cex_bps >= market.spread_buy_dex_bps;
     let direction = if buy_cex_better {
         Direction::BuyCexSellDex
@@ -2290,6 +2313,12 @@ fn expected_pnl_preview(market: &MarketState, fees: &FeeStructure) -> ExpectedPn
     let fee_breakdown = fees.breakdown(trade_value_usd);
     let expected_fees = fee_breakdown.total_fee_usd;
     let expected_net_pnl = expected_gross_pnl - expected_fees;
+    let breakeven_spread_bps = if trade_value_usd <= Decimal::ZERO {
+        Decimal::MAX
+    } else {
+        (expected_fees + min_profit_usd) / trade_value_usd * bps
+    };
+    let missing_profit_usd = (min_profit_usd - expected_net_pnl).max(Decimal::ZERO);
     ExpectedPnlPreview {
         direction,
         cex_price,
@@ -2297,7 +2326,8 @@ fn expected_pnl_preview(market: &MarketState, fees: &FeeStructure) -> ExpectedPn
         spread_bps,
         quote_usd_price: market.quote_usd_price,
         trade_value_usd,
-        breakeven_spread_bps: fees.breakeven_spread_bps(trade_value_usd),
+        breakeven_spread_bps,
+        missing_profit_usd,
         expected_gross_pnl,
         expected_fees,
         fee_breakdown,
@@ -2384,6 +2414,7 @@ fn render_dry_run_opportunity(
          ├─ Expected PnL ───────────────────────────────────────\n\
          │ gross        │ {gross}\n\
          │ net          │ {net}\n\
+         │ missing      │ {missing}\n\
          └──────────────────────────────────────────────────────",
         direction = preview.direction,
         size = fmt_qty(market.size),
@@ -2411,6 +2442,7 @@ fn render_dry_run_opportunity(
         fees = fmt_usd(preview.expected_fees),
         fee_bps = fmt_bps(preview.fee_breakdown.total_fee_bps),
         net = fmt_usd(preview.expected_net_pnl),
+        missing = fmt_usd(preview.missing_profit_usd),
     )
 }
 
@@ -2526,7 +2558,7 @@ async fn tick(
             None => {
                 if deps.dry_run {
                     if let Some(m) = maybe_market {
-                        let preview = expected_pnl_preview(&m, &tick_fees);
+                        let preview = expected_pnl_preview(&m, &tick_fees, deps.min_profit_usd);
                         info!(
                             "{}",
                             render_dry_run_opportunity(
@@ -4026,7 +4058,7 @@ mod seed_tests {
             "--simulation=false",
             "--dry-run=false",
             "--dex-chain-id",
-            "42161",
+            &ARBITRUM_CHAIN_ID.to_string(),
         ]);
         let err = validate_flashbots_relay_chain(&cli)
             .unwrap_err()
