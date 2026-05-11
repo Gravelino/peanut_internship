@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::chain::ChainClient;
-use crate::core::types::{Address, Token};
+use crate::core::types::{Address, DEFAULT_ORDERBOOK_DEPTH, ESTIMATE_PRICE_DEPTH, Token};
 use crate::exchange::client::ExchangeClient;
 use crate::pricing::{UniswapV2Pair, UniswapV3Pool, V3QuoterConfig};
 use crate::strategy::errors::{StrategyError, StrategyResult};
@@ -248,7 +248,10 @@ impl LivePriceSource {
                 };
 
                 while let Some(block) = block_stream.next().await {
-                    let block_number = block.number.map(|n: U64| n.as_u64()).unwrap_or(0);
+                    let block_number = block.number.map(|n: U64| n.as_u64()).unwrap_or_else(|| {
+                        warn!("DEX V2 block feed received block without number; using 0");
+                        0
+                    });
 
                     for (pair_name, entry) in &v2_entries {
                         let LivePool::V2(pair_lock) = &entry.pool else {
@@ -373,8 +376,20 @@ fn decimal_to_u128_scaled(value: Decimal, decimals: u8) -> Option<u128> {
 /// `Decimal`'s mantissa for the notional sizes we care about in arb
 /// (loses precision only beyond ~28 significant digits).
 fn u128_to_decimal_scaled(value: u128, decimals: u8) -> Decimal {
-    let raw = Decimal::from_u128(value).unwrap_or(Decimal::ZERO);
-    let scale = Decimal::from_u128(10u128.pow(decimals as u32)).unwrap_or(Decimal::ONE);
+    let raw = Decimal::from_u128(value).unwrap_or_else(|| {
+        warn!(
+            value,
+            decimals, "raw integer value does not fit Decimal; using 0"
+        );
+        Decimal::ZERO
+    });
+    let scale = Decimal::from_u128(10u128.pow(decimals as u32)).unwrap_or_else(|| {
+        warn!(
+            value,
+            decimals, "decimal scale does not fit Decimal; using scale 1"
+        );
+        Decimal::ONE
+    });
     raw / scale
 }
 
@@ -463,7 +478,10 @@ impl PriceSource for LivePriceSource {
         })?;
 
         // CEX side: re-read the best bid/ask from the exchange order book.
-        let ob = self.cex.fetch_order_book(pair, 20).await?;
+        let ob = self
+            .cex
+            .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
+            .await?;
         let cex_bid = ob
             .best_bid
             .map(|(p, _)| p)
@@ -527,7 +545,10 @@ impl PriceSource for LivePriceSource {
 
     async fn get_latest_price(&self, pair: &str) -> StrategyResult<Decimal> {
         // CEX mid price as a baseline
-        let ob = self.cex.fetch_order_book(pair, 5).await?;
+        let ob = self
+            .cex
+            .fetch_order_book(pair, ESTIMATE_PRICE_DEPTH)
+            .await?;
         let bid = ob
             .best_bid
             .map(|(p, _)| p)
@@ -549,7 +570,14 @@ async fn fetch_dex_prices_sync(
 ) -> StrategyResult<(Decimal, Decimal)> {
     // Log the current block number so we can verify the RPC is returning
     // fresh data and not a cached response.
-    let block_num = client.get_block_number().await.unwrap_or(0);
+    let block_num = client.get_block_number().await.unwrap_or_else(|e| {
+        warn!(
+            pool = %entry.address,
+            error = %e,
+            "failed to read block number for sync DEX price fetch; using 0"
+        );
+        0
+    });
     debug!(pool = %entry.address, block = block_num, "fetch_dex_prices_sync");
     match &entry.pool {
         LivePool::V2(pair_lock) => {

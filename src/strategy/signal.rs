@@ -64,7 +64,9 @@ pub struct Signal {
     pub spread_bps: Decimal,
     /// Base-asset size of one leg.
     pub size: Decimal,
-    /// USD notional of one leg.
+    /// Value of one leg in quote asset (size * cex_price).
+    pub notional_quote: Decimal,
+    /// Value of one leg in USD.
     pub notional_usd: Decimal,
 
     /// Gross PnL in USD before fees.
@@ -105,6 +107,8 @@ pub struct SignalParams {
     pub spread_bps: Decimal,
     /// Base-asset size.
     pub size: Decimal,
+    /// USD value of one leg.
+    pub notional_usd: Decimal,
     /// Gross PnL in USD.
     pub expected_gross_pnl: Decimal,
     /// Fees in USD.
@@ -134,7 +138,8 @@ impl Signal {
             dex_price: params.dex_price,
             spread_bps: params.spread_bps,
             size: params.size,
-            notional_usd: params.size * params.cex_price,
+            notional_quote: params.size * params.cex_price,
+            notional_usd: params.notional_usd,
             expected_gross_pnl: params.expected_gross_pnl,
             expected_fees: params.expected_fees,
             expected_net_pnl: params.expected_net_pnl,
@@ -181,6 +186,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(100),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(5),
             expected_net_pnl: net_pnl,

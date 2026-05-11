@@ -1,16 +1,14 @@
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::amm::UniswapV2Pair;
 use super::mempool::ParsedSwap;
 use super::router::{PoolRef, RouteFinder};
 use super::v3::pool::UniswapV3Pool;
 use crate::core::types::{
-    Address, DECIMAL_BASE, MIN_CROSS_DEX_AMOUNT_WEI, MIN_TRIANGULAR_ARB_HOPS, Token, WEI_PER_GWEI,
+    Address, DECIMAL_BASE, DEFAULT_ARB_GAS_UNITS, MIN_CROSS_DEX_AMOUNT_WEI,
+    MIN_TRIANGULAR_ARB_HOPS, Token, WEI_PER_GWEI,
 };
-
-/// Estimated gas units for a single cross-DEX arb execution (2 swaps + overhead).
-const DEFAULT_GAS_LIMIT: u128 = 250_000;
 
 /// Classification of arbitrage opportunity type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,11 +134,29 @@ impl ArbDetector {
 
                 let out1 = match p1.get_amount_out(amount_in, token_in_tok) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!(
+                            pool = %p1.address(),
+                            token_in = %token_in,
+                            amount_in,
+                            error = %e,
+                            "cross-DEX arb detection skipped pool after amount_out error"
+                        );
+                        continue;
+                    }
                 };
                 let out2 = match p2.get_amount_out(amount_in, token_in_tok) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!(
+                            pool = %p2.address(),
+                            token_in = %token_in,
+                            amount_in,
+                            error = %e,
+                            "cross-DEX arb detection skipped pool after amount_out error"
+                        );
+                        continue;
+                    }
                 };
 
                 let (buy_pool, sell_pool, buy_out, sell_out) = if out1 > out2 {
@@ -154,7 +170,8 @@ impl ArbDetector {
                     continue;
                 }
 
-                let gas_cost = DEFAULT_GAS_LIMIT * self.gas_price_gwei * WEI_PER_GWEI;
+                let gas_cost =
+                    u128::from(DEFAULT_ARB_GAS_UNITS) * self.gas_price_gwei * WEI_PER_GWEI;
 
                 let scale_out = DECIMAL_BASE.pow(token_out_tok.decimals as u32);
                 let scale_eth = DECIMAL_BASE.pow(18u32);
@@ -236,7 +253,16 @@ impl ArbDetector {
 
             let fair_out = match pool.get_amount_out(amount_in, token_in_tok) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        pool = %pool.address(),
+                        token_in = %token_in,
+                        amount_in,
+                        error = %e,
+                        "mempool arb detection skipped pool after amount_out error"
+                    );
+                    continue;
+                }
             };
 
             if fair_out <= swap_min_out {
@@ -245,7 +271,7 @@ impl ArbDetector {
 
             let capturable = fair_out - swap_min_out;
 
-            let gas_cost = DEFAULT_GAS_LIMIT * self.gas_price_gwei * WEI_PER_GWEI;
+            let gas_cost = u128::from(DEFAULT_ARB_GAS_UNITS) * self.gas_price_gwei * WEI_PER_GWEI;
 
             let token_out_tok = if pool.token0().address == *token_out {
                 pool.token0()

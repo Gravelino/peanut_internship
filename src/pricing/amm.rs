@@ -4,6 +4,7 @@
 
 use ethers::types::U256;
 use rust_decimal::Decimal;
+use tracing::warn;
 
 use super::errors::{PricingError, PricingResult};
 use crate::chain::client::ChainClient;
@@ -412,7 +413,13 @@ pub async fn fetch_token_metadata(
         .call(&call(SYMBOL_SELECTOR.to_vec()), BlockId::Latest)
         .await
         .map_err(|e| PricingError::ChainCall(e.to_string()))?;
-    let symbol = decode_string_from_abi(&sym_raw).unwrap_or_else(|| "???".into());
+    let symbol = decode_string_from_abi(&sym_raw).unwrap_or_else(|| {
+        warn!(
+            token = %addr,
+            "failed to decode token symbol; using placeholder"
+        );
+        "???".into()
+    });
 
     Ok(Token {
         address: addr.clone(),

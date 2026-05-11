@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::core::types::{DEFAULT_MAX_SLIPPAGE_BPS, DEFAULT_MIN_SPREAD_BPS, split_pair_symbols};
 use crate::exchange::orderbook::OrderBookAnalyzer;
 use crate::exchange::types::{OrderBookSnapshot, SkewResult};
 use crate::strategy::signal::{Direction, Signal};
@@ -13,6 +14,20 @@ use crate::strategy::signal::{Direction, Signal};
 /// Upper bound for stored history; oldest entries are evicted.
 const HISTORY_CAP: usize = 100;
 const HISTORY_WINDOW: usize = 20;
+const DEFAULT_SPREAD_WEIGHT_MANTISSA: i64 = 4;
+const DEFAULT_LIQUIDITY_WEIGHT_MANTISSA: i64 = 2;
+const DEFAULT_INVENTORY_WEIGHT_MANTISSA: i64 = 2;
+const DEFAULT_HISTORY_WEIGHT_MANTISSA: i64 = 2;
+const DEFAULT_SCORE_WEIGHT_SCALE: u32 = 1;
+const DEFAULT_EXCELLENT_SPREAD_BPS: u64 = 100;
+const DEFAULT_MIN_SLIPPAGE_BPS: u64 = 5;
+const DEFAULT_FALLBACK_LIQUIDITY_SCORE: u64 = 80;
+const SCORE_MAX: u64 = 100;
+const SCORE_INVENTORY_HEALTHY: u64 = 60;
+const SCORE_INVENTORY_REBALANCE_NEEDED: u64 = 20;
+const SCORE_HISTORY_NEUTRAL: u64 = 50;
+const MIN_HISTORY_SAMPLES: usize = 3;
+const DECAY_AT_EXPIRY_MULTIPLIER: f64 = 0.5;
 
 /// Weights and thresholds controlling how a [`Signal`] is scored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,15 +59,24 @@ pub struct ScorerConfig {
 impl Default for ScorerConfig {
     fn default() -> Self {
         Self {
-            spread_weight: Decimal::new(4, 1),    // 0.4
-            liquidity_weight: Decimal::new(2, 1), // 0.2
-            inventory_weight: Decimal::new(2, 1), // 0.2
-            history_weight: Decimal::new(2, 1),   // 0.2
-            excellent_spread_bps: Decimal::from(100),
-            min_spread_bps: Decimal::from(30),
-            min_slippage_bps: Decimal::from(5),
-            max_slippage_bps: Decimal::from(50),
-            fallback_liquidity: Decimal::from(80),
+            spread_weight: Decimal::new(DEFAULT_SPREAD_WEIGHT_MANTISSA, DEFAULT_SCORE_WEIGHT_SCALE),
+            liquidity_weight: Decimal::new(
+                DEFAULT_LIQUIDITY_WEIGHT_MANTISSA,
+                DEFAULT_SCORE_WEIGHT_SCALE,
+            ),
+            inventory_weight: Decimal::new(
+                DEFAULT_INVENTORY_WEIGHT_MANTISSA,
+                DEFAULT_SCORE_WEIGHT_SCALE,
+            ),
+            history_weight: Decimal::new(
+                DEFAULT_HISTORY_WEIGHT_MANTISSA,
+                DEFAULT_SCORE_WEIGHT_SCALE,
+            ),
+            excellent_spread_bps: Decimal::from(DEFAULT_EXCELLENT_SPREAD_BPS),
+            min_spread_bps: Decimal::from(DEFAULT_MIN_SPREAD_BPS),
+            min_slippage_bps: Decimal::from(DEFAULT_MIN_SLIPPAGE_BPS),
+            max_slippage_bps: Decimal::from(DEFAULT_MAX_SLIPPAGE_BPS),
+            fallback_liquidity: Decimal::from(DEFAULT_FALLBACK_LIQUIDITY_SCORE),
         }
     }
 }
@@ -113,6 +137,11 @@ impl SignalScorer {
     /// error internally).
     fn score_liquidity(&self, signal: &Signal, book: Option<&OrderBookSnapshot>) -> Decimal {
         let Some(book) = book else {
+            warn!(
+                pair = %signal.pair,
+                fallback_liquidity = %self.config.fallback_liquidity,
+                "scorer: no order book provided; using fallback liquidity"
+            );
             return self.config.fallback_liquidity;
         };
         if book.symbol != signal.pair {
@@ -154,7 +183,7 @@ impl SignalScorer {
         let min = self.config.min_slippage_bps;
         let max = self.config.max_slippage_bps;
         if slippage_bps <= min {
-            return Decimal::from(100);
+            return Decimal::from(SCORE_MAX);
         }
         if slippage_bps >= max {
             return Decimal::ZERO;
@@ -164,10 +193,10 @@ impl SignalScorer {
             // Misconfigured thresholds — treat as saturated 100 to avoid
             // a divide-by-zero and log a warning once per call site.
             warn!("scorer: min_slippage_bps >= max_slippage_bps; using 100");
-            return Decimal::from(100);
+            return Decimal::from(SCORE_MAX);
         }
-        let penalty = (slippage_bps - min) / range * Decimal::from(100);
-        clamp_0_100(Decimal::from(100) - penalty)
+        let penalty = (slippage_bps - min) / range * Decimal::from(SCORE_MAX);
+        clamp_0_100(Decimal::from(SCORE_MAX) - penalty)
     }
 
     fn score_spread(&self, spread_bps: Decimal) -> Decimal {
@@ -175,32 +204,37 @@ impl SignalScorer {
             return Decimal::ZERO;
         }
         if spread_bps >= self.config.excellent_spread_bps {
-            return Decimal::from(100);
+            return Decimal::from(SCORE_MAX);
         }
         let range = self.config.excellent_spread_bps - self.config.min_spread_bps;
         if range <= Decimal::ZERO {
-            return Decimal::from(100);
+            warn!(
+                min_spread_bps = %self.config.min_spread_bps,
+                excellent_spread_bps = %self.config.excellent_spread_bps,
+                "scorer: excellent_spread_bps <= min_spread_bps; using max spread score"
+            );
+            return Decimal::from(SCORE_MAX);
         }
-        (spread_bps - self.config.min_spread_bps) / range * Decimal::from(100)
+        (spread_bps - self.config.min_spread_bps) / range * Decimal::from(SCORE_MAX)
     }
 
     fn score_inventory(&self, signal: &Signal, skews: &[SkewResult]) -> Decimal {
         // Penalise when the base asset needs rebalancing.
-        let base = match signal.pair.split('/').next() {
-            Some(b) if !b.is_empty() => b,
-            _ => {
+        let base = match split_pair_symbols(&signal.pair) {
+            Ok((base, _)) => base,
+            Err(_) => {
                 tracing::warn!(
                     pair = %signal.pair,
                     "malformed pair in scorer; skipping inventory sub-score"
                 );
-                return Decimal::from(60);
+                return Decimal::from(SCORE_INVENTORY_HEALTHY);
             }
         };
         let relevant: Vec<_> = skews.iter().filter(|s| s.asset == base).collect();
         if relevant.iter().any(|s| s.needs_rebalance) {
-            Decimal::from(20)
+            Decimal::from(SCORE_INVENTORY_REBALANCE_NEEDED)
         } else {
-            Decimal::from(60)
+            Decimal::from(SCORE_INVENTORY_HEALTHY)
         }
     }
 
@@ -213,11 +247,11 @@ impl SignalScorer {
             .filter(|(p, _)| p == pair)
             .map(|(_, ok)| *ok)
             .collect();
-        if recent.len() < 3 {
-            return Decimal::from(50);
+        if recent.len() < MIN_HISTORY_SAMPLES {
+            return Decimal::from(SCORE_HISTORY_NEUTRAL);
         }
         let wins = recent.iter().filter(|v| **v).count();
-        Decimal::from(wins) * Decimal::from(100) / Decimal::from(recent.len())
+        Decimal::from(wins) * Decimal::from(SCORE_MAX) / Decimal::from(recent.len())
     }
 
     /// Records the outcome of an executed signal, for future history scoring.
@@ -235,9 +269,15 @@ impl SignalScorer {
         let age = signal.age_seconds().max(0.0);
         let ttl = (signal.expiry - signal.timestamp).num_milliseconds() as f64 / 1000.0;
         if ttl <= 0.0 {
+            warn!(
+                signal = %signal.signal_id,
+                pair = %signal.pair,
+                ttl_secs = ttl,
+                "signal has non-positive TTL; decay score set to zero"
+            );
             return Decimal::ZERO;
         }
-        let factor = (1.0 - (age / ttl) * 0.5).max(0.0);
+        let factor = (1.0 - (age / ttl) * DECAY_AT_EXPIRY_MULTIPLIER).max(0.0);
         let factor_d = Decimal::from_f64_retain(factor).unwrap_or_else(|| {
             tracing::warn!(
                 signal = %signal.signal_id,
@@ -251,7 +291,7 @@ impl SignalScorer {
 }
 
 fn clamp_0_100(v: Decimal) -> Decimal {
-    let max = Decimal::from(100);
+    let max = Decimal::from(SCORE_MAX);
     if v < Decimal::ZERO {
         Decimal::ZERO
     } else if v > max {
@@ -276,6 +316,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(spread_bps),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(5),
             expected_net_pnl: Decimal::from(15),

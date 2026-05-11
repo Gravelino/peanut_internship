@@ -177,12 +177,17 @@ impl ForkSimulator {
 
         let typed = tx.into();
         let block = Some(to_eth_block(self.block).into());
-        let gas_used = self
-            .provider
-            .estimate_gas(&typed, block)
-            .await
-            .map(|g| g.as_u64())
-            .unwrap_or(DEFAULT_GAS_USED);
+        let gas_used = match self.provider.estimate_gas(&typed, block).await {
+            Ok(gas) => gas.as_u64(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    fallback_gas_used = DEFAULT_GAS_USED,
+                    "fork swap gas estimation failed; using fallback gas value"
+                );
+                DEFAULT_GAS_USED
+            }
+        };
 
         match self.provider.call(&typed, block).await {
             Ok(bytes) => {
@@ -272,12 +277,17 @@ impl ForkSimulator {
 
         let block = Some(to_eth_block(self.block).into());
 
-        let gas_used = self
-            .provider
-            .estimate_gas(&tx, block)
-            .await
-            .map(|g| g.as_u64())
-            .unwrap_or(DEFAULT_GAS_USED);
+        let gas_used = match self.provider.estimate_gas(&tx, block).await {
+            Ok(gas) => gas.as_u64(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    fallback_gas_used = DEFAULT_GAS_USED,
+                    "fork route gas estimation failed; using fallback gas value"
+                );
+                DEFAULT_GAS_USED
+            }
+        };
 
         let mut logs = Vec::with_capacity(route.num_hops() + 1);
         logs.push(format!("simulated_for_sender={sender}"));

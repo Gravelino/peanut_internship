@@ -5,7 +5,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::core::types::BPS_SCALE as BPS_U64;
+use crate::core::types::{
+    BPS_SCALE as BPS_U64, DEFAULT_CEX_FEE_BPS, DEFAULT_DEX_FEE_BPS, DEFAULT_GAS_COST_USD,
+};
 
 fn bps_scale() -> Decimal {
     Decimal::from(BPS_U64)
@@ -32,12 +34,12 @@ pub struct FeeBreakdown {
 }
 
 impl Default for FeeStructure {
-    /// Defaults: 10 / 30 bp and $5 gas.
+    /// Defaults from centralized types.
     fn default() -> Self {
         Self {
-            cex_taker_bps: Decimal::from(10),
-            dex_swap_bps: Decimal::from(30),
-            gas_cost_usd: Decimal::from(5),
+            cex_taker_bps: Decimal::from(DEFAULT_CEX_FEE_BPS),
+            dex_swap_bps: Decimal::from(DEFAULT_DEX_FEE_BPS),
+            gas_cost_usd: Decimal::from(DEFAULT_GAS_COST_USD),
         }
     }
 }
