@@ -489,7 +489,7 @@ mod tests {
     use super::*;
     use crate::core::types::MAINNET_CHAIN_ID;
     use crate::exchange::types::NormalizedBalance;
-    use crate::executor::engine::{ExecutorConfig, SimulatedLegs};
+    use crate::executor::engine::{ExecutorConfig, ExecutorState, SimulatedLegs};
     use crate::inventory::tracker::InventoryTracker;
     use crate::strategy::signal::{Direction, SignalParams};
 
@@ -740,12 +740,17 @@ mod tests {
             .with_inventory(Arc::clone(&inventory));
         let handle = tokio::spawn(async move { worker.run().await });
 
-        let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(ctx.state.is_filled());
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let states = [first.state, second.state];
+        assert!(states.iter().any(|state| state.is_filled()));
+        assert!(states.contains(&ExecutorState::Rejected));
         assert!(rx.try_recv().is_err());
         assert_eq!(q.len().await, 0);
         assert_eq!(
