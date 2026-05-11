@@ -116,6 +116,8 @@ async fn main() {
                         .timestamp_millis_opt(sell.timestamp as i64)
                         .single()
                         .expect("valid sell timestamp from Binance");
+                    let gross_pnl = sell.qty * sell.price - buy.qty * buy.price;
+                    let total_fees = buy_fee_usd + sell_fee_usd;
                     let trade = ArbRecord {
                         id: format!("{}_{}", pair.replace('/', ""), i),
                         timestamp: buy_ts,
@@ -142,6 +144,16 @@ async fn main() {
                             fee_asset: "USDT".into(),
                         },
                         gas_cost_usd: Decimal::ZERO,
+                        expected_gross_pnl_usd: gross_pnl,
+                        expected_fees_usd: total_fees,
+                        expected_net_pnl_usd: gross_pnl - total_fees,
+                        actual_gross_pnl_usd: gross_pnl,
+                        actual_fees_usd: total_fees,
+                        actual_cex_fee_usd: total_fees,
+                        actual_onchain_gas_fee_usd: Decimal::ZERO,
+                        actual_net_pnl_usd: gross_pnl - total_fees,
+                        onchain_gas_used: None,
+                        onchain_gas_fee_wei: None,
                     };
                     engine.record(trade);
                 }

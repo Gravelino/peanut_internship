@@ -38,14 +38,16 @@ struct VenueBalance {
 pub struct InventoryTracker {
     balances: HashMap<(Venue, String), VenueBalance>,
     venues: Vec<Venue>,
+    chain_id: u64,
 }
 
 impl InventoryTracker {
     /// Creates a new tracker for the given list of venues.
-    pub fn new(venues: Vec<Venue>) -> Self {
+    pub fn new(venues: Vec<Venue>, chain_id: u64) -> Self {
         Self {
             balances: HashMap::new(),
             venues,
+            chain_id,
         }
     }
 
@@ -75,9 +77,17 @@ impl InventoryTracker {
         }
 
         for (asset, bal) in balances {
-            let reserved = old_reserved.get(&asset).copied().unwrap_or(Decimal::ZERO);
+            let canonical = if self.chain_id == crate::core::types::ARBITRUM_CHAIN_ID {
+                crate::core::assets::canonicalize_asset(&asset)
+            } else {
+                asset.to_uppercase()
+            };
+            let reserved = old_reserved
+                .get(&canonical)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
             self.balances.insert(
-                (venue, asset),
+                (venue, canonical),
                 VenueBalance {
                     free: bal.free,
                     locked: bal.locked,
@@ -180,6 +190,17 @@ impl InventoryTracker {
             .map(|b| b.free + b.locked)
     }
 
+    /// Internal helper for 'smart' wallet balance checks (e.g. ETH + WETH).
+    fn get_wallet_effective_available(&self, asset: &str) -> Decimal {
+        let mut total = Decimal::ZERO;
+        for a in crate::core::assets::get_equivalent_assets(asset) {
+            if let Some(bal) = self.balances.get(&(Venue::Wallet, a)) {
+                total += bal.free - bal.reserved;
+            }
+        }
+        total
+    }
+
     /// Compares tracked balances against freshly-fetched actual balances.
     /// Returns a list of mismatches where the absolute difference exceeds
     /// `tolerance_pct` (expressed as a percentage, e.g. `1.0` = 1%).
@@ -195,7 +216,14 @@ impl InventoryTracker {
     ) -> Vec<BalanceMismatch> {
         let mut mismatches = Vec::new();
         for (asset, actual_total) in actual {
-            let tracked = self.get_total(venue, asset).unwrap_or(Decimal::ZERO);
+            let tracked = self.get_total(venue, asset).unwrap_or_else(|| {
+                warn!(
+                    venue = %venue,
+                    asset,
+                    "tracked balance missing during verification; treating tracked total as 0"
+                );
+                Decimal::ZERO
+            });
             if tracked == Decimal::ZERO && *actual_total == Decimal::ZERO {
                 continue;
             }
@@ -230,14 +258,32 @@ impl InventoryTracker {
         sell_asset: &str,
         sell_amount: Decimal,
     ) -> CanExecuteResult {
-        let buy_available = self.get_available(buy_venue, buy_asset).unwrap_or_else(|| {
-            warn!(venue = %buy_venue, asset = buy_asset, "No balance data loaded, treating available as zero");
-            Decimal::ZERO
-        });
-        let sell_available = self.get_available(sell_venue, sell_asset).unwrap_or_else(|| {
-            warn!(venue = %sell_venue, asset = sell_asset, "No balance data loaded, treating available as zero");
-            Decimal::ZERO
-        });
+        let buy_available = if buy_venue == Venue::Wallet {
+            self.get_wallet_effective_available(buy_asset)
+        } else {
+            self.get_available(buy_venue, buy_asset).unwrap_or_else(|| {
+                warn!(
+                    venue = %buy_venue,
+                    asset = buy_asset,
+                    "available balance missing for buy leg; treating available as 0"
+                );
+                Decimal::ZERO
+            })
+        };
+
+        let sell_available = if sell_venue == Venue::Wallet {
+            self.get_wallet_effective_available(sell_asset)
+        } else {
+            self.get_available(sell_venue, sell_asset)
+                .unwrap_or_else(|| {
+                    warn!(
+                        venue = %sell_venue,
+                        asset = sell_asset,
+                        "available balance missing for sell leg; treating available as 0"
+                    );
+                    Decimal::ZERO
+                })
+        };
 
         let buy_ok = buy_available >= buy_amount;
         let sell_ok = sell_available >= sell_amount;
@@ -316,6 +362,46 @@ impl InventoryTracker {
     }
 
     fn adjust_balance(&mut self, venue: Venue, asset: &str, delta: Decimal) -> InventoryResult<()> {
+        if venue == Venue::Wallet && delta < Decimal::ZERO {
+            let mut remaining_to_subtract = -delta;
+            // Get equivalents first as a list of static strings to avoid borrow issues
+            let equivalents = crate::core::assets::get_equivalent_assets(asset);
+
+            // First, try to subtract from the primary asset
+            let primary_key = (venue, asset.to_string());
+            if let Some(bal) = self.balances.get_mut(&primary_key) {
+                let can_take = bal.free.min(remaining_to_subtract);
+                bal.free -= can_take;
+                remaining_to_subtract -= can_take;
+            }
+
+            // Then, spill over to equivalents if needed
+            if remaining_to_subtract > Decimal::ZERO {
+                for eq in equivalents {
+                    if eq == asset {
+                        continue;
+                    }
+                    let eq_key = (venue, eq.clone());
+                    if let Some(bal) = self.balances.get_mut(&eq_key) {
+                        let can_take = bal.free.min(remaining_to_subtract);
+                        bal.free -= can_take;
+                        remaining_to_subtract -= can_take;
+                    }
+                    if remaining_to_subtract <= Decimal::ZERO {
+                        break;
+                    }
+                }
+            }
+
+            if remaining_to_subtract > Decimal::ZERO {
+                return Err(InventoryError::NegativeBalance(format!(
+                    "{} (and equivalents) on {} would go negative by {}",
+                    asset, venue, remaining_to_subtract
+                )));
+            }
+            return Ok(());
+        }
+
         let key = (venue, asset.to_string());
         let bal = self.balances.entry(key).or_insert(VenueBalance {
             free: Decimal::ZERO,
@@ -407,21 +493,25 @@ impl InventoryTracker {
 
     /// Reserves a specific amount of an asset for an in-flight trade.
     pub fn reserve(&mut self, venue: Venue, asset: &str, amount: Decimal) -> InventoryResult<()> {
+        let available = if venue == Venue::Wallet {
+            self.get_wallet_effective_available(asset)
+        } else {
+            self.get_available(venue, asset).unwrap_or(Decimal::ZERO)
+        };
+
+        if available < amount {
+            return Err(InventoryError::InsufficientBalance(format!(
+                "Cannot reserve {} {}: only {} available",
+                amount, asset, available
+            )));
+        }
+
         let key = (venue, asset.to_string());
         let bal = self.balances.entry(key).or_insert(VenueBalance {
             free: Decimal::ZERO,
             locked: Decimal::ZERO,
             reserved: Decimal::ZERO,
         });
-
-        if bal.free - bal.reserved < amount {
-            return Err(InventoryError::InsufficientBalance(format!(
-                "Cannot reserve {} {}: only {} available",
-                amount,
-                asset,
-                bal.free - bal.reserved
-            )));
-        }
 
         bal.reserved += amount;
         Ok(())
@@ -448,9 +538,11 @@ impl InventoryTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::MAINNET_CHAIN_ID;
 
     fn setup_tracker() -> InventoryTracker {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
@@ -542,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_record_trade_updates_balances() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
 
         let mut bals = HashMap::new();
         bals.insert(
@@ -588,7 +680,8 @@ mod tests {
 
     #[test]
     fn test_skew_detects_imbalance() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
@@ -612,7 +705,8 @@ mod tests {
 
     #[test]
     fn test_skew_balanced() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
@@ -646,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_record_trade_unknown_side_returns_error() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         let mut bals = HashMap::new();
         bals.insert(
             "ETH".into(),
@@ -675,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_adjust_balance_negative_returns_error() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         let mut bals = HashMap::new();
         bals.insert(
             "ETH".into(),
@@ -704,13 +798,13 @@ mod tests {
 
     #[test]
     fn test_get_available_returns_none_for_unknown() {
-        let tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         assert!(tracker.get_available(Venue::Binance, "ETH").is_none());
     }
 
     #[test]
     fn test_get_total_returns_none_for_unknown() {
-        let tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         assert!(tracker.get_total(Venue::Binance, "ETH").is_none());
     }
 
@@ -733,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_can_execute_no_balance_data_returns_zero_available() {
-        let tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
         let result = tracker.can_execute(
             Venue::Binance,
             "ETH",
@@ -766,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_record_trade_sell_adjusts_correctly() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         let mut bals = HashMap::new();
         bals.insert(
             "ETH".into(),
@@ -811,7 +905,7 @@ mod tests {
 
     #[test]
     fn test_verify_balances_detects_mismatch() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         let mut bals = HashMap::new();
         bals.insert(
             "ETH".into(),
@@ -834,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_verify_balances_within_tolerance() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance]);
+        let mut tracker = InventoryTracker::new(vec![Venue::Binance], MAINNET_CHAIN_ID);
         let mut bals = HashMap::new();
         bals.insert(
             "ETH".into(),

@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use clap::Parser;
 use rust_decimal::Decimal;
 
+use peanut_internship_rust::core::types::{
+    DEFAULT_ARB_CHECK_SIZE_ETH, DEFAULT_DEX_FEE_BPS, DEFAULT_GAS_COST_USD, MAINNET_CHAIN_ID,
+    split_pair_symbols,
+};
 use peanut_internship_rust::exchange::types::NormalizedBalance;
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient};
 use peanut_internship_rust::integration::{ArbCheckResult, ArbChecker, ArbLogger};
@@ -18,14 +22,14 @@ const WBTC_ETH_V2: &str = "0xBb2b8038a16401936FCE81B262E509B2E5c43d05";
 struct Cli {
     pair: String,
 
-    #[arg(short, long, default_value = "2.0")]
+    #[arg(short, long, default_value = DEFAULT_ARB_CHECK_SIZE_ETH)]
     size: String,
 
-    #[arg(long, default_value = "30")]
-    dex_fee_bps: String,
+    #[arg(long, default_value_t = DEFAULT_DEX_FEE_BPS)]
+    dex_fee_bps: u64,
 
-    #[arg(long, default_value = "5.0")]
-    gas_cost_usd: String,
+    #[arg(long, default_value_t = DEFAULT_GAS_COST_USD)]
+    gas_cost_usd: u64,
 
     #[arg(long)]
     fork_url: Option<String>,
@@ -51,10 +55,8 @@ async fn main() {
     let cli = Cli::parse();
 
     let size: Decimal = Decimal::from_str_exact(&cli.size).unwrap_or(Decimal::from(2));
-    let dex_fee_bps: Decimal =
-        Decimal::from_str_exact(&cli.dex_fee_bps).unwrap_or(Decimal::from(30));
-    let gas_cost_usd: Decimal =
-        Decimal::from_str_exact(&cli.gas_cost_usd).unwrap_or(Decimal::from(5));
+    let dex_fee_bps: Decimal = Decimal::from(cli.dex_fee_bps);
+    let gas_cost_usd: Decimal = Decimal::from(cli.gas_cost_usd);
 
     let config = match BinanceConfig::from_env() {
         Ok(c) => c,
@@ -73,7 +75,7 @@ async fn main() {
         }
     };
 
-    let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+    let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
     match exchange_client.fetch_balance().await {
         Ok(balances) => {
@@ -374,5 +376,7 @@ fn default_pool(pair: &str) -> &'static str {
 }
 
 fn base_asset(symbol: &str) -> &str {
-    symbol.split('/').next().unwrap_or("???")
+    split_pair_symbols(symbol)
+        .map(|(base, _)| base)
+        .unwrap_or("???")
 }

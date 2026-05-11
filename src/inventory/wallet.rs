@@ -5,8 +5,8 @@ use tracing::{debug, info, warn};
 
 use crate::chain::ChainClient;
 use crate::core::types::{
-    Address, BlockId, DECIMAL_BASE, ETH_DECIMALS, MAINNET_CHAIN_ID, ARBITRUM_CHAIN_ID, RPC_RETRIES, RPC_TIMEOUT_SECS,
-    TransactionRequest,
+    ARBITRUM_CHAIN_ID, Address, BlockId, DECIMAL_BASE, ETH_DECIMALS, MAINNET_CHAIN_ID, RPC_RETRIES,
+    RPC_TIMEOUT_SECS, TransactionRequest,
 };
 use crate::inventory::errors::{InventoryError, InventoryResult};
 
@@ -148,8 +148,8 @@ impl WalletBalanceFetcher {
                 Ok(bal) => {
                     if bal > Decimal::ZERO {
                         balances.insert(symbol.to_string(), bal);
+                        info!(symbol, balance = %bal, "Fetched wallet token balance");
                     }
-                    debug!(symbol, balance = %bal, "Fetched ERC-20 balance");
                 }
                 Err(e) => {
                     debug!(symbol, error = %e, "Skipping ERC-20 balance");
@@ -159,7 +159,7 @@ impl WalletBalanceFetcher {
 
         info!(
             wallet = %self.wallet_address,
-            tokens = balances.len(),
+            total_assets = balances.len(),
             "Wallet balance fetch complete"
         );
 

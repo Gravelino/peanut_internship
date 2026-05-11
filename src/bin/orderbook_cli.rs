@@ -1,7 +1,15 @@
 use clap::Parser;
 use rust_decimal::Decimal;
 
+use peanut_internship_rust::core::types::{DEFAULT_ORDERBOOK_DEPTH, split_pair_symbols};
 use peanut_internship_rust::exchange::{BinanceConfig, ExchangeClient, OrderBookAnalyzer};
+use peanut_internship_rust::format;
+
+const DEPTH_WINDOW_BPS: u64 = 10;
+const IMBALANCE_LEVELS: usize = 10;
+const IMBALANCE_PRESSURE_THRESHOLD: f64 = 0.05;
+const WALK_THE_BOOK_SIZES: [u64; 2] = [2, 10];
+const EFFECTIVE_SPREAD_SIZE: u64 = 2;
 
 /// Formats a Unix-millisecond timestamp as a human-readable UTC string.
 fn format_unix_millis(millis: u64) -> String {
@@ -16,7 +24,7 @@ fn format_unix_millis(millis: u64) -> String {
 struct Cli {
     symbol: String,
 
-    #[arg(short, long, default_value = "20")]
+    #[arg(short, long, default_value_t = DEFAULT_ORDERBOOK_DEPTH)]
     depth: u32,
 }
 
@@ -63,6 +71,14 @@ async fn main() {
     let analyzer = OrderBookAnalyzer::new(ob);
     let ob = analyzer.orderbook();
 
+    let base = match split_pair_symbols(&ob.symbol) {
+        Ok((base, _)) => base,
+        Err(error) => {
+            eprintln!("Invalid order book symbol: {error}");
+            std::process::exit(1);
+        }
+    };
+
     println!();
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  {} Order Book Analysis", pad_right(&ob.symbol, 34));
@@ -71,65 +87,59 @@ async fn main() {
 
     match ob.best_bid {
         Some((p, q)) => println!(
-            "║  Best Bid:    ${} × {} {}",
-            fmt_dec(p),
-            fmt_dec(q),
-            base_asset(&ob.symbol)
+            "║  Best Bid:    {} × {} {}",
+            format::fmt_price(p),
+            format::fmt_qty(q),
+            base
         ),
         None => println!("║  Best Bid:    N/A"),
     }
     match ob.best_ask {
         Some((p, q)) => println!(
-            "║  Best Ask:    ${} × {} {}",
-            fmt_dec(p),
-            fmt_dec(q),
-            base_asset(&ob.symbol)
+            "║  Best Ask:    {} × {} {}",
+            format::fmt_price(p),
+            format::fmt_qty(q),
+            base
         ),
         None => println!("║  Best Ask:    N/A"),
     }
     match ob.mid_price {
-        Some(mp) => println!("║  Mid Price:   ${}", fmt_dec(mp)),
+        Some(mp) => println!("║  Mid Price:   {}", format::fmt_price(mp)),
         None => println!("║  Mid Price:   N/A"),
     }
     println!(
-        "║  Spread:      {} ({} bps)",
+        "║  Spread:      {} ({})",
         match (ob.best_bid, ob.best_ask) {
-            (Some((bid, _)), Some((ask, _))) => fmt_spread(ask - bid),
+            (Some((bid, _)), Some((ask, _))) => format::fmt_price(ask - bid),
             _ => "N/A".into(),
         },
-        ob.spread_bps.map(fmt_dec).unwrap_or_else(|| "N/A".into())
+        ob.spread_bps
+            .map(format::fmt_bps)
+            .unwrap_or_else(|| "N/A".into())
     );
 
     println!("╠══════════════════════════════════════════════════════╣");
 
     let bid_depth = analyzer
-        .depth_at_bps("bid", Decimal::from(10))
+        .depth_at_bps("bid", Decimal::from(DEPTH_WINDOW_BPS))
         .unwrap_or_else(|e| {
             eprintln!("  Warning: bid depth calculation failed: {e}");
             Decimal::ZERO
         });
     let ask_depth = analyzer
-        .depth_at_bps("ask", Decimal::from(10))
+        .depth_at_bps("ask", Decimal::from(DEPTH_WINDOW_BPS))
         .unwrap_or_else(|e| {
             eprintln!("  Warning: ask depth calculation failed: {e}");
             Decimal::ZERO
         });
-    println!("║  Depth (within 10 bps):");
-    println!(
-        "║    Bids: {} {}",
-        fmt_dec(bid_depth),
-        base_asset(&ob.symbol)
-    );
-    println!(
-        "║    Asks: {} {}",
-        fmt_dec(ask_depth),
-        base_asset(&ob.symbol)
-    );
+    println!("║  Depth (within {DEPTH_WINDOW_BPS} bps):");
+    println!("║    Bids: {} {}", format::fmt_qty(bid_depth), base);
+    println!("║    Asks: {} {}", format::fmt_qty(ask_depth), base);
 
-    let imb = analyzer.imbalance(10);
-    let imb_label = if imb > 0.05 {
+    let imb = analyzer.imbalance(IMBALANCE_LEVELS);
+    let imb_label = if imb > IMBALANCE_PRESSURE_THRESHOLD {
         "buy pressure"
-    } else if imb < -0.05 {
+    } else if imb < -IMBALANCE_PRESSURE_THRESHOLD {
         "sell pressure"
     } else {
         "balanced"
@@ -138,15 +148,11 @@ async fn main() {
 
     println!("╠══════════════════════════════════════════════════════╣");
 
-    for size in [Decimal::from(2), Decimal::from(10)] {
+    for size in WALK_THE_BOOK_SIZES.map(Decimal::from) {
         let walk = analyzer.walk_the_book("buy", size).unwrap();
-        println!(
-            "║  Walk-the-book ({} {} buy):",
-            fmt_dec(size),
-            base_asset(&ob.symbol)
-        );
-        println!("║    Avg price:  ${}", fmt_dec(walk.avg_price));
-        println!("║    Slippage:   {} bps", fmt_dec(walk.slippage_bps));
+        println!("║  Walk-the-book ({} {} buy):", format::fmt_qty(size), base);
+        println!("║    Avg price:  {}", format::fmt_price(walk.avg_price));
+        println!("║    Slippage:   {}", format::fmt_bps(walk.slippage_bps));
         println!("║    Levels:     {}", walk.levels_consumed);
         if !walk.fully_filled {
             println!("║    ⚠️  Insufficient liquidity");
@@ -154,26 +160,19 @@ async fn main() {
     }
 
     let eff_spread = analyzer
-        .effective_spread(Decimal::from(2))
+        .effective_spread(Decimal::from(EFFECTIVE_SPREAD_SIZE))
         .unwrap_or_else(|e| {
             eprintln!("  Warning: effective spread calculation failed: {e}");
             Decimal::ZERO
         });
     println!("╠══════════════════════════════════════════════════════╣");
     println!(
-        "║  Effective spread (2 {} round-trip): {} bps",
-        base_asset(&ob.symbol),
-        fmt_dec(eff_spread)
+        "║  Effective spread ({} {} round-trip): {}",
+        EFFECTIVE_SPREAD_SIZE,
+        base,
+        format::fmt_bps(eff_spread)
     );
     println!("╚══════════════════════════════════════════════════════╝");
-}
-
-fn fmt_dec(d: Decimal) -> String {
-    format!("{d:.2}")
-}
-
-fn fmt_spread(d: Decimal) -> String {
-    format!("${d:.2}")
 }
 
 fn pad_right(s: &str, width: usize) -> String {
@@ -182,8 +181,4 @@ fn pad_right(s: &str, width: usize) -> String {
         out.push(' ');
     }
     out
-}
-
-fn base_asset(symbol: &str) -> &str {
-    symbol.split('/').next().unwrap_or("???")
 }

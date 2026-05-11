@@ -1610,7 +1610,15 @@ mod tests {
                     "fee": "1",
                     "fee_asset": "USDC"
                 },
-                "gas_cost_usd": "2"
+                "gas_cost_usd": "2",
+                "expected_gross_pnl_usd": "10",
+                "expected_fees_usd": "4",
+                "expected_net_pnl_usd": "6",
+                "actual_gross_pnl_usd": "10",
+                "actual_fees_usd": "4",
+                "actual_cex_fee_usd": "2",
+                "actual_onchain_gas_fee_usd": "2",
+                "actual_net_pnl_usd": "6"
             })
         )
         .unwrap();

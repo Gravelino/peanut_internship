@@ -50,6 +50,16 @@ pub struct ArbRecord {
     pub sell_leg: TradeLeg,
     /// On-chain gas cost in USD.
     pub gas_cost_usd: Decimal,
+    pub expected_gross_pnl_usd: Decimal,
+    pub expected_fees_usd: Decimal,
+    pub expected_net_pnl_usd: Decimal,
+    pub actual_gross_pnl_usd: Decimal,
+    pub actual_fees_usd: Decimal,
+    pub actual_cex_fee_usd: Decimal,
+    pub actual_onchain_gas_fee_usd: Decimal,
+    pub actual_net_pnl_usd: Decimal,
+    pub onchain_gas_used: Option<String>,
+    pub onchain_gas_fee_wei: Option<String>,
 }
 
 /// Append-only JSONL writer for completed arbitrage records.
@@ -87,32 +97,17 @@ impl TradeJsonlLogger {
 impl ArbRecord {
     /// Revenue from sell leg minus cost of buy leg, before fees.
     pub fn gross_pnl(&self) -> Decimal {
-        let sell_revenue = self.sell_leg.amount * self.sell_leg.price;
-        let buy_cost = self.buy_leg.amount * self.buy_leg.price;
-        sell_revenue - buy_cost
+        self.actual_gross_pnl_usd
     }
 
     /// Sum of buy-leg fee, sell-leg fee, and gas cost, all in USD.
     pub fn total_fees(&self) -> Decimal {
-        let buy_fee_usd = if self.buy_leg.fee_asset == "USDT" || self.buy_leg.fee_asset == "USDC" {
-            self.buy_leg.fee
-        } else {
-            self.buy_leg.fee * self.buy_leg.price
-        };
-
-        let sell_fee_usd = if self.sell_leg.fee_asset == "USDT" || self.sell_leg.fee_asset == "USDC"
-        {
-            self.sell_leg.fee
-        } else {
-            self.sell_leg.fee * self.sell_leg.price
-        };
-
-        buy_fee_usd + sell_fee_usd + self.gas_cost_usd
+        self.actual_fees_usd
     }
 
     /// Gross PnL minus all fees.
     pub fn net_pnl(&self) -> Decimal {
-        self.gross_pnl() - self.total_fees()
+        self.actual_net_pnl_usd
     }
 
     /// Buy-leg amount times buy price (USD notional of the trade).
@@ -335,6 +330,16 @@ impl PnLEngine {
             "sell_fee",
             "sell_fee_asset",
             "gas_cost_usd",
+            "expected_gross_pnl_usd",
+            "expected_fees_usd",
+            "expected_net_pnl_usd",
+            "actual_gross_pnl_usd",
+            "actual_fees_usd",
+            "actual_cex_fee_usd",
+            "actual_onchain_gas_fee_usd",
+            "actual_net_pnl_usd",
+            "onchain_gas_used",
+            "onchain_gas_fee_wei",
             "gross_pnl",
             "total_fees",
             "net_pnl",
@@ -360,6 +365,16 @@ impl PnLEngine {
                 &t.sell_leg.fee.to_string(),
                 &t.sell_leg.fee_asset,
                 &t.gas_cost_usd.to_string(),
+                &t.expected_gross_pnl_usd.to_string(),
+                &t.expected_fees_usd.to_string(),
+                &t.expected_net_pnl_usd.to_string(),
+                &t.actual_gross_pnl_usd.to_string(),
+                &t.actual_fees_usd.to_string(),
+                &t.actual_cex_fee_usd.to_string(),
+                &t.actual_onchain_gas_fee_usd.to_string(),
+                &t.actual_net_pnl_usd.to_string(),
+                t.onchain_gas_used.as_deref().unwrap_or(""),
+                t.onchain_gas_fee_wei.as_deref().unwrap_or(""),
                 &t.gross_pnl().to_string(),
                 &t.total_fees().to_string(),
                 &t.net_pnl().to_string(),
@@ -417,6 +432,20 @@ mod tests {
             buy_leg: make_leg(&format!("{id}_buy"), "buy", amount, buy_price, buy_fee),
             sell_leg: make_leg(&format!("{id}_sell"), "sell", amount, sell_price, sell_fee),
             gas_cost_usd: gas,
+            expected_gross_pnl_usd: sell_price * amount - buy_price * amount,
+            expected_fees_usd: buy_fee + sell_fee + gas,
+            expected_net_pnl_usd: sell_price * amount
+                - buy_price * amount
+                - buy_fee
+                - sell_fee
+                - gas,
+            actual_gross_pnl_usd: sell_price * amount - buy_price * amount,
+            actual_fees_usd: buy_fee + sell_fee + gas,
+            actual_cex_fee_usd: buy_fee + sell_fee,
+            actual_onchain_gas_fee_usd: gas,
+            actual_net_pnl_usd: sell_price * amount - buy_price * amount - buy_fee - sell_fee - gas,
+            onchain_gas_used: None,
+            onchain_gas_fee_wei: None,
         }
     }
 
@@ -577,6 +606,31 @@ mod tests {
         );
         let bps = arb.net_pnl_bps();
         assert!(bps > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_arb_record_net_pnl_uses_actual_usd_fields_for_eth_quote() {
+        let mut arb = make_arb(
+            "eth_quote",
+            Decimal::from_str_exact("0.004472").unwrap(),
+            Decimal::from_str_exact("0.004532").unwrap(),
+            Decimal::from_str_exact("0.79").unwrap(),
+            Decimal::ZERO,
+        );
+        arb.actual_gross_pnl_usd = Decimal::from_str_exact("0.048349").unwrap();
+        arb.actual_fees_usd = Decimal::from_str_exact("0.014366").unwrap();
+        arb.actual_net_pnl_usd = Decimal::from_str_exact("0.033983").unwrap();
+
+        assert_eq!(
+            arb.gross_pnl(),
+            Decimal::from_str_exact("0.048349").unwrap()
+        );
+        assert_eq!(
+            arb.total_fees(),
+            Decimal::from_str_exact("0.014366").unwrap()
+        );
+        assert_eq!(arb.net_pnl(), Decimal::from_str_exact("0.033983").unwrap());
+        assert!(arb.net_pnl() > Decimal::ZERO);
     }
 
     #[test]

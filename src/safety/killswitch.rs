@@ -2,11 +2,10 @@ use std::path::Path;
 
 use rust_decimal::Decimal;
 
-pub const DEFAULT_KILL_SWITCH_FILE: &str = "/tmp/arb_bot_kill";
-pub const ABSOLUTE_MAX_TRADE_USD: u64 = 25;
-pub const ABSOLUTE_MAX_DAILY_LOSS: i64 = 20;
-pub const ABSOLUTE_MIN_CAPITAL: u64 = 50;
-pub const ABSOLUTE_MAX_TRADES_PER_HOUR: u32 = 30;
+use crate::core::types::{
+    ABSOLUTE_MAX_DAILY_LOSS, ABSOLUTE_MAX_TRADE_USD, ABSOLUTE_MAX_TRADES_PER_HOUR,
+    ABSOLUTE_MIN_CAPITAL,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SafetyDecision {

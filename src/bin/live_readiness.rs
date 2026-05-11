@@ -9,7 +9,15 @@ use clap::Parser;
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::U256;
 use peanut_internship_rust::chain::ChainClient;
-use peanut_internship_rust::core::types::{Address, BlockId, TransactionRequest, ARBITRUM_CHAIN_ID};
+use peanut_internship_rust::config::address_book::{
+    AddressBookPoolKind, ParsedAddressBookPair, load_parsed_address_book, unique_tokens,
+};
+use peanut_internship_rust::core::types::{
+    ARBITRUM_CHAIN_ID, Address, BlockId, DEFAULT_INITIAL_CAPITAL_USD,
+    DEFAULT_MIN_NATIVE_BALANCE_ETH, DEFAULT_RECENT_WINDOW_MINUTES,
+    DEFAULT_RISK_CONSECUTIVE_LOSS_LIMIT, DEFAULT_RISK_MAX_DAILY_LOSS_USD,
+    DEFAULT_RISK_MAX_TRADE_USD, DEFAULT_RISK_MAX_TRADES_PER_HOUR, TransactionRequest,
+};
 use rusqlite::Connection;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -50,7 +58,7 @@ struct Cli {
     #[arg(long, default_value = ARBITRUM_UNISWAP_V3_SWAP_ROUTER, env = "DEX_ROUTER")]
     router: String,
 
-    #[arg(long, default_value = "0.01")]
+    #[arg(long, default_value = DEFAULT_MIN_NATIVE_BALANCE_ETH)]
     min_native_balance_eth: String,
 
     #[arg(long, default_value_t = true, env = "SIMULATION", action = clap::ArgAction::Set)]
@@ -68,25 +76,25 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     max_gas_gwei: u64,
 
-    #[arg(long, default_value = "100", env = "INITIAL_CAPITAL_USD")]
+    #[arg(long, default_value = DEFAULT_INITIAL_CAPITAL_USD, env = "INITIAL_CAPITAL_USD")]
     initial_capital_usd: String,
 
-    #[arg(long, default_value = "5", env = "RISK_MAX_TRADE_USD")]
+    #[arg(long, default_value = DEFAULT_RISK_MAX_TRADE_USD, env = "RISK_MAX_TRADE_USD")]
     risk_max_trade_usd: String,
 
-    #[arg(long, default_value = "10", env = "RISK_MAX_DAILY_LOSS_USD")]
+    #[arg(long, default_value = DEFAULT_RISK_MAX_DAILY_LOSS_USD, env = "RISK_MAX_DAILY_LOSS_USD")]
     risk_max_daily_loss_usd: String,
 
-    #[arg(long, default_value_t = 20, env = "RISK_MAX_TRADES_PER_HOUR")]
+    #[arg(long, default_value_t = DEFAULT_RISK_MAX_TRADES_PER_HOUR, env = "RISK_MAX_TRADES_PER_HOUR")]
     risk_max_trades_per_hour: u32,
 
-    #[arg(long, default_value_t = 3, env = "RISK_CONSECUTIVE_LOSS_LIMIT")]
+    #[arg(long, default_value_t = DEFAULT_RISK_CONSECUTIVE_LOSS_LIMIT, env = "RISK_CONSECUTIVE_LOSS_LIMIT")]
     risk_consecutive_loss_limit: u32,
 
     #[arg(long, default_value = "/tmp/arb_bot_kill", env = "HALT_FILE")]
     halt_file_path: String,
 
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = DEFAULT_RECENT_WINDOW_MINUTES)]
     recent_window_minutes: i64,
 
     #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
@@ -133,35 +141,6 @@ struct ReadinessReport {
     fail_count: usize,
     warn_count: usize,
     checks: Vec<ReadinessCheck>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AddressBookEntry {
-    base: String,
-    base_decimals: u8,
-    quote: String,
-    quote_decimals: u8,
-    pool: Option<String>,
-    #[serde(default)]
-    pool_type: String,
-    #[serde(default, alias = "fee")]
-    v3_fee: Option<u32>,
-    quoter: Option<String>,
-}
-
-#[derive(Debug)]
-struct ParsedPair {
-    pair: String,
-    base_symbol: String,
-    quote_symbol: String,
-    base: Address,
-    base_decimals: u8,
-    quote: Address,
-    quote_decimals: u8,
-    pool: Option<Address>,
-    pool_type: String,
-    v3_fee: Option<u32>,
-    quoter: Option<Address>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,35 +311,13 @@ fn overall_status(checks: &[ReadinessCheck]) -> CheckStatus {
     }
 }
 
-fn load_address_book(path: &Path) -> Result<Vec<ParsedPair>, Box<dyn std::error::Error>> {
-    let raw: BTreeMap<String, AddressBookEntry> = serde_json::from_reader(File::open(path)?)?;
-    let mut out = Vec::new();
-    for (pair, entry) in raw {
-        let (base_symbol, quote_symbol) = pair
-            .split_once('/')
-            .ok_or_else(|| format!("pair '{pair}' missing '/' separator"))?;
-        let base_symbol = base_symbol.to_ascii_uppercase();
-        let quote_symbol = quote_symbol.to_ascii_uppercase();
-        let pool = entry.pool.as_deref().map(Address::new).transpose()?;
-        let quoter = entry.quoter.as_deref().map(Address::new).transpose()?;
-        out.push(ParsedPair {
-            pair,
-            base_symbol,
-            quote_symbol,
-            base: Address::new(&entry.base)?,
-            base_decimals: entry.base_decimals,
-            quote: Address::new(&entry.quote)?,
-            quote_decimals: entry.quote_decimals,
-            pool,
-            pool_type: entry.pool_type.to_ascii_lowercase(),
-            v3_fee: entry.v3_fee,
-            quoter,
-        });
-    }
-    Ok(out)
+fn load_address_book(
+    path: &Path,
+) -> Result<Vec<ParsedAddressBookPair>, Box<dyn std::error::Error>> {
+    load_parsed_address_book(path)
 }
 
-fn address_book_checks(pairs: &[ParsedPair], router: &str) -> Vec<ReadinessCheck> {
+fn address_book_checks(pairs: &[ParsedAddressBookPair], router: &str) -> Vec<ReadinessCheck> {
     let mut checks = Vec::new();
     match Address::new(router) {
         Ok(addr) if addr.lower() != ZERO_ADDRESS => checks.push(check(
@@ -399,14 +356,8 @@ fn address_book_checks(pairs: &[ParsedPair], router: &str) -> Vec<ReadinessCheck
         if pair.base_decimals > 36 || pair.quote_decimals > 36 {
             issues.push("token decimals exceed sanity bound".to_string());
         }
-        if !matches!(pair.pool_type.as_str(), "v2" | "v3") {
-            issues.push(format!("unsupported pool_type '{}'", pair.pool_type));
-        }
         if pair.pool.is_none() {
             issues.push("missing pool address".to_string());
-        }
-        if pair.pool_type == "v3" && pair.quoter.is_none() {
-            issues.push("V3 pair missing quoter".to_string());
         }
         token_addresses.insert(
             format!("{}:{}", pair.base_symbol, pair.base.lower()),
@@ -424,7 +375,7 @@ fn address_book_checks(pairs: &[ParsedPair], router: &str) -> Vec<ReadinessCheck
                 CheckStatus::Fail
             },
             if issues.is_empty() {
-                let fee_detail = if pair.pool_type == "v3" {
+                let fee_detail = if pair.pool_kind == AddressBookPoolKind::V3 {
                     pair.v3_fee
                         .map(|fee| format!(", v3_fee={fee}"))
                         .unwrap_or_else(|| ", v3_fee=discover_from_pool".to_string())
@@ -437,7 +388,7 @@ fn address_book_checks(pairs: &[ParsedPair], router: &str) -> Vec<ReadinessCheck
                     pair.base,
                     pair.quote_symbol,
                     pair.quote,
-                    pair.pool_type,
+                    pair.pool_kind.as_str(),
                     fee_detail
                 )
             } else {
@@ -516,7 +467,7 @@ async fn chain_checks(rpc_urls: &[String], expected_chain_id: u64) -> Vec<Readin
 async fn balance_checks(
     rpc_urls: &[String],
     wallet: &Address,
-    pairs: &[ParsedPair],
+    pairs: &[ParsedAddressBookPair],
     min_native_balance: Decimal,
 ) -> Vec<ReadinessCheck> {
     let mut checks = Vec::new();
@@ -570,7 +521,7 @@ async fn balance_checks(
 async fn allowance_checks(
     rpc_urls: &[String],
     wallet: &Address,
-    pairs: &[ParsedPair],
+    pairs: &[ParsedAddressBookPair],
     router: &str,
 ) -> Vec<ReadinessCheck> {
     let mut checks = Vec::new();
@@ -661,27 +612,6 @@ fn u256_to_decimal(value: U256, decimals: u8) -> Result<Decimal, String> {
         scale *= Decimal::from(10u64);
     }
     Ok(raw / scale)
-}
-
-fn unique_tokens(pairs: &[ParsedPair]) -> Vec<(String, Address, u8)> {
-    let mut tokens = BTreeMap::new();
-    for pair in pairs {
-        tokens.entry(pair.base.lower()).or_insert_with(|| {
-            (
-                pair.base_symbol.clone(),
-                pair.base.clone(),
-                pair.base_decimals,
-            )
-        });
-        tokens.entry(pair.quote.lower()).or_insert_with(|| {
-            (
-                pair.quote_symbol.clone(),
-                pair.quote.clone(),
-                pair.quote_decimals,
-            )
-        });
-    }
-    tokens.into_values().collect()
 }
 
 fn reconcile_checks(path: &Path) -> Vec<ReadinessCheck> {

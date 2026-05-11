@@ -4,6 +4,9 @@ use rust_decimal::Decimal;
 use crate::safety::killswitch::SafetyDecision;
 use crate::strategy::Signal;
 
+const DEFAULT_PRE_TRADE_MAX_SPREAD_BPS: u64 = 500;
+const DEFAULT_PRE_TRADE_MAX_AGE_SECONDS: f64 = 5.0;
+
 #[derive(Debug, Clone)]
 pub struct PreTradeValidator {
     pub max_spread_bps: Decimal,
@@ -13,8 +16,8 @@ pub struct PreTradeValidator {
 impl Default for PreTradeValidator {
     fn default() -> Self {
         Self {
-            max_spread_bps: Decimal::from(500),
-            max_age_seconds: 5.0,
+            max_spread_bps: Decimal::from(DEFAULT_PRE_TRADE_MAX_SPREAD_BPS),
+            max_age_seconds: DEFAULT_PRE_TRADE_MAX_AGE_SECONDS,
         }
     }
 }
@@ -84,6 +87,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(100),
             size: Decimal::new(1, 2),
+            notional_usd: Decimal::from(1000),
             expected_gross_pnl: Decimal::from(1),
             expected_fees: Decimal::new(1, 1),
             expected_net_pnl: Decimal::new(9, 1),
@@ -133,6 +137,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(100),
             size: Decimal::new(1, 2),
+            notional_usd: Decimal::from(1000),
             expected_gross_pnl: Decimal::from(1),
             expected_fees: Decimal::new(1, 1),
             expected_net_pnl: Decimal::new(9, 1),
