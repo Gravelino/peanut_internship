@@ -28,7 +28,9 @@ use thiserror::Error;
 use tracing::{info, instrument, warn};
 
 use crate::chain::client::ChainClient;
-use crate::core::types::TransactionReceipt;
+use crate::core::types::{
+    DEFAULT_RECONCILE_MAX_AGE_SECS, DEFAULT_RECONCILE_POLL_SECS, TransactionReceipt,
+};
 use crate::executor::errors::ExecutorError;
 use crate::executor::migrations::{SqlMigration, migrate_executor_db};
 use crate::observability::{emit_event, metrics_handle};
@@ -392,9 +394,8 @@ pub struct ReconcileConfig {
 impl Default for ReconcileConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(10),
-            // 1 hour — generously longer than typical mempool residency.
-            max_age: Duration::from_secs(60 * 60),
+            poll_interval: Duration::from_secs(DEFAULT_RECONCILE_POLL_SECS),
+            max_age: Duration::from_secs(DEFAULT_RECONCILE_MAX_AGE_SECS),
         }
     }
 }

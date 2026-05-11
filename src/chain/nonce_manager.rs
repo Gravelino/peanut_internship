@@ -6,7 +6,9 @@ use tracing::{debug, warn};
 
 use crate::chain::client::ChainClient;
 use crate::chain::errors::ChainResult;
-use crate::core::types::{Address, BlockId, ARBITRUM_CHAIN_ID};
+#[cfg(test)]
+use crate::core::types::ARBITRUM_CHAIN_ID;
+use crate::core::types::{Address, BlockId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NonceKey {

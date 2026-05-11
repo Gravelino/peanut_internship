@@ -20,10 +20,13 @@ use tracing::{info, warn};
 
 use ethers::types::U256;
 
-use crate::core::types::{Address, BPS_SCALE};
+use crate::core::types::{
+    Address, BPS_SCALE, DEFAULT_LEG1_TIMEOUT_SECS, DEFAULT_LEG2_TIMEOUT_SECS,
+    DEFAULT_MIN_FILL_RATIO, split_pair_symbols,
+};
 use crate::exchange::client::ExchangeClient;
 use crate::executor::dex_swapper::{self, DexSwapper, DexSwapperConfig, PairAddressBook};
-use crate::executor::errors::ExecutorResult;
+use crate::executor::errors::{ExecutorError, ExecutorResult};
 use crate::executor::reconcile::{PendingReconcile, ReconcileStore};
 use crate::executor::recovery::{CircuitBreaker, ReplayProtection};
 use crate::observability::{emit_event, metrics_handle};
@@ -137,6 +140,44 @@ pub struct LegFill {
     pub handle: Option<String>,
     /// Human-readable error description when `outcome != Accepted`.
     pub error: Option<String>,
+    pub fee: Decimal,
+    pub fee_asset: Option<String>,
+    pub onchain_gas_used: Option<U256>,
+    pub onchain_gas_fee_wei: Option<U256>,
+}
+
+impl LegFill {
+    fn new(
+        outcome: LegOutcome,
+        price: Decimal,
+        filled: Decimal,
+        handle: Option<String>,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            outcome,
+            price,
+            filled,
+            handle,
+            error,
+            fee: Decimal::ZERO,
+            fee_asset: None,
+            onchain_gas_used: None,
+            onchain_gas_fee_wei: None,
+        }
+    }
+
+    fn with_fee(mut self, fee: Decimal, fee_asset: impl Into<String>) -> Self {
+        self.fee = fee;
+        self.fee_asset = Some(fee_asset.into());
+        self
+    }
+
+    fn with_onchain_gas(mut self, gas_used: U256, gas_fee_wei: U256) -> Self {
+        self.onchain_gas_used = Some(gas_used);
+        self.onchain_gas_fee_wei = Some(gas_fee_wei);
+        self
+    }
 }
 
 /// Running state of one [`Executor::execute`] call.
@@ -155,6 +196,8 @@ pub struct ExecutionContext {
     pub leg1_fill_price: Option<Decimal>,
     /// Leg 1 filled quantity.
     pub leg1_fill_size: Option<Decimal>,
+    pub leg1_fee: Decimal,
+    pub leg1_fee_asset: Option<String>,
 
     /// Venue label for leg 2 ("cex" or "dex").
     pub leg2_venue: &'static str,
@@ -164,6 +207,8 @@ pub struct ExecutionContext {
     pub leg2_fill_price: Option<Decimal>,
     /// Leg 2 filled quantity.
     pub leg2_fill_size: Option<Decimal>,
+    pub leg2_fee: Decimal,
+    pub leg2_fee_asset: Option<String>,
 
     /// Monotonic start time.
     pub started_at: Instant,
@@ -171,6 +216,12 @@ pub struct ExecutionContext {
     pub finished_at: Option<Instant>,
     /// Realised net PnL after both legs (only for `Done`).
     pub actual_net_pnl: Option<Decimal>,
+    pub actual_gross_pnl_usd: Option<Decimal>,
+    pub actual_fees_usd: Option<Decimal>,
+    pub actual_cex_fee_usd: Option<Decimal>,
+    pub actual_onchain_gas_fee_usd: Option<Decimal>,
+    pub onchain_gas_used: Option<U256>,
+    pub onchain_gas_fee_wei: Option<U256>,
     /// Error description for `Failed` states.
     pub error: Option<String>,
 }
@@ -184,15 +235,29 @@ impl ExecutionContext {
             leg1_handle: None,
             leg1_fill_price: None,
             leg1_fill_size: None,
+            leg1_fee: Decimal::ZERO,
+            leg1_fee_asset: None,
             leg2_venue: "",
             leg2_handle: None,
             leg2_fill_price: None,
             leg2_fill_size: None,
+            leg2_fee: Decimal::ZERO,
+            leg2_fee_asset: None,
             started_at: Instant::now(),
             finished_at: None,
             actual_net_pnl: None,
+            actual_gross_pnl_usd: None,
+            actual_fees_usd: None,
+            actual_cex_fee_usd: None,
+            actual_onchain_gas_fee_usd: None,
+            onchain_gas_used: None,
+            onchain_gas_fee_wei: None,
             error: None,
         }
+    }
+
+    pub fn rejected(signal: Signal, msg: impl Into<String>) -> Self {
+        Self::new(signal).reject(msg)
     }
 
     /// Pre-flight / leg-1 rejection (no position opened).
@@ -227,8 +292,22 @@ impl ExecutionContext {
         self
     }
 
-    fn complete(mut self, pnl: Decimal) -> Self {
-        self.actual_net_pnl = Some(pnl);
+    fn complete_with_actuals(
+        mut self,
+        gross_pnl_usd: Decimal,
+        fees_usd: Decimal,
+        cex_fee_usd: Decimal,
+        onchain_gas_fee_usd: Decimal,
+        onchain_gas_used: Option<U256>,
+        onchain_gas_fee_wei: Option<U256>,
+    ) -> Self {
+        self.actual_net_pnl = Some(gross_pnl_usd - fees_usd);
+        self.actual_gross_pnl_usd = Some(gross_pnl_usd);
+        self.actual_fees_usd = Some(fees_usd);
+        self.actual_cex_fee_usd = Some(cex_fee_usd);
+        self.actual_onchain_gas_fee_usd = Some(onchain_gas_fee_usd);
+        self.onchain_gas_used = onchain_gas_used;
+        self.onchain_gas_fee_wei = onchain_gas_fee_wei;
         self.state = ExecutorState::Done;
         self.finished_at = Some(Instant::now());
         self
@@ -338,6 +417,9 @@ pub trait LegExecutor: Send + Sync {
     /// Market-flattens a stuck leg-1 position after a leg-2 failure.
     async fn unwind(&self, ctx: &ExecutionContext) -> ExecutorResult<()>;
 
+    /// Fetches the current USD price of the given asset.
+    async fn get_usd_price(&self, asset: &str) -> Option<Decimal>;
+
     /// Flattens a specific position without a full [`ExecutionContext`].
     /// Used by the reconcile worker (S3) which only has
     /// `(pair, venue, direction, size)` recovered from persistence.
@@ -359,6 +441,7 @@ pub trait LegExecutor: Send + Sync {
             dex_price: Decimal::ZERO,
             spread_bps: Decimal::ZERO,
             size,
+            notional_usd: Decimal::ZERO,
             expected_gross_pnl: Decimal::ZERO,
             expected_fees: Decimal::ZERO,
             expected_net_pnl: Decimal::ZERO,
@@ -371,7 +454,11 @@ pub trait LegExecutor: Send + Sync {
         ctx.leg1_venue = match venue {
             "cex" => "cex",
             "dex" => "dex",
-            _ => "cex",
+            _ => {
+                return Err(crate::executor::errors::ExecutorError::InvalidSignal(
+                    format!("cannot unwind unknown leg1 venue: {venue}"),
+                ));
+            }
         };
         ctx.leg1_fill_size = Some(size);
         self.unwind(&ctx).await
@@ -379,7 +466,7 @@ pub trait LegExecutor: Send + Sync {
 }
 
 /// In-process, deterministic leg executor used for demos and tests.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct SimulatedLegs {
     /// Artificial latency for the CEX leg.
     pub cex_latency: Duration,
@@ -392,6 +479,39 @@ pub struct SimulatedLegs {
     /// Outcome of a `cancel_cex` call. Lets tests cover all four race-
     /// on-cancel branches deterministically.
     pub cancel_behaviour: CancelBehaviour,
+    /// Optional live price source for USD valuation in dry-run / simulation
+    /// mode. When `Some`, [`get_usd_price`] calls `get_latest_price("{asset}/USDC")`
+    /// to return a real market price instead of `None`.
+    /// Leave `None` in unit tests (callers fall back to their own stub).
+    pub price_source: Option<Arc<dyn crate::strategy::generator::PriceSource + Send + Sync>>,
+}
+
+impl SimulatedLegs {
+    /// Attaches a live price source so that USD fee valuation uses real
+    /// market prices during `--dry-run` / `--simulation` mode.
+    pub fn with_price_source(
+        mut self,
+        source: Arc<dyn crate::strategy::generator::PriceSource + Send + Sync>,
+    ) -> Self {
+        self.price_source = Some(source);
+        self
+    }
+}
+
+impl std::fmt::Debug for SimulatedLegs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulatedLegs")
+            .field("cex_latency", &self.cex_latency)
+            .field("dex_latency", &self.dex_latency)
+            .field("cex_behaviour", &self.cex_behaviour)
+            .field("dex_behaviour", &self.dex_behaviour)
+            .field("cancel_behaviour", &self.cancel_behaviour)
+            .field(
+                "price_source",
+                &self.price_source.as_ref().map(|_| "<PriceSource>"),
+            )
+            .finish()
+    }
 }
 
 /// Outcome knob for [`SimulatedLegs::cancel_cex`]. Maps 1:1 to
@@ -460,20 +580,20 @@ impl LegExecutor for SimulatedLegs {
         let (price, size) = parse_sim_handle(handle).unwrap_or((Decimal::ZERO, Decimal::ZERO));
         Ok(match self.cancel_behaviour {
             CancelBehaviour::CleanCancel => CancelOutcome::Cancelled,
-            CancelBehaviour::RaceFilled => CancelOutcome::RaceFilled(LegFill {
-                outcome: LegOutcome::Accepted,
+            CancelBehaviour::RaceFilled => CancelOutcome::RaceFilled(LegFill::new(
+                LegOutcome::Accepted,
                 price,
-                filled: size,
-                handle: Some(handle.to_string()),
-                error: None,
-            }),
-            CancelBehaviour::PartialRace => CancelOutcome::PartiallyFilled(LegFill {
-                outcome: LegOutcome::Accepted,
+                size,
+                Some(handle.to_string()),
+                None,
+            )),
+            CancelBehaviour::PartialRace => CancelOutcome::PartiallyFilled(LegFill::new(
+                LegOutcome::Accepted,
                 price,
-                filled: size / Decimal::TWO,
-                handle: Some(handle.to_string()),
-                error: None,
-            }),
+                size / Decimal::TWO,
+                Some(handle.to_string()),
+                None,
+            )),
             CancelBehaviour::Unknown => CancelOutcome::Unknown("simulated ambiguous cancel".into()),
         })
     }
@@ -481,6 +601,17 @@ impl LegExecutor for SimulatedLegs {
     async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(())
+    }
+
+    async fn get_usd_price(&self, asset: &str) -> Option<Decimal> {
+        let source = self.price_source.as_ref()?;
+        // Try "{asset}/USDC" first (standard pair), then "{asset}/USDT".
+        let pair_usdc = format!("{asset}/USDC");
+        if let Ok(price) = source.get_latest_price(&pair_usdc).await {
+            return Some(price);
+        }
+        let pair_usdt = format!("{asset}/USDT");
+        source.get_latest_price(&pair_usdt).await.ok()
     }
 }
 
@@ -506,42 +637,42 @@ async fn run_simulated(
             tokio::time::sleep(Duration::from_secs(300)).await;
             unreachable!("test timeout should fire first")
         }
-        LegBehaviour::Reject => Ok(LegFill {
-            outcome: LegOutcome::Rejected,
-            price: Decimal::ZERO,
-            filled: Decimal::ZERO,
-            handle: None,
-            error: Some("simulated reject".into()),
-        }),
+        LegBehaviour::Reject => Ok(LegFill::new(
+            LegOutcome::Rejected,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            None,
+            Some("simulated reject".into()),
+        )),
         LegBehaviour::Revert => {
             tokio::time::sleep(latency).await;
-            Ok(LegFill {
-                outcome: LegOutcome::Reverted,
-                price: Decimal::ZERO,
-                filled: Decimal::ZERO,
-                handle: Some("sim_tx_reverted".into()),
-                error: Some("simulated on-chain revert".into()),
-            })
+            Ok(LegFill::new(
+                LegOutcome::Reverted,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Some("sim_tx_reverted".into()),
+                Some("simulated on-chain revert".into()),
+            ))
         }
         LegBehaviour::PartialFill => {
             tokio::time::sleep(latency).await;
-            Ok(LegFill {
-                outcome: LegOutcome::Accepted,
+            Ok(LegFill::new(
+                LegOutcome::Accepted,
                 price,
-                filled: size / Decimal::TWO,
-                handle: Some("sim_partial".into()),
-                error: None,
-            })
+                size / Decimal::TWO,
+                Some("sim_partial".into()),
+                None,
+            ))
         }
         LegBehaviour::Fill => {
             tokio::time::sleep(latency).await;
-            Ok(LegFill {
-                outcome: LegOutcome::Accepted,
+            Ok(LegFill::new(
+                LegOutcome::Accepted,
                 price,
-                filled: size,
-                handle: Some("sim_fill".into()),
-                error: None,
-            })
+                size,
+                Some("sim_fill".into()),
+                None,
+            ))
         }
     }
 }
@@ -702,25 +833,25 @@ impl LiveLegs {
             .await
         {
             Ok(Some(fresh_out)) if fresh_out < min_out => {
-                return Ok(LegFill {
-                    outcome: LegOutcome::Rejected,
-                    price: Decimal::ZERO,
-                    filled: Decimal::ZERO,
-                    handle: None,
-                    error: Some(format!(
+                return Ok(LegFill::new(
+                    LegOutcome::Rejected,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    None,
+                    Some(format!(
                         "DEX preflight quote below min_out: fresh_out={fresh_out}, min_out={min_out}"
                     )),
-                });
+                ));
             }
             Ok(_) => {}
             Err(e) => {
-                return Ok(LegFill {
-                    outcome: LegOutcome::Rejected,
-                    price: Decimal::ZERO,
-                    filled: Decimal::ZERO,
-                    handle: None,
-                    error: Some(format!("DEX preflight quote failed: {e}")),
-                });
+                return Ok(LegFill::new(
+                    LegOutcome::Rejected,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    None,
+                    Some(format!("DEX preflight quote failed: {e}")),
+                ));
             }
         }
 
@@ -730,22 +861,22 @@ impl LiveLegs {
         {
             Ok(submission) => submission,
             Err(dex_swapper::SwapperError::Reverted(tx)) => {
-                return Ok(LegFill {
-                    outcome: LegOutcome::Reverted,
-                    price: Decimal::ZERO,
-                    filled: Decimal::ZERO,
-                    handle: Some(tx),
-                    error: Some("on-chain revert".into()),
-                });
+                return Ok(LegFill::new(
+                    LegOutcome::Reverted,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    Some(tx),
+                    Some("on-chain revert".into()),
+                ));
             }
             Err(e) => {
-                return Ok(LegFill {
-                    outcome: LegOutcome::Rejected,
-                    price: Decimal::ZERO,
-                    filled: Decimal::ZERO,
-                    handle: None,
-                    error: Some(e.to_string()),
-                });
+                return Ok(LegFill::new(
+                    LegOutcome::Rejected,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    None,
+                    Some(e.to_string()),
+                ));
             }
         };
 
@@ -766,7 +897,12 @@ impl LiveLegs {
 
         match wait_result {
             Ok(result) => {
-                let filled = u256_to_decimal_scaled(result.amount_out, decimals_out);
+                let filled =
+                    u256_to_decimal_scaled(result.amount_out, decimals_out).map_err(|e| {
+                        ExecutorError::Exchange(
+                            crate::exchange::errors::ExchangeError::DecimalParse(e),
+                        )
+                    })?;
                 let price = if matches!(signal.direction, Direction::BuyCexSellDex) {
                     if size > Decimal::ZERO {
                         filled / size
@@ -782,28 +918,29 @@ impl LiveLegs {
                     Direction::BuyCexSellDex => size,
                     Direction::BuyDexSellCex => filled,
                 };
-                Ok(LegFill {
-                    outcome: LegOutcome::Accepted,
+                Ok(LegFill::new(
+                    LegOutcome::Accepted,
                     price,
-                    filled: filled_base,
-                    handle: Some(result.tx_hash),
-                    error: None,
-                })
+                    filled_base,
+                    Some(result.tx_hash),
+                    None,
+                )
+                .with_onchain_gas(result.total_gas_used, result.total_gas_fee_wei))
             }
-            Err(dex_swapper::SwapperError::Reverted(tx)) => Ok(LegFill {
-                outcome: LegOutcome::Reverted,
-                price: Decimal::ZERO,
-                filled: Decimal::ZERO,
-                handle: Some(tx),
-                error: Some("on-chain revert".into()),
-            }),
-            Err(e) => Ok(LegFill {
-                outcome: LegOutcome::Rejected,
-                price: Decimal::ZERO,
-                filled: Decimal::ZERO,
-                handle: None,
-                error: Some(e.to_string()),
-            }),
+            Err(dex_swapper::SwapperError::Reverted(tx)) => Ok(LegFill::new(
+                LegOutcome::Reverted,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Some(tx),
+                Some("on-chain revert".into()),
+            )),
+            Err(e) => Ok(LegFill::new(
+                LegOutcome::Rejected,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                None,
+                Some(e.to_string()),
+            )),
         }
     }
 }
@@ -841,17 +978,18 @@ impl LegExecutor for LiveLegs {
             "FILLED" | "PARTIALLY_FILLED" => LegOutcome::Accepted,
             _ => LegOutcome::Rejected,
         };
-        Ok(LegFill {
+        Ok(LegFill::new(
             outcome,
-            price: result.avg_fill_price,
-            filled: result.amount_filled,
-            handle: Some(result.id),
-            error: if outcome == LegOutcome::Accepted {
+            result.avg_fill_price,
+            result.amount_filled,
+            Some(result.id),
+            if outcome == LegOutcome::Accepted {
                 None
             } else {
                 Some(result.status)
             },
-        })
+        )
+        .with_fee(result.fee, result.fee_asset))
     }
 
     async fn execute_dex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
@@ -911,10 +1049,14 @@ impl LegExecutor for LiveLegs {
             return self.unwind_dex(ctx).await;
         }
         if ctx.leg1_venue != "cex" {
-            return Ok(());
+            return Err(crate::executor::errors::ExecutorError::InvalidSignal(
+                format!("cannot unwind unknown leg1 venue: {}", ctx.leg1_venue),
+            ));
         }
         let Some(filled) = ctx.leg1_fill_size else {
-            return Ok(());
+            return Err(crate::executor::errors::ExecutorError::InvalidSignal(
+                "cannot unwind CEX exposure without leg1 fill size".into(),
+            ));
         };
         if filled <= Decimal::ZERO {
             return Ok(());
@@ -942,10 +1084,49 @@ impl LegExecutor for LiveLegs {
                 "unwind price {price} cannot be represented as f64"
             ))
         })?;
-        self.exchange
+        let result = self
+            .exchange
             .create_limit_ioc_order(&ctx.signal.pair, reverse_side, amount_f, price_f)
             .await?;
+        validate_cex_unwind_fill(
+            &result.status,
+            result.amount_filled,
+            filled,
+            &result.id,
+            Decimal::new(999, 3),
+        )?;
+        tracing::warn!(
+            signal = %ctx.signal.signal_id,
+            pair = %ctx.signal.pair,
+            side = reverse_side,
+            requested = %filled,
+            filled = %result.amount_filled,
+            status = %result.status,
+            order_id = %result.id,
+            "CEX unwind filled"
+        );
         Ok(())
+    }
+
+    async fn get_usd_price(&self, asset: &str) -> Option<Decimal> {
+        let asset = asset.to_uppercase();
+        if asset == "USDT" || asset == "USDC" || asset == "DAI" || asset == "USD" {
+            return Some(Decimal::ONE);
+        }
+
+        // Try USDT pair first
+        let symbol = format!("{}USDT", asset);
+        if let Ok(price) = self.exchange.fetch_price(&symbol).await {
+            return Some(price);
+        }
+
+        // Fallback to USDC pair
+        let symbol = format!("{}USDC", asset);
+        if let Ok(price) = self.exchange.fetch_price(&symbol).await {
+            return Some(price);
+        }
+
+        None
     }
 }
 
@@ -964,11 +1145,12 @@ fn decimal_to_u256_scaled(value: Decimal, decimals: u8) -> Result<U256, String> 
 
 /// Inverse of [`decimal_to_u256_scaled`]. Lossy for values that exceed the
 /// Decimal 28-digit precision window.
-fn u256_to_decimal_scaled(value: U256, decimals: u8) -> Decimal {
+fn u256_to_decimal_scaled(value: U256, decimals: u8) -> Result<Decimal, String> {
     let s = value.to_string();
-    let raw = Decimal::from_str_exact(&s).unwrap_or(Decimal::ZERO);
+    let raw = Decimal::from_str_exact(&s)
+        .map_err(|e| format!("failed to convert U256 to Decimal (value too large?): {e}"))?;
     let scale = Decimal::from(10u64.pow(decimals as u32));
-    raw / scale
+    Ok(raw / scale)
 }
 
 fn cex_ioc_cross_price(side: &str, reference_price: Decimal) -> Decimal {
@@ -976,6 +1158,25 @@ fn cex_ioc_cross_price(side: &str, reference_price: Decimal) -> Decimal {
         "sell" => reference_price * Decimal::new(999, 3),
         _ => reference_price * Decimal::new(1001, 3),
     }
+}
+
+fn validate_cex_unwind_fill(
+    status: &str,
+    amount_filled: Decimal,
+    requested: Decimal,
+    order_id: &str,
+    min_fill_ratio: Decimal,
+) -> ExecutorResult<()> {
+    let status_upper = status.to_uppercase();
+    let required = requested * min_fill_ratio;
+    if matches!(status_upper.as_str(), "FILLED" | "PARTIALLY_FILLED") && amount_filled >= required {
+        return Ok(());
+    }
+    Err(crate::executor::errors::ExecutorError::InvalidSignal(
+        format!(
+            "CEX unwind did not close exposure: status={status}, filled={amount_filled}, required={required}, requested={requested}, order_id={order_id}"
+        ),
+    ))
 }
 
 /// Tunables for the executor.
@@ -1012,10 +1213,10 @@ pub struct ExecutorConfig {
 
 impl Default for ExecutorConfig {
     fn default() -> Self {
-        let min_fill = Decimal::new(8, 1); // 0.8
+        let min_fill = Decimal::from_f64_retain(DEFAULT_MIN_FILL_RATIO).unwrap();
         Self {
-            leg1_timeout: Duration::from_secs(10),
-            leg2_timeout: Duration::from_secs(60),
+            leg1_timeout: Duration::from_secs(DEFAULT_LEG1_TIMEOUT_SECS),
+            leg2_timeout: Duration::from_secs(DEFAULT_LEG2_TIMEOUT_SECS),
             min_fill_ratio: min_fill,
             partial_proceed_min_ratio: min_fill,
             partial_dust_ratio: min_fill,
@@ -1338,6 +1539,7 @@ impl Executor {
                                 );
                                 ctx.leg1_fill_price = Some(fill.price);
                                 ctx.leg1_fill_size = Some(fill.filled);
+                                Self::apply_leg_fill_metadata(&mut ctx, "leg1", &fill);
                                 ctx.state = ExecutorState::Unwinding;
                                 let unwind_status = self.log_unwind(&ctx).await;
                                 return ctx.fail(format!(
@@ -1386,6 +1588,7 @@ impl Executor {
             FillClass::Full => {
                 ctx.leg1_fill_price = Some(leg1.price);
                 ctx.leg1_fill_size = Some(leg1.filled);
+                Self::apply_leg_fill_metadata(&mut ctx, "leg1", &leg1);
                 ctx.state = ExecutorState::Leg1Filled;
             }
             FillClass::ProceedReduced => {
@@ -1398,6 +1601,7 @@ impl Executor {
                 );
                 ctx.leg1_fill_price = Some(leg1.price);
                 ctx.leg1_fill_size = Some(leg1.filled);
+                Self::apply_leg_fill_metadata(&mut ctx, "leg1", &leg1);
                 ctx.state = ExecutorState::Leg1Partial;
                 // Best-effort cancel of the unfilled remainder to free
                 // exchange margin; ignore the outcome — we're proceeding
@@ -1428,6 +1632,7 @@ impl Executor {
                 }
                 ctx.leg1_fill_price = Some(leg1.price);
                 ctx.leg1_fill_size = Some(leg1.filled);
+                Self::apply_leg_fill_metadata(&mut ctx, "leg1", &leg1);
                 ctx.state = ExecutorState::Unwinding;
                 let requested = ctx.signal.size;
                 let filled = leg1.filled;
@@ -1611,7 +1816,15 @@ impl Executor {
 
         match leg2.outcome {
             LegOutcome::Accepted => {
-                if !self.meets_min_fill(leg2.filled, ctx.leg1_fill_size.unwrap_or_default()) {
+                let Some(leg1_fill_size) = ctx.leg1_fill_size else {
+                    tracing::error!(
+                        signal = %ctx.signal.signal_id,
+                        leg2_filled = %leg2.filled,
+                        "leg2 accepted but leg1_fill_size is missing"
+                    );
+                    return ctx.fail("internal execution state missing leg1 fill size");
+                };
+                if !self.meets_min_fill(leg2.filled, leg1_fill_size) {
                     // Partial leg2 — unwind leg1 to flatten.
                     ctx.state = ExecutorState::Unwinding;
                     let unwind_status = self.log_unwind(&ctx).await;
@@ -1619,12 +1832,24 @@ impl Executor {
                 }
                 ctx.leg2_fill_price = Some(leg2.price);
                 ctx.leg2_fill_size = Some(leg2.filled);
-                let pnl = self.calc_pnl(&ctx);
-                let done = ctx.complete(pnl);
-                info!(
+                Self::apply_leg_fill_metadata(&mut ctx, "leg2", &leg2);
+                let (gross, fees, cex_fee, gas_fee, gas_used, gas_fee_wei) =
+                    self.calc_actual_pnl(&ctx).await;
+                let done =
+                    ctx.complete_with_actuals(gross, fees, cex_fee, gas_fee, gas_used, gas_fee_wei);
+                tracing::debug!(
                     signal = %done.signal.signal_id,
                     state = %done.state,
-                    pnl = %pnl,
+                    expected_gross_pnl_usd = %done.signal.expected_gross_pnl,
+                    expected_fees_usd = %done.signal.expected_fees,
+                    expected_net_pnl_usd = %done.signal.expected_net_pnl,
+                    actual_gross_pnl_usd = %gross,
+                    actual_fees_usd = %fees,
+                    actual_cex_fee_usd = %cex_fee,
+                    actual_onchain_gas_fee_usd = %gas_fee,
+                    onchain_gas_used = ?gas_used,
+                    onchain_gas_fee_wei = ?gas_fee_wei,
+                    actual_net_pnl_usd = %done.actual_net_pnl.unwrap_or(Decimal::ZERO),
                     "execution complete (cex-first)"
                 );
                 done
@@ -1696,6 +1921,7 @@ impl Executor {
 
         ctx.leg1_fill_price = Some(leg1.price);
         ctx.leg1_fill_size = Some(leg1.filled);
+        Self::apply_leg_fill_metadata(&mut ctx, "leg1", &leg1);
         ctx.state = ExecutorState::Leg1Filled;
 
         // --- Leg 2: CEX ---
@@ -1741,19 +1967,39 @@ impl Executor {
 
         match leg2.outcome {
             LegOutcome::Accepted => {
-                if !self.meets_min_fill(leg2.filled, ctx.leg1_fill_size.unwrap_or_default()) {
+                let Some(leg1_fill_size) = ctx.leg1_fill_size else {
+                    tracing::error!(
+                        signal = %ctx.signal.signal_id,
+                        leg2_filled = %leg2.filled,
+                        "leg2 accepted but leg1_fill_size is missing"
+                    );
+                    return ctx.fail("internal execution state missing leg1 fill size");
+                };
+                if !self.meets_min_fill(leg2.filled, leg1_fill_size) {
                     ctx.state = ExecutorState::Unwinding;
                     let unwind_status = self.log_unwind(&ctx).await;
                     return ctx.fail(format!("CEX partial below threshold - {unwind_status}"));
                 }
                 ctx.leg2_fill_price = Some(leg2.price);
                 ctx.leg2_fill_size = Some(leg2.filled);
-                let pnl = self.calc_pnl(&ctx);
-                let done = ctx.complete(pnl);
-                info!(
+                Self::apply_leg_fill_metadata(&mut ctx, "leg2", &leg2);
+                let (gross, fees, cex_fee, gas_fee, gas_used, gas_fee_wei) =
+                    self.calc_actual_pnl(&ctx).await;
+                let done =
+                    ctx.complete_with_actuals(gross, fees, cex_fee, gas_fee, gas_used, gas_fee_wei);
+                tracing::debug!(
                     signal = %done.signal.signal_id,
                     state = %done.state,
-                    pnl = %pnl,
+                    expected_gross_pnl_usd = %done.signal.expected_gross_pnl,
+                    expected_fees_usd = %done.signal.expected_fees,
+                    expected_net_pnl_usd = %done.signal.expected_net_pnl,
+                    actual_gross_pnl_usd = %gross,
+                    actual_fees_usd = %fees,
+                    actual_cex_fee_usd = %cex_fee,
+                    actual_onchain_gas_fee_usd = %gas_fee,
+                    onchain_gas_used = ?gas_used,
+                    onchain_gas_fee_wei = ?gas_fee_wei,
+                    actual_net_pnl_usd = %done.actual_net_pnl.unwrap_or(Decimal::ZERO),
                     "execution complete (dex-first)"
                 );
                 done
@@ -1818,13 +2064,60 @@ impl Executor {
         }
     }
 
-    fn calc_pnl(&self, ctx: &ExecutionContext) -> Decimal {
+    fn apply_leg_fill_metadata(ctx: &mut ExecutionContext, leg: &'static str, fill: &LegFill) {
+        match leg {
+            "leg1" => {
+                ctx.leg1_fee = fill.fee;
+                ctx.leg1_fee_asset = fill.fee_asset.clone();
+            }
+            "leg2" => {
+                ctx.leg2_fee = fill.fee;
+                ctx.leg2_fee_asset = fill.fee_asset.clone();
+            }
+            other => {
+                warn!(
+                    signal = %ctx.signal.signal_id,
+                    leg = other,
+                    "unknown leg label while applying fill metadata"
+                );
+            }
+        }
+        if fill.onchain_gas_used.is_some() || fill.onchain_gas_fee_wei.is_some() {
+            ctx.onchain_gas_used = fill.onchain_gas_used;
+            ctx.onchain_gas_fee_wei = fill.onchain_gas_fee_wei;
+        }
+    }
+
+    #[cfg(test)]
+    async fn calc_pnl(&self, ctx: &ExecutionContext) -> Decimal {
+        let (gross, fees, _, _, _, _) = self.calc_actual_pnl(ctx).await;
+        gross - fees
+    }
+
+    async fn calc_actual_pnl(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> (
+        Decimal,
+        Decimal,
+        Decimal,
+        Decimal,
+        Option<U256>,
+        Option<U256>,
+    ) {
         let (leg1_price, leg1_size, leg2_price) =
             match (ctx.leg1_fill_price, ctx.leg1_fill_size, ctx.leg2_fill_price) {
                 (Some(p1), Some(s1), Some(p2)) => (p1, s1, p2),
                 _ => {
                     warn!("calc_pnl called with missing leg data");
-                    return Decimal::ZERO;
+                    return (
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        None,
+                        None,
+                    );
                 }
             };
         // Map leg1/leg2 prices back to cex/dex, since leg order depends on
@@ -1835,14 +2128,91 @@ impl Executor {
         } else {
             (leg2_price, leg1_price)
         };
-        let gross = match ctx.signal.direction {
+        let gross_quote = match ctx.signal.direction {
             Direction::BuyCexSellDex => (dex_price - cex_price) * leg1_size,
             Direction::BuyDexSellCex => (cex_price - dex_price) * leg1_size,
         };
-        let trade_value = leg1_size * cex_price;
+        let expected_quote_value = ctx.signal.size * ctx.signal.cex_price;
+        let quote_usd_price = if expected_quote_value > Decimal::ZERO {
+            ctx.signal.notional_usd / expected_quote_value
+        } else {
+            warn!(
+                signal = %ctx.signal.signal_id,
+                pair = %ctx.signal.pair,
+                size = %ctx.signal.size,
+                cex_price = %ctx.signal.cex_price,
+                notional_usd = %ctx.signal.notional_usd,
+                "calc_pnl could not derive quote_usd_price from signal; falling back to 1.0"
+            );
+            Decimal::ONE
+        };
+        let gross = gross_quote * quote_usd_price;
+        let trade_value = leg1_size * cex_price * quote_usd_price;
         let bps = Decimal::from(BPS_SCALE);
-        let fees = self.fees.total_fee_bps(trade_value) / bps * trade_value;
-        gross - fees
+        let configured_cex_fee = self.fees.cex_taker_bps / bps * trade_value;
+        let actual_cex_fee = if ctx.leg1_venue == "cex" && ctx.leg1_fee > Decimal::ZERO {
+            let asset = ctx.leg1_fee_asset.as_deref().unwrap_or("USDT");
+            let price = self
+                .legs
+                .get_usd_price(asset)
+                .await
+                .unwrap_or(quote_usd_price);
+            ctx.leg1_fee * price
+        } else if ctx.leg2_venue == "cex" && ctx.leg2_fee > Decimal::ZERO {
+            let asset = ctx.leg2_fee_asset.as_deref().unwrap_or("USDT");
+            let price = self
+                .legs
+                .get_usd_price(asset)
+                .await
+                .unwrap_or(quote_usd_price);
+            ctx.leg2_fee * price
+        } else {
+            warn!(
+                signal = %ctx.signal.signal_id,
+                pair = %ctx.signal.pair,
+                "actual CEX fee unavailable; using configured taker fee estimate"
+            );
+            configured_cex_fee
+        };
+        let (gas_used, gas_fee_wei) = (ctx.onchain_gas_used, ctx.onchain_gas_fee_wei);
+        let gas_fee_usd = if let Some(fee_wei) = gas_fee_wei {
+            let fee_dec = u256_to_decimal_scaled(fee_wei, 18).unwrap_or(Decimal::ZERO);
+            let eth_price = self
+                .legs
+                .get_usd_price("ETH")
+                .await
+                .unwrap_or(quote_usd_price);
+            fee_dec * eth_price
+        } else {
+            warn!(
+                signal = %ctx.signal.signal_id,
+                pair = %ctx.signal.pair,
+                "actual on-chain gas fee unavailable; using signal expected gas component"
+            );
+            let configured_dex_fee = self.fees.dex_swap_bps / bps * trade_value;
+            let configured_non_cex_fee = configured_dex_fee + self.fees.gas_cost_usd;
+            let signal_cex_fee = self.fees.cex_taker_bps / bps * ctx.signal.notional_usd;
+            let signal_non_cex_fee = (ctx.signal.expected_fees - signal_cex_fee).max(Decimal::ZERO);
+            let quote_asset = split_pair_symbols(&ctx.signal.pair)
+                .map(|(_, quote)| quote)
+                .unwrap_or_default();
+            if !matches!(quote_asset, "USD" | "USDC" | "USDC.E" | "USDT")
+                && signal_non_cex_fee > Decimal::ZERO
+            {
+                signal_non_cex_fee
+            } else {
+                configured_non_cex_fee
+            }
+        };
+        let fees = actual_cex_fee + gas_fee_usd;
+        (
+            gross,
+            fees,
+            actual_cex_fee,
+            gas_fee_usd,
+            gas_used,
+            gas_fee_wei,
+        )
     }
 }
 
@@ -1859,6 +2229,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(100),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(5),
             expected_net_pnl: Decimal::from(15),
@@ -1917,6 +2288,41 @@ mod tests {
         let ctx = ex.execute(mk_signal(Decimal::from(80))).await;
         assert_eq!(ctx.state, ExecutorState::Done);
         assert!(ctx.actual_net_pnl.unwrap() < Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn calc_pnl_converts_eth_quoted_pair_to_usd_and_uses_signal_gas() {
+        let legs = Arc::new(SimulatedLegs::default());
+        let ex = Executor::new(legs, cex_first()).with_fees(FeeStructure {
+            cex_taker_bps: Decimal::from(10),
+            dex_swap_bps: Decimal::ZERO,
+            gas_cost_usd: Decimal::new(5, 1),
+        });
+        let signal = Signal::new(SignalParams {
+            pair: "LINK/ETH".into(),
+            direction: Direction::BuyDexSellCex,
+            cex_price: Decimal::new(430, 5),
+            dex_price: Decimal::new(4281, 6),
+            spread_bps: Decimal::from(44),
+            size: Decimal::ONE,
+            notional_usd: Decimal::from(10),
+            expected_gross_pnl: Decimal::new(44186, 6),
+            expected_fees: Decimal::new(1271, 5),
+            expected_net_pnl: Decimal::new(31476, 6),
+            ttl: chrono::Duration::seconds(5),
+            inventory_ok: true,
+            within_limits: true,
+        });
+        let mut ctx = ExecutionContext::new(signal);
+        ctx.leg1_venue = "cex";
+        ctx.leg1_fill_price = Some(Decimal::new(430, 5));
+        ctx.leg1_fill_size = Some(Decimal::ONE);
+        ctx.leg2_fill_price = Some(Decimal::new(4281, 6));
+
+        let pnl = ex.calc_pnl(&ctx).await;
+
+        assert!(pnl > Decimal::new(3, 2), "pnl={pnl}");
+        assert!(pnl < Decimal::new(32, 3), "pnl={pnl}");
     }
 
     #[tokio::test]
@@ -2036,6 +2442,10 @@ mod tests {
             async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
                 Ok(())
             }
+
+            async fn get_usd_price(&self, _asset: &str) -> Option<Decimal> {
+                Some(Decimal::ONE)
+            }
         }
         let legs = MinimalLegs;
         let outcome = legs.cancel_cex("anything").await.unwrap();
@@ -2096,6 +2506,44 @@ mod tests {
             ex.classify_fill(Decimal::new(5, 2), Decimal::ONE),
             FillClass::Dust
         );
+    }
+
+    #[test]
+    fn cex_unwind_fill_validation_rejects_unfilled_ioc() {
+        let err = validate_cex_unwind_fill(
+            "EXPIRED",
+            Decimal::ZERO,
+            Decimal::ONE,
+            "unwind-1",
+            Decimal::new(95, 2),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("did not close exposure"));
+    }
+
+    #[test]
+    fn cex_unwind_fill_validation_rejects_underfilled_ioc() {
+        let err = validate_cex_unwind_fill(
+            "PARTIALLY_FILLED",
+            Decimal::new(5, 1),
+            Decimal::ONE,
+            "unwind-2",
+            Decimal::new(95, 2),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("required=0.95"));
+    }
+
+    #[test]
+    fn cex_unwind_fill_validation_accepts_sufficient_fill() {
+        validate_cex_unwind_fill(
+            "PARTIALLY_FILLED",
+            Decimal::new(96, 2),
+            Decimal::ONE,
+            "unwind-3",
+            Decimal::new(95, 2),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2197,13 +2645,13 @@ mod tests {
         #[async_trait::async_trait]
         impl LegExecutor for TwoPhaseTimeoutLegs {
             async fn execute_cex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
-                Ok(LegFill {
-                    outcome: LegOutcome::Accepted,
-                    price: signal.cex_price,
-                    filled: size,
-                    handle: Some("cex-order-1".into()),
-                    error: None,
-                })
+                Ok(LegFill::new(
+                    LegOutcome::Accepted,
+                    signal.cex_price,
+                    size,
+                    Some("cex-order-1".into()),
+                    None,
+                ))
             }
 
             async fn execute_dex(
@@ -2227,6 +2675,10 @@ mod tests {
 
             async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
                 Ok(())
+            }
+
+            async fn get_usd_price(&self, _asset: &str) -> Option<Decimal> {
+                Some(Decimal::ONE)
             }
         }
 
@@ -2263,13 +2715,13 @@ mod tests {
         #[async_trait::async_trait]
         impl LegExecutor for CancelledDexTimeoutLegs {
             async fn execute_cex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
-                Ok(LegFill {
-                    outcome: LegOutcome::Accepted,
-                    price: signal.cex_price,
-                    filled: size,
-                    handle: Some("cex-order-1".into()),
-                    error: None,
-                })
+                Ok(LegFill::new(
+                    LegOutcome::Accepted,
+                    signal.cex_price,
+                    size,
+                    Some("cex-order-1".into()),
+                    None,
+                ))
             }
 
             async fn execute_dex(
@@ -2305,6 +2757,10 @@ mod tests {
                 *self.unwinds.lock().await += 1;
                 Ok(())
             }
+
+            async fn get_usd_price(&self, _asset: &str) -> Option<Decimal> {
+                Some(Decimal::ONE)
+            }
         }
 
         let unwinds = Arc::new(Mutex::new(0));
@@ -2337,13 +2793,13 @@ mod tests {
     #[async_trait::async_trait]
     impl LegExecutor for TimeoutCancelBranchLegs {
         async fn execute_cex(&self, signal: &Signal, size: Decimal) -> ExecutorResult<LegFill> {
-            Ok(LegFill {
-                outcome: LegOutcome::Accepted,
-                price: signal.cex_price,
-                filled: size,
-                handle: Some("cex-order-1".into()),
-                error: None,
-            })
+            Ok(LegFill::new(
+                LegOutcome::Accepted,
+                signal.cex_price,
+                size,
+                Some("cex-order-1".into()),
+                None,
+            ))
         }
 
         async fn execute_dex(&self, _signal: &Signal, _size: Decimal) -> ExecutorResult<LegFill> {
@@ -2372,6 +2828,10 @@ mod tests {
         async fn unwind(&self, _ctx: &ExecutionContext) -> ExecutorResult<()> {
             *self.unwinds.lock().await += 1;
             Ok(())
+        }
+
+        async fn get_usd_price(&self, _asset: &str) -> Option<Decimal> {
+            Some(Decimal::ONE)
         }
     }
 
@@ -2650,7 +3110,7 @@ mod tests {
         let d = Decimal::from_str_exact("1.5").unwrap();
         let u = decimal_to_u256_scaled(d, 6).unwrap();
         assert_eq!(u, U256::from(1_500_000u64));
-        let back = u256_to_decimal_scaled(u, 6);
+        let back = u256_to_decimal_scaled(u, 6).unwrap();
         assert_eq!(back, d);
     }
 
@@ -2700,6 +3160,7 @@ mod tests {
                 recipient: recipient.clone(),
                 private_bundle: None,
                 pool_kind: dex_swapper::DexPoolKind::V2,
+                pre_swap_fees: dex_swapper::OnchainFeeSummary::default(),
             })
         }
 
@@ -2726,6 +3187,8 @@ mod tests {
                         amount_in: submission.amount_in,
                         amount_out,
                         gas_used: U256::from(150_000u64),
+                        total_gas_used: U256::from(150_000u64),
+                        total_gas_fee_wei: U256::zero(),
                         success: true,
                     })
                 }
@@ -2744,6 +3207,7 @@ mod tests {
             dex_price: Decimal::from_str_exact(dex_price).unwrap(),
             spread_bps: Decimal::from(100),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(5),
             expected_net_pnl: Decimal::from(15),

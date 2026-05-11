@@ -16,6 +16,8 @@ use tracing::{debug, info, instrument, warn};
 /// Minimum interval between polling for transaction receipts.
 pub const MIN_POLL_INTERVAL: f64 = 0.1;
 
+const RPC_RETRY_BASE_BACKOFF_MS: u64 = 100;
+
 /// A high-level client for interacting with the Ethereum blockchain.
 ///
 /// Supports multiple RPC endpoints with automatic failover and retries.
@@ -314,20 +316,37 @@ impl ChainClient {
                         retry,
                         "Retrying RPC operation"
                     );
-                    tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(retry as u32 - 1)))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(
+                        RPC_RETRY_BASE_BACKOFF_MS * 2u64.pow(retry as u32 - 1),
+                    ))
+                    .await;
                 }
                 let result = operation(Arc::clone(provider)).await;
                 match result {
                     Ok(value) => return Ok(value),
                     Err(error) => {
-                        warn!(
-                            url_idx,
-                            url = %self.rpc_urls.get(url_idx).map(String::as_str).unwrap_or("<unknown>"),
-                            retry,
-                            error = %error,
-                            "RPC operation failed"
-                        );
+                        let url = self
+                            .rpc_urls
+                            .get(url_idx)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        if retry == self.max_retries {
+                            warn!(
+                                url_idx,
+                                url = %url,
+                                attempts = self.max_retries + 1,
+                                error = %error,
+                                "RPC operation failed after retries"
+                            );
+                        } else {
+                            debug!(
+                                url_idx,
+                                url = %url,
+                                retry,
+                                error = %error,
+                                "RPC operation failed; retrying"
+                            );
+                        }
                         last_error = Some(error);
                     }
                 }

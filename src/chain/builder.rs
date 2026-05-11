@@ -109,9 +109,12 @@ impl TransactionBuilder {
     /// [`DEFAULT_GAS_BUFFER_BPS`] is applied (12_000 bps = 1.2×).
     pub async fn with_gas_estimate(mut self, buffer_bps: Option<u64>) -> ChainResult<Self> {
         let request = self.build_partial_request(self.nonce)?;
-        let wallet_address = Address::new(self.wallet.address())
-            .map_err(|_| ChainError::InvalidWalletAddress)?;
-        let estimated = self.client.estimate_gas_from(&request, &wallet_address).await?;
+        let wallet_address =
+            Address::new(self.wallet.address()).map_err(|_| ChainError::InvalidWalletAddress)?;
+        let estimated = self
+            .client
+            .estimate_gas_from(&request, &wallet_address)
+            .await?;
         let multiplier_bps = buffer_bps
             .filter(|&b| b >= MIN_GAS_ESTIMATE_BUFFER_BPS)
             .unwrap_or(DEFAULT_GAS_BUFFER_BPS);

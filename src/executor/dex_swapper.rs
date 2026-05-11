@@ -40,7 +40,8 @@ use crate::chain::selectors::TRANSFER_TOPIC;
 use crate::chain::{BundleRelay, BundleRequest, BundleTx, FlashbotsConfig};
 use crate::chain::{NonceManager, SignedTransaction, TransactionBuilder};
 use crate::core::types::{
-    Address, BlockId, GasPriority, MIN_GAS_LIMIT, TokenAmount, TransactionRequest, WEI_PER_GWEI,
+    Address, BlockId, DEFAULT_RECEIPT_POLL_INTERVAL_SECS, GasPriority, MIN_GAS_LIMIT, TokenAmount,
+    TransactionRequest, WEI_PER_GWEI,
 };
 use crate::core::wallet::WalletManager;
 use crate::observability::metrics_handle;
@@ -75,7 +76,7 @@ const KNOWN_WETH_ADDRESSES: &[&str] = &[
 ];
 
 /// Total basis points (100%).
-const BPS_FULL: u64 = 10_000;
+const BPS_FULL: u64 = crate::core::types::BPS_SCALE;
 
 // ---------------------------------------------------------------------------
 // Config + address book
@@ -107,11 +108,11 @@ impl Default for DexSwapperConfig {
             // Uniswap V2 Router02 on Ethereum mainnet.
             router: Address::new("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
                 .expect("hard-coded mainnet router must parse"),
-            slippage_bps: 50, // 0.50%
-            deadline_secs: 60,
-            gas_buffer_bps: 12_000, // 1.20×
-            receipt_timeout_secs: 120,
-            chain_id: 1,
+            slippage_bps: crate::core::types::DEFAULT_DEX_SLIPPAGE_BPS,
+            deadline_secs: crate::core::types::DEFAULT_DEX_DEADLINE_SECS,
+            gas_buffer_bps: crate::core::types::DEFAULT_GAS_BUFFER_BPS,
+            receipt_timeout_secs: crate::core::types::DEFAULT_RECEIPT_TIMEOUT_SECS,
+            chain_id: crate::core::types::MAINNET_CHAIN_ID,
             max_gas_gwei: None,
         }
     }
@@ -180,8 +181,25 @@ pub struct SwapResult {
     pub amount_out: U256,
     /// Gas used by the swap itself (does not include any approve tx).
     pub gas_used: U256,
+    pub total_gas_used: U256,
+    pub total_gas_fee_wei: U256,
     /// Whether the receipt reported `status == 1`.
     pub success: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OnchainFeeSummary {
+    pub gas_used: U256,
+    pub fee_wei: U256,
+    pub tx_hashes: Vec<String>,
+}
+
+impl OnchainFeeSummary {
+    fn add_receipt(&mut self, receipt: &crate::core::types::TransactionReceipt) {
+        self.gas_used += receipt.gas_used;
+        self.fee_wei += receipt.gas_used * receipt.effective_gas_price;
+        self.tx_hashes.push(receipt.tx_hash.clone());
+    }
 }
 
 /// Result of broadcasting a swap transaction before receipt confirmation.
@@ -200,6 +218,7 @@ pub struct SwapSubmission {
     pub recipient: Address,
     pub private_bundle: Option<PrivateSwapBundle>,
     pub pool_kind: DexPoolKind,
+    pub pre_swap_fees: OnchainFeeSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -330,7 +349,11 @@ async fn cancel_pending_public_swap(
         }
     };
     match client
-        .wait_for_receipt(&cancel_tx_hash, config.receipt_timeout_secs, 1.0)
+        .wait_for_receipt(
+            &cancel_tx_hash,
+            config.receipt_timeout_secs,
+            DEFAULT_RECEIPT_POLL_INTERVAL_SECS,
+        )
         .await
     {
         Ok(receipt) if receipt.status => Ok(PendingSwapCancelOutcome::Cancelled { cancel_tx_hash }),
@@ -1172,21 +1195,13 @@ impl UniswapV3Swapper {
     /// Returns `true` if `token` is a known WETH contract.
     fn is_weth(token: &Address) -> bool {
         let lower = token.lower();
-        KNOWN_WETH_ADDRESSES
-            .iter()
-            .any(|addr| lower == *addr)
+        KNOWN_WETH_ADDRESSES.iter().any(|addr| lower == *addr)
     }
 
     /// Fetches the ERC-20 balance of `token` held by `owner`.
-    async fn erc20_balance(
-        &self,
-        token: &Address,
-        owner: &Address,
-    ) -> SwapperResult<U256> {
+    async fn erc20_balance(&self, token: &Address, owner: &Address) -> SwapperResult<U256> {
         let mut calldata = ERC20_BALANCE_OF_SELECTOR.to_vec();
-        calldata.extend_from_slice(&abi_encode(&[
-            AbiToken::Address(owner.as_eth_address()),
-        ]));
+        calldata.extend_from_slice(&abi_encode(&[AbiToken::Address(owner.as_eth_address())]));
         let req = TransactionRequest {
             to: token.clone(),
             value: TokenAmount::eth(0),
@@ -1207,11 +1222,7 @@ impl UniswapV3Swapper {
 
     /// If `token_in` is WETH and the wallet doesn't hold enough, wraps
     /// native ETH by calling `WETH.deposit{value: shortfall}()`.
-    async fn ensure_weth_balance(
-        &self,
-        token_in: &Address,
-        needed: U256,
-    ) -> SwapperResult<bool> {
+    async fn ensure_weth_balance(&self, token_in: &Address, needed: U256) -> SwapperResult<bool> {
         if !Self::is_weth(token_in) {
             return Ok(false);
         }
@@ -1547,6 +1558,7 @@ impl FlashbotsSwapper {
                 target_block: submitted.target_block,
             }),
             pool_kind: tokens.map(|t| t.pool_kind).unwrap_or(DexPoolKind::V2),
+            pre_swap_fees: OnchainFeeSummary::default(),
         })
     }
 }
@@ -1663,11 +1675,15 @@ impl DexSwapper for FlashbotsSwapper {
             return Err(SwapperError::Reverted(receipt.tx_hash));
         }
 
+        let mut total_fees = submission.pre_swap_fees.clone();
+        total_fees.add_receipt(&receipt);
         Ok(SwapResult {
             tx_hash: receipt.tx_hash,
             amount_in: submission.amount_in,
             amount_out,
             gas_used: receipt.gas_used,
+            total_gas_used: total_fees.gas_used,
+            total_gas_fee_wei: total_fees.fee_wei,
             success: true,
         })
     }
@@ -1795,8 +1811,7 @@ impl DexSwapper for UniswapV3Swapper {
         if min_out.is_zero() {
             return Err(SwapperError::InvalidMinOut("min_out is zero".into()));
         }
-        self.ensure_weth_balance(token_in, amount_in)
-            .await?;
+        self.ensure_weth_balance(token_in, amount_in).await?;
         self.ensure_allowance(token_in, &self.config.router, amount_in)
             .await?;
         let deadline = U256::from(current_unix_ts().saturating_add(self.config.deadline_secs));
@@ -1840,6 +1855,7 @@ impl DexSwapper for UniswapV3Swapper {
             recipient: recipient.clone(),
             private_bundle: None,
             pool_kind: DexPoolKind::V3,
+            pre_swap_fees: OnchainFeeSummary::default(),
         })
     }
 
@@ -1900,11 +1916,15 @@ impl DexSwapper for UniswapV3Swapper {
             );
             return Err(SwapperError::Reverted(receipt.tx_hash));
         }
+        let mut total_fees = submission.pre_swap_fees.clone();
+        total_fees.add_receipt(&receipt);
         Ok(SwapResult {
             tx_hash: receipt.tx_hash,
             amount_in: submission.amount_in,
             amount_out,
             gas_used: receipt.gas_used,
+            total_gas_used: total_fees.gas_used,
+            total_gas_fee_wei: total_fees.fee_wei,
             success: true,
         })
     }
@@ -1991,6 +2011,7 @@ impl DexSwapper for UniswapV2Swapper {
             recipient: recipient.clone(),
             private_bundle: None,
             pool_kind: DexPoolKind::V2,
+            pre_swap_fees: OnchainFeeSummary::default(),
         })
     }
 
@@ -2050,11 +2071,15 @@ impl DexSwapper for UniswapV2Swapper {
             return Err(SwapperError::Reverted(receipt.tx_hash));
         }
 
+        let mut total_fees = submission.pre_swap_fees.clone();
+        total_fees.add_receipt(&receipt);
         Ok(SwapResult {
             tx_hash: receipt.tx_hash,
             amount_in: submission.amount_in,
             amount_out,
             gas_used: receipt.gas_used,
+            total_gas_used: total_fees.gas_used,
+            total_gas_fee_wei: total_fees.fee_wei,
             success: true,
         })
     }
