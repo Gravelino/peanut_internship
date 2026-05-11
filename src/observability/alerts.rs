@@ -51,6 +51,40 @@ pub enum AlertEvent {
     },
     /// Circuit breaker flipped from open to closed (cooldown elapsed).
     BreakerClosed,
+    RiskPaused {
+        reason: String,
+    },
+    RiskResumed {
+        reason: String,
+    },
+    TradeExecuted {
+        signal_id: String,
+        pair: String,
+        direction: String,
+        expected_net_pnl: String,
+        actual_net_pnl: String,
+        actual_gross_pnl: String,
+        actual_fees: String,
+        actual_cex_fee: String,
+        actual_gas_fee: String,
+        gas_used: Option<String>,
+    },
+    RebalanceTriggered {
+        assets: usize,
+        steps: usize,
+        dry_run: bool,
+        quote_asset: String,
+    },
+    RebalanceStepCompleted {
+        asset: String,
+        step: String,
+        reference: String,
+    },
+    RebalanceStepFailed {
+        asset: String,
+        step: String,
+        reason: String,
+    },
     /// A DEX leg-2 timeout occurred and was enqueued (or skipped) for
     /// reconciliation.
     Leg2Timeout {
@@ -125,6 +159,47 @@ impl AlertEvent {
             Self::BreakerClosed => {
                 "✅ Circuit breaker CLOSED — trades resumed, breaker recovered".into()
             }
+            Self::RiskPaused { reason } => {
+                format!("⏸ Risk pause ACTIVE — trades blocked: {reason}")
+            }
+            Self::RiskResumed { reason } => {
+                format!("▶️ Risk pause CLEARED — trades resumed: {reason}")
+            }
+            Self::TradeExecuted {
+                signal_id,
+                pair,
+                direction,
+                expected_net_pnl,
+                actual_net_pnl,
+                actual_gross_pnl,
+                actual_fees,
+                actual_cex_fee,
+                actual_gas_fee,
+                gas_used,
+            } => {
+                let gas_used = gas_used.as_deref().unwrap_or("n/a");
+                format!(
+                    "✅ TRADE EXECUTED {pair} {signal_id} direction={direction} expected_net={expected_net_pnl} actual_net={actual_net_pnl} gross={actual_gross_pnl} fees={actual_fees} cex_fee={actual_cex_fee} gas_fee={actual_gas_fee} gas_used={gas_used}"
+                )
+            }
+            Self::RebalanceTriggered {
+                assets,
+                steps,
+                dry_run,
+                quote_asset,
+            } => format!(
+                "⚖️ REBALANCE TRIGGERED assets={assets} steps={steps} quote={quote_asset} dry_run={dry_run}"
+            ),
+            Self::RebalanceStepCompleted {
+                asset,
+                step,
+                reference,
+            } => format!("✅ REBALANCE STEP DONE asset={asset} step={step} ref={reference}"),
+            Self::RebalanceStepFailed {
+                asset,
+                step,
+                reason,
+            } => format!("❌ REBALANCE STEP FAILED asset={asset} step={step}: {reason}"),
             Self::Leg2Timeout {
                 signal_id,
                 tx_hash,
@@ -442,6 +517,7 @@ mod tests {
             dex_price: Decimal::from(2010),
             spread_bps: Decimal::from(50),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(10),
             expected_fees: Decimal::from(5),
             expected_net_pnl: Decimal::from(5),
@@ -467,13 +543,23 @@ mod tests {
             leg1_handle: None,
             leg1_fill_price: None,
             leg1_fill_size: None,
+            leg1_fee: Decimal::ZERO,
+            leg1_fee_asset: None,
             leg2_venue: "",
             leg2_handle: None,
             leg2_fill_price: None,
             leg2_fill_size: None,
+            leg2_fee: Decimal::ZERO,
+            leg2_fee_asset: None,
             started_at: std::time::Instant::now(),
             finished_at: None,
             actual_net_pnl: pnl,
+            actual_gross_pnl_usd: pnl,
+            actual_fees_usd: None,
+            actual_cex_fee_usd: None,
+            actual_onchain_gas_fee_usd: None,
+            onchain_gas_used: None,
+            onchain_gas_fee_wei: None,
             error: None,
         };
         ctx.state = state;
@@ -566,6 +652,49 @@ mod tests {
         let body = WebhookSink::encode_payload(AlertProvider::Generic, "", &event).unwrap();
         assert_eq!(body["kind"], "breaker_opened");
         assert_eq!(body["failures"], 5);
+    }
+
+    #[test]
+    fn trade_executed_summary_and_payload_include_pnl_breakdown() {
+        let event = AlertEvent::TradeExecuted {
+            signal_id: "sig-1".into(),
+            pair: "LINK/ETH".into(),
+            direction: "buy_dex_sell_cex".into(),
+            expected_net_pnl: "$0.020000".into(),
+            actual_net_pnl: "$0.010000".into(),
+            actual_gross_pnl: "$0.030000".into(),
+            actual_fees: "$0.020000".into(),
+            actual_cex_fee: "$0.001000".into(),
+            actual_gas_fee: "$0.019000".into(),
+            gas_used: Some("12345".into()),
+        };
+        let summary = event.summary();
+        assert!(summary.contains("TRADE EXECUTED"));
+        assert!(summary.contains("LINK/ETH"));
+        assert!(summary.contains("actual_net=$0.010000"));
+        assert!(summary.contains("gas_used=12345"));
+
+        let body = WebhookSink::encode_payload(AlertProvider::Generic, "", &event).unwrap();
+        assert_eq!(body["kind"], "trade_executed");
+        assert_eq!(body["actual_net_pnl"], "$0.010000");
+    }
+
+    #[test]
+    fn rebalance_triggered_summary_and_payload_include_plan_size() {
+        let event = AlertEvent::RebalanceTriggered {
+            assets: 2,
+            steps: 3,
+            dry_run: false,
+            quote_asset: "ETH".into(),
+        };
+        let summary = event.summary();
+        assert!(summary.contains("REBALANCE TRIGGERED"));
+        assert!(summary.contains("assets=2"));
+        assert!(summary.contains("quote=ETH"));
+
+        let body = WebhookSink::encode_payload(AlertProvider::Generic, "", &event).unwrap();
+        assert_eq!(body["kind"], "rebalance_triggered");
+        assert_eq!(body["steps"], 3);
     }
 
     #[test]

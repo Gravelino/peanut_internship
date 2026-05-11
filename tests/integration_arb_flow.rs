@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use rust_decimal::Decimal;
 
-use peanut_internship_rust::core::types::Address;
+use peanut_internship_rust::core::types::{Address, MAINNET_CHAIN_ID};
 use peanut_internship_rust::exchange::orderbook::OrderBookAnalyzer;
 use peanut_internship_rust::exchange::types::{NormalizedBalance, OrderBookSnapshot};
 use peanut_internship_rust::integration::{CrossDexOpportunity, ForkSimInfo};
@@ -44,7 +44,7 @@ fn make_orderbook() -> OrderBookSnapshot {
 }
 
 fn make_tracker() -> InventoryTracker {
-    let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+    let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
     let mut binance_bals = HashMap::new();
     binance_bals.insert(
@@ -184,6 +184,9 @@ fn test_full_pnl_pipeline() {
         let amount = Decimal::from(2);
         let buy_fee = amount * buy_price * Decimal::from_str_exact("0.001").unwrap();
         let sell_fee = amount * sell_price * Decimal::from_str_exact("0.001").unwrap();
+        let gas_cost = Decimal::from(5);
+        let gross_pnl = sell_price * amount - buy_price * amount;
+        let total_fees = buy_fee + sell_fee + gas_cost;
 
         let trade = ArbRecord {
             id,
@@ -210,7 +213,17 @@ fn test_full_pnl_pipeline() {
                 fee: sell_fee,
                 fee_asset: "USDT".into(),
             },
-            gas_cost_usd: Decimal::from(5),
+            gas_cost_usd: gas_cost,
+            expected_gross_pnl_usd: gross_pnl,
+            expected_fees_usd: total_fees,
+            expected_net_pnl_usd: gross_pnl - total_fees,
+            actual_gross_pnl_usd: gross_pnl,
+            actual_fees_usd: total_fees,
+            actual_cex_fee_usd: buy_fee + sell_fee,
+            actual_onchain_gas_fee_usd: gas_cost,
+            actual_net_pnl_usd: gross_pnl - total_fees,
+            onchain_gas_used: None,
+            onchain_gas_fee_wei: None,
         };
         engine.record(trade);
     }
@@ -249,6 +262,8 @@ fn test_rebalance_integration() {
 
 #[test]
 fn test_arb_record_properties() {
+    let gross_pnl = Decimal::from(2) * Decimal::from(2020) - Decimal::from(2) * Decimal::from(2000);
+    let total_fees = Decimal::from(4) + Decimal::from(4) + Decimal::from(5);
     let arb = ArbRecord {
         id: "test".into(),
         timestamp: Utc::now(),
@@ -275,6 +290,16 @@ fn test_arb_record_properties() {
             fee_asset: "USDT".into(),
         },
         gas_cost_usd: Decimal::from(5),
+        expected_gross_pnl_usd: gross_pnl,
+        expected_fees_usd: total_fees,
+        expected_net_pnl_usd: gross_pnl - total_fees,
+        actual_gross_pnl_usd: gross_pnl,
+        actual_fees_usd: total_fees,
+        actual_cex_fee_usd: Decimal::from(8),
+        actual_onchain_gas_fee_usd: Decimal::from(5),
+        actual_net_pnl_usd: gross_pnl - total_fees,
+        onchain_gas_used: None,
+        onchain_gas_fee_wei: None,
     };
 
     let gross = arb.gross_pnl();

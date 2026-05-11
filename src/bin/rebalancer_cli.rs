@@ -4,6 +4,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use rust_decimal::Decimal;
 
+use peanut_internship_rust::core::types::MAINNET_CHAIN_ID;
 use peanut_internship_rust::exchange::{BinanceConfig, BybitConfig, ExchangeClient};
 use peanut_internship_rust::inventory::pnl::PnLEngine;
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
@@ -379,7 +380,7 @@ async fn build_tracker(
         venues.push(Venue::Bybit);
     }
     venues.push(Venue::Wallet);
-    let mut tracker = InventoryTracker::new(venues);
+    let mut tracker = InventoryTracker::new(venues, MAINNET_CHAIN_ID);
 
     let config = BinanceConfig::from_env()?;
     let client = ExchangeClient::new(config)?;

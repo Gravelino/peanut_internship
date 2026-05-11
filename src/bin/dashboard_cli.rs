@@ -16,21 +16,25 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use clap::Parser;
+use peanut_internship_rust::core::types::{
+    DEFAULT_ORDERBOOK_DISPLAY_LEVELS, DEFAULT_TUI_BALANCE_REFRESH_SECS, DEFAULT_TUI_REFRESH_MS,
+    MAINNET_CHAIN_ID,
+};
 use peanut_internship_rust::exchange::config::BinanceConfig;
 use peanut_internship_rust::exchange::ws::{DepthEvent, LocalOrderBook};
 use peanut_internship_rust::exchange::{BINANCE_TESTNET_WS_URL, ExchangeClient, OrderBookAnalyzer};
+use peanut_internship_rust::format;
 use peanut_internship_rust::inventory::pnl::PnLSummary;
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
 use peanut_internship_rust::inventory::types::Venue;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 
 /// Refresh interval in milliseconds for polling the TUI events.
-const TICK_RATE_MS: u64 = 250;
+const TICK_RATE_MS: u64 = DEFAULT_TUI_REFRESH_MS;
 /// Number of top-of-book levels to display in the order book panel.
-const ORDERBOOK_DISPLAY_LEVELS: usize = 5;
+const ORDERBOOK_DISPLAY_LEVELS: usize = DEFAULT_ORDERBOOK_DISPLAY_LEVELS;
 /// Interval in seconds between CEX balance refresh attempts.
-const BALANCE_REFRESH_INTERVAL_SECS: u64 = 30;
+const BALANCE_REFRESH_INTERVAL_SECS: u64 = DEFAULT_TUI_BALANCE_REFRESH_SECS;
 
 #[derive(Parser)]
 #[command(name = "dashboard")]
@@ -116,11 +120,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("tokio runtime");
 
         rt.block_on(async move {
-            let tracker =
-                std::sync::Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(vec![
-                    Venue::Binance,
-                    Venue::Wallet,
-                ])));
+            let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(
+                vec![Venue::Binance, Venue::Wallet],
+                MAINNET_CHAIN_ID,
+            )));
             let book = std::sync::Arc::new(tokio::sync::Mutex::new(LocalOrderBook::new(&pair)));
             let prices =
                 std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Decimal>::new()));
@@ -386,15 +389,15 @@ fn render_balances(data: &DashboardData) -> Table<'static> {
         .iter()
         .map(|r| {
             let usd_cell = if r.usd_val > Decimal::ZERO {
-                Cell::from(format!("${}", fmt_dec(r.usd_val, 2)))
+                Cell::from(format::fmt_usd(r.usd_val))
             } else {
                 Cell::from("-")
             };
             Row::new(vec![
                 Cell::from(r.asset.clone()).style(Style::default().fg(Color::Cyan)),
-                Cell::from(fmt_total(r.total)),
-                Cell::from(fmt_total(r.binance)),
-                Cell::from(fmt_total(r.wallet)),
+                Cell::from(format::fmt_qty(r.total)),
+                Cell::from(format::fmt_qty(r.binance)),
+                Cell::from(format::fmt_qty(r.wallet)),
                 usd_cell,
             ])
         })
@@ -478,11 +481,11 @@ fn render_skews(data: &DashboardData) -> Table<'static> {
 fn render_orderbook(data: &DashboardData) -> Table<'static> {
     let mid_str = data
         .ob_mid
-        .map(|m| fmt_dec(m, 2))
+        .map(format::fmt_price)
         .unwrap_or_else(|| "N/A".into());
     let spread_str = data
         .ob_spread_bps
-        .map(|s| format!("{s:.2}"))
+        .map(format::fmt_bps)
         .unwrap_or_else(|| "N/A".into());
     let imb = data.ob_imbalance;
 
@@ -490,8 +493,8 @@ fn render_orderbook(data: &DashboardData) -> Table<'static> {
 
     for (price, qty) in data.ob_asks.iter().rev() {
         rows.push(Row::new(vec![
-            Cell::from(fmt_dec(*price, 2)).style(Style::default().fg(Color::Red)),
-            Cell::from(fmt_dec(*qty, 4)),
+            Cell::from(format::fmt_price(*price)).style(Style::default().fg(Color::Red)),
+            Cell::from(format::fmt_qty(*qty)),
         ]));
     }
 
@@ -502,16 +505,15 @@ fn render_orderbook(data: &DashboardData) -> Table<'static> {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Cell::from(format!("Spd: {spread_str} bps"))
-                .style(Style::default().fg(Color::DarkGray)),
+            Cell::from(format!("Spd: {spread_str}")).style(Style::default().fg(Color::DarkGray)),
         ])
         .style(Style::default().bg(Color::DarkGray)),
     );
 
     for (price, qty) in &data.ob_bids {
         rows.push(Row::new(vec![
-            Cell::from(fmt_dec(*price, 2)).style(Style::default().fg(Color::Green)),
-            Cell::from(fmt_dec(*qty, 4)),
+            Cell::from(format::fmt_price(*price)).style(Style::default().fg(Color::Green)),
+            Cell::from(format::fmt_qty(*qty)),
         ]));
     }
 
@@ -564,20 +566,20 @@ fn render_pnl(data: &DashboardData) -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("PnL: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("${}", fmt_dec(summary.total_pnl_usd, 2)),
+                format::fmt_usd(summary.total_pnl_usd),
                 Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Avg: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("${}/t", fmt_dec(summary.avg_pnl_per_trade, 2)),
+                format!("{}/t", format::fmt_usd(summary.avg_pnl_per_trade)),
                 Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![
             Span::styled("Fees: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("${}", fmt_dec(summary.total_fees_usd, 2)),
+                format::fmt_usd(summary.total_fees_usd),
                 Style::default().fg(Color::Magenta),
             ),
             Span::raw("  "),
@@ -587,14 +589,14 @@ fn render_pnl(data: &DashboardData) -> Paragraph<'static> {
         Line::from(vec![
             Span::styled("Notional: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("${}", fmt_dec(summary.total_notional, 0)),
+                format::fmt_usd(summary.total_notional),
                 Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![
             Span::styled("Avg BPS: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                fmt_dec(summary.avg_pnl_bps, 2),
+                format::fmt_bps(summary.avg_pnl_bps),
                 Style::default().fg(Color::Cyan),
             ),
         ]),
@@ -623,19 +625,6 @@ fn render_footer(data: &DashboardData) -> Paragraph<'static> {
         ),
     ]))
     .block(Block::default().borders(Borders::TOP))
-}
-
-fn fmt_total(d: Decimal) -> String {
-    if d == Decimal::ZERO {
-        return "-".into();
-    }
-    fmt_dec(d, 4)
-}
-
-fn fmt_dec(d: Decimal, precision: usize) -> String {
-    d.to_f64()
-        .map(|f| format!("{f:.precision$}", precision = precision))
-        .unwrap_or_else(|| d.to_string())
 }
 
 fn fmt_pct(opt: Option<f64>) -> String {

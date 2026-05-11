@@ -11,13 +11,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ethers::prelude::StreamExt;
 use ethers::providers::{Middleware, Provider, Ws};
-use ethers::types::U64;
+use ethers::types::{Filter, H256, U64, U256, ValueOrArray};
+use ethers::utils::keccak256;
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::chain::ChainClient;
-use crate::core::types::{Address, Token};
+use crate::core::types::{Address, DEFAULT_ORDERBOOK_DEPTH, ESTIMATE_PRICE_DEPTH, Token};
 use crate::exchange::client::ExchangeClient;
 use crate::pricing::{UniswapV2Pair, UniswapV3Pool, V3QuoterConfig};
 use crate::strategy::errors::{StrategyError, StrategyResult};
@@ -75,6 +76,7 @@ struct DexStateCache {
 /// If the WS block feed is down and the cache is older than this,
 /// fall back to a synchronous RPC fetch per tick.
 const DEX_CACHE_STALE_SECS: u64 = 5;
+const UNISWAP_V3_SWAP_EVENT: &str = "Swap(address,address,int256,int256,uint160,uint128,int24)";
 
 pub struct LivePriceSource {
     cex: Arc<dyn CexOrderBookSource>,
@@ -216,31 +218,48 @@ impl LivePriceSource {
         let client = self.client.clone();
         let dex_cache = self.dex_cache.clone();
 
-        // Clone pool entries for the background task.
         let pool_entries: Vec<(String, PoolEntry)> = self
             .pools
             .iter()
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect();
+        let v2_entries: Vec<(String, PoolEntry)> = pool_entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry.pool, LivePool::V2(_)))
+            .cloned()
+            .collect();
+        let v3_entries: Vec<(String, PoolEntry)> = pool_entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry.pool, LivePool::V3(_)))
+            .cloned()
+            .collect();
 
-        tokio::spawn(async move {
-            let mut block_stream = match live_ws.subscribe_blocks().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "Failed to subscribe to blocks in DEX feed task");
-                    return;
-                }
-            };
+        if !v2_entries.is_empty() {
+            let v2_ws = live_ws.clone();
+            let v2_client = client.clone();
+            let v2_cache = dex_cache.clone();
+            tokio::spawn(async move {
+                let mut block_stream = match v2_ws.subscribe_blocks().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to subscribe to blocks in DEX V2 feed task");
+                        return;
+                    }
+                };
 
-            while let Some(block) = block_stream.next().await {
-                let block_number = block.number.map(|n: U64| n.as_u64()).unwrap_or(0);
+                while let Some(block) = block_stream.next().await {
+                    let block_number = block.number.map(|n: U64| n.as_u64()).unwrap_or_else(|| {
+                        warn!("DEX V2 block feed received block without number; using 0");
+                        0
+                    });
 
-                for (pair_name, entry) in &pool_entries {
-                    let mut updated = false;
-
-                    match &entry.pool {
-                        LivePool::V2(pair_lock) => {
-                            match UniswapV2Pair::fetch_reserves(&entry.address, &client).await {
+                    for (pair_name, entry) in &v2_entries {
+                        let LivePool::V2(pair_lock) = &entry.pool else {
+                            continue;
+                        };
+                        let mut updated = false;
+                        {
+                            match UniswapV2Pair::fetch_reserves(&entry.address, &v2_client).await {
                                 Ok((r0, r1)) => {
                                     let mut guard = pair_lock.write().await;
                                     guard.reserve0 = r0;
@@ -256,44 +275,84 @@ impl LivePriceSource {
                                 }
                             }
                         }
-                        LivePool::V3(pool_lock) => {
-                            match UniswapV3Pool::fetch_state(&entry.address, &client).await {
-                                Ok((sqrt_price_x96, liquidity, tick)) => {
-                                    let mut guard = pool_lock.write().await;
-                                    guard.sqrt_price_x96 = sqrt_price_x96;
-                                    guard.liquidity = liquidity;
-                                    guard.tick = tick;
-                                    updated = true;
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        pair = %pair_name,
-                                        error = %e,
-                                        "fetch_state failed in block feed"
-                                    );
-                                }
-                            }
-                        }
-                    };
 
-                    if updated {
-                        debug!(
-                            pair = %pair_name,
-                            block = block_number,
-                            "DEX pool state updated from block"
-                        );
-                        let mut cache = dex_cache.write().await;
-                        cache.insert(
-                            pair_name.clone(),
-                            DexStateCache {
-                                updated_at: std::time::Instant::now(),
-                            },
-                        );
+                        if updated {
+                            debug!(
+                                pair = %pair_name,
+                                block = block_number,
+                                "DEX V2 pool state updated from block"
+                            );
+                            let mut cache = v2_cache.write().await;
+                            cache.insert(
+                                pair_name.clone(),
+                                DexStateCache {
+                                    updated_at: std::time::Instant::now(),
+                                },
+                            );
+                        }
                     }
                 }
-            }
-            warn!("DEX block feed stream ended");
-        });
+                warn!("DEX V2 block feed stream ended");
+            });
+        }
+
+        if !v3_entries.is_empty() {
+            let v3_ws = live_ws.clone();
+            let v3_cache = dex_cache.clone();
+            tokio::spawn(async move {
+                let by_address: HashMap<_, _> = v3_entries
+                    .iter()
+                    .map(|(pair, entry)| {
+                        (
+                            entry.address.as_eth_address(),
+                            (pair.clone(), entry.clone()),
+                        )
+                    })
+                    .collect();
+                let addresses: Vec<_> = by_address.keys().copied().collect();
+                let topic = H256::from(keccak256(UNISWAP_V3_SWAP_EVENT));
+                let filter = Filter::new()
+                    .address(ValueOrArray::Array(addresses))
+                    .topic0(topic);
+                let mut log_stream = match v3_ws.subscribe_logs(&filter).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to subscribe to V3 Swap logs");
+                        return;
+                    }
+                };
+
+                while let Some(log) = log_stream.next().await {
+                    let Some((pair_name, entry)) = by_address.get(&log.address) else {
+                        continue;
+                    };
+                    let Some((sqrt_price_x96, liquidity, tick)) =
+                        parse_v3_swap_state(log.data.as_ref())
+                    else {
+                        debug!(pair = %pair_name, "failed to parse V3 Swap log");
+                        continue;
+                    };
+                    let LivePool::V3(pool_lock) = &entry.pool else {
+                        continue;
+                    };
+                    {
+                        let mut guard = pool_lock.write().await;
+                        guard.sqrt_price_x96 = sqrt_price_x96;
+                        guard.liquidity = liquidity;
+                        guard.tick = tick;
+                    }
+                    debug!(pair = %pair_name, "DEX V3 pool state updated from Swap log");
+                    let mut cache = v3_cache.write().await;
+                    cache.insert(
+                        pair_name.clone(),
+                        DexStateCache {
+                            updated_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                warn!("DEX V3 Swap log stream ended");
+            });
+        }
 
         Ok(())
     }
@@ -317,9 +376,96 @@ fn decimal_to_u128_scaled(value: Decimal, decimals: u8) -> Option<u128> {
 /// `Decimal`'s mantissa for the notional sizes we care about in arb
 /// (loses precision only beyond ~28 significant digits).
 fn u128_to_decimal_scaled(value: u128, decimals: u8) -> Decimal {
-    let raw = Decimal::from_u128(value).unwrap_or(Decimal::ZERO);
-    let scale = Decimal::from_u128(10u128.pow(decimals as u32)).unwrap_or(Decimal::ONE);
+    let raw = Decimal::from_u128(value).unwrap_or_else(|| {
+        warn!(
+            value,
+            decimals, "raw integer value does not fit Decimal; using 0"
+        );
+        Decimal::ZERO
+    });
+    let scale = Decimal::from_u128(10u128.pow(decimals as u32)).unwrap_or_else(|| {
+        warn!(
+            value,
+            decimals, "decimal scale does not fit Decimal; using scale 1"
+        );
+        Decimal::ONE
+    });
     raw / scale
+}
+
+fn parse_v3_swap_state(data: &[u8]) -> Option<(U256, u128, i32)> {
+    if data.len() < 160 {
+        return None;
+    }
+    let sqrt_price_x96 = U256::from_big_endian(&data[64..96]);
+    let liquidity = U256::from_big_endian(&data[96..128]).as_u128();
+    let tick = decode_abi_int24(&data[128..160])?;
+    Some((sqrt_price_x96, liquidity, tick))
+}
+
+fn decode_abi_int24(word: &[u8]) -> Option<i32> {
+    if word.len() != 32 {
+        return None;
+    }
+    let raw = ((word[29] as i32) << 16) | ((word[30] as i32) << 8) | word[31] as i32;
+    if raw & 0x80_0000 != 0 {
+        Some(raw | !0xFF_FFFF)
+    } else {
+        Some(raw)
+    }
+}
+
+fn local_v3_prices(
+    pool: &UniswapV3Pool,
+    entry: &PoolEntry,
+    size: Decimal,
+    size_raw: u128,
+) -> StrategyResult<(Decimal, Decimal)> {
+    let sell_quote = pool
+        .quote_swap(size_raw, &entry.base)
+        .map_err(|e| StrategyError::Pricing(format!("v3 local quote exact input: {e}")))?;
+    let buy_raw = local_v3_exact_output_input(pool, size_raw, &entry.quote)
+        .ok_or_else(|| StrategyError::Pricing("v3 local quote exact output failed".into()))?;
+    let dex_sell = if size > Decimal::ZERO {
+        u128_to_decimal_scaled(sell_quote.amount_out, entry.quote.decimals) / size
+    } else {
+        Decimal::ZERO
+    };
+    let dex_buy = if size > Decimal::ZERO {
+        u128_to_decimal_scaled(buy_raw, entry.quote.decimals) / size
+    } else {
+        Decimal::ZERO
+    };
+    Ok((dex_buy, dex_sell))
+}
+
+fn local_v3_exact_output_input(
+    pool: &UniswapV3Pool,
+    amount_out_raw: u128,
+    token_in: &Token,
+) -> Option<u128> {
+    if amount_out_raw == 0 {
+        return Some(0);
+    }
+    let mut high = amount_out_raw.saturating_mul(2).max(1);
+    for _ in 0..32 {
+        let out = pool.quote_swap(high, token_in).ok()?.amount_out;
+        if out >= amount_out_raw {
+            break;
+        }
+        high = high.checked_mul(2)?;
+    }
+    let mut low = 0u128;
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        let out = pool.quote_swap(mid, token_in).ok()?.amount_out;
+        if out >= amount_out_raw {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    Some(high)
 }
 
 #[async_trait]
@@ -332,7 +478,10 @@ impl PriceSource for LivePriceSource {
         })?;
 
         // CEX side: re-read the best bid/ask from the exchange order book.
-        let ob = self.cex.fetch_order_book(pair, 20).await?;
+        let ob = self
+            .cex
+            .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
+            .await?;
         let cex_bid = ob
             .best_bid
             .map(|(p, _)| p)
@@ -342,9 +491,7 @@ impl PriceSource for LivePriceSource {
             .map(|(p, _)| p)
             .ok_or_else(|| StrategyError::EmptyOrderBook(pair.to_string()))?;
 
-        // DEX side: if the WS block feed is active (cache fresh), read from
-        // it. Otherwise fetch fresh on-chain prices every tick — no stale
-        // cache, prices are always live.
+        // DEX side: V2 prices from reserves; V3 prices from WS-updated pool state.
         let is_fresh = {
             let cache = self.dex_cache.read().await;
             if let Some(cached) = cache.get(pair) {
@@ -357,10 +504,9 @@ impl PriceSource for LivePriceSource {
         let size_raw = decimal_to_u128_scaled(size, entry.base.decimals)
             .ok_or_else(|| StrategyError::Pricing(format!("size {size} does not fit in u128")))?;
 
-        let (dex_buy, dex_sell) = if is_fresh {
-            // Compute locally from locked state
-            match &entry.pool {
-                LivePool::V2(pair_lock) => {
+        let (dex_buy, dex_sell) = match &entry.pool {
+            LivePool::V2(pair_lock) => {
+                if is_fresh {
                     let pool = pair_lock.read().await;
                     let out_raw = pool
                         .get_amount_out(size_raw, &entry.base)
@@ -379,57 +525,14 @@ impl PriceSource for LivePriceSource {
                         Decimal::ZERO
                     };
                     (dex_buy, dex_sell)
-                }
-                LivePool::V3(pool_lock) => {
-                    let pool = pool_lock.read().await.clone();
-
-                    // Spot price as base anchor (no RPC, pure local math)
-                    let spot_price = pool.get_spot_price(&entry.base).unwrap_or(Decimal::ZERO);
-
-                    // dex_sell: exact input — sell `size` base, get quote
-                    let dex_sell = if size_raw > 0 {
-                        match pool.quote_swap(size_raw, &entry.base) {
-                            Ok(q) if q.amount_out > 0 => {
-                                u128_to_decimal_scaled(q.amount_out, entry.quote.decimals) / size
-                            }
-                            _ => spot_price, // fall back to spot
-                        }
-                    } else {
-                        spot_price
-                    };
-
-                    // dex_buy: estimate how much quote to spend for `size` base.
-                    // Use dex_sell as the quote estimate (sell price ≈ buy price at small spread),
-                    // then simulate the reverse swap.
-                    let quote_est = if dex_sell > Decimal::ZERO {
-                        dex_sell
-                    } else {
-                        spot_price
-                    };
-                    let quote_est_amount =
-                        decimal_to_u128_scaled(size * quote_est, entry.quote.decimals).unwrap_or(0);
-
-                    let dex_buy = if quote_est_amount > 0 {
-                        match pool.quote_swap(quote_est_amount, &entry.quote) {
-                            Ok(q) if q.amount_out > 0 => {
-                                let quote_in =
-                                    u128_to_decimal_scaled(quote_est_amount, entry.quote.decimals);
-                                let base_out =
-                                    u128_to_decimal_scaled(q.amount_out, entry.base.decimals);
-                                quote_in / base_out
-                            }
-                            _ => spot_price, // fall back to spot
-                        }
-                    } else {
-                        spot_price
-                    };
-
-                    (dex_buy, dex_sell)
+                } else {
+                    fetch_dex_prices_sync(entry, &self.client, size, size_raw).await?
                 }
             }
-        } else {
-            // No WS feed (or stale). Fetch live prices via RPC and update state.
-            fetch_dex_prices_sync(entry, &self.client, size, size_raw).await?
+            LivePool::V3(pool_lock) => {
+                let pool = pool_lock.read().await;
+                local_v3_prices(&pool, entry, size, size_raw)?
+            }
         };
 
         Ok(VenuePrices {
@@ -442,7 +545,10 @@ impl PriceSource for LivePriceSource {
 
     async fn get_latest_price(&self, pair: &str) -> StrategyResult<Decimal> {
         // CEX mid price as a baseline
-        let ob = self.cex.fetch_order_book(pair, 5).await?;
+        let ob = self
+            .cex
+            .fetch_order_book(pair, ESTIMATE_PRICE_DEPTH)
+            .await?;
         let bid = ob
             .best_bid
             .map(|(p, _)| p)
@@ -464,7 +570,14 @@ async fn fetch_dex_prices_sync(
 ) -> StrategyResult<(Decimal, Decimal)> {
     // Log the current block number so we can verify the RPC is returning
     // fresh data and not a cached response.
-    let block_num = client.get_block_number().await.unwrap_or(0);
+    let block_num = client.get_block_number().await.unwrap_or_else(|e| {
+        warn!(
+            pool = %entry.address,
+            error = %e,
+            "failed to read block number for sync DEX price fetch; using 0"
+        );
+        0
+    });
     debug!(pool = %entry.address, block = block_num, "fetch_dex_prices_sync");
     match &entry.pool {
         LivePool::V2(pair_lock) => {
@@ -496,16 +609,6 @@ async fn fetch_dex_prices_sync(
             Ok((dex_buy, dex_sell))
         }
         LivePool::V3(pool_lock) => {
-            let (sqrt_price_x96, liquidity, tick) =
-                UniswapV3Pool::fetch_state(&entry.address, client)
-                    .await
-                    .map_err(|e| StrategyError::Pricing(format!("fetch_state: {e}")))?;
-            {
-                let mut guard = pool_lock.write().await;
-                guard.sqrt_price_x96 = sqrt_price_x96;
-                guard.liquidity = liquidity;
-                guard.tick = tick;
-            }
             let pool = pool_lock.read().await.clone();
             let quoter = entry
                 .quoter
@@ -582,5 +685,30 @@ mod tests {
     fn u128_to_decimal_6_decimals() {
         // 1_500_000 (USDC, 6 decimals) → 1.5
         assert_eq!(u128_to_decimal_scaled(1_500_000, 6), Decimal::new(15, 1));
+    }
+
+    #[test]
+    fn parses_v3_swap_state_from_log_data() {
+        let sqrt = U256::from(123_456_789u64);
+        let liquidity = U256::from(987_654u64);
+        let tick = U256::from(42u64);
+        let mut data = vec![0u8; 160];
+        sqrt.to_big_endian(&mut data[64..96]);
+        liquidity.to_big_endian(&mut data[96..128]);
+        tick.to_big_endian(&mut data[128..160]);
+
+        let parsed = parse_v3_swap_state(&data).unwrap();
+        assert_eq!(parsed.0, sqrt);
+        assert_eq!(parsed.1, 987_654);
+        assert_eq!(parsed.2, 42);
+    }
+
+    #[test]
+    fn decodes_negative_v3_swap_tick() {
+        let mut word = [0xffu8; 32];
+        word[29] = 0xff;
+        word[30] = 0xff;
+        word[31] = 0xff;
+        assert_eq!(decode_abi_int24(&word), Some(-1));
     }
 }

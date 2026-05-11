@@ -23,13 +23,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use thiserror::Error;
 use tracing::{info, instrument, warn};
 
 use crate::chain::client::ChainClient;
-use crate::core::types::TransactionReceipt;
+use crate::core::types::{
+    DEFAULT_RECONCILE_MAX_AGE_SECS, DEFAULT_RECONCILE_POLL_SECS, TransactionReceipt,
+};
 use crate::executor::errors::ExecutorError;
 use crate::executor::migrations::{SqlMigration, migrate_executor_db};
+use crate::observability::{emit_event, metrics_handle};
 use crate::strategy::signal::Direction;
 
 // ---------------------------------------------------------------------------
@@ -390,9 +394,8 @@ pub struct ReconcileConfig {
 impl Default for ReconcileConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(10),
-            // 1 hour — generously longer than typical mempool residency.
-            max_age: Duration::from_secs(60 * 60),
+            poll_interval: Duration::from_secs(DEFAULT_RECONCILE_POLL_SECS),
+            max_age: Duration::from_secs(DEFAULT_RECONCILE_MAX_AGE_SECS),
         }
     }
 }
@@ -493,6 +496,15 @@ impl ReconcileWorker {
                     self.store
                         .mark_async(entry.signal_id.clone(), ReconcileStatus::Resolved, None)
                         .await?;
+                    metrics_handle().record_reconcile_resolved("receipt_success");
+                    emit_event(
+                        "reconcile_resolved",
+                        json!({
+                            "signal_id": entry.signal_id,
+                            "tx_hash": entry.tx_hash,
+                            "outcome": "receipt_success",
+                        }),
+                    );
                     info!(signal = %entry.signal_id, tx = %entry.tx_hash, "reconcile: resolved");
                     out.push((entry, TickOutcome::ReceiptSuccess));
                 }
@@ -504,6 +516,15 @@ impl ReconcileWorker {
                             Some("leg2 reverted on-chain".to_string()),
                         )
                         .await?;
+                    metrics_handle().record_reconcile_resolved("receipt_reverted");
+                    emit_event(
+                        "reconcile_resolved",
+                        json!({
+                            "signal_id": entry.signal_id,
+                            "tx_hash": entry.tx_hash,
+                            "outcome": "receipt_reverted",
+                        }),
+                    );
                     warn!(
                         signal = %entry.signal_id,
                         tx = %entry.tx_hash,
@@ -519,6 +540,15 @@ impl ReconcileWorker {
                             Some("max_age exceeded without receipt".to_string()),
                         )
                         .await?;
+                    metrics_handle().record_reconcile_resolved("expired");
+                    emit_event(
+                        "reconcile_resolved",
+                        json!({
+                            "signal_id": entry.signal_id,
+                            "tx_hash": entry.tx_hash,
+                            "outcome": "expired",
+                        }),
+                    );
                     warn!(
                         signal = %entry.signal_id,
                         tx = %entry.tx_hash,
@@ -530,6 +560,15 @@ impl ReconcileWorker {
                     out.push((entry, TickOutcome::StillPending));
                 }
                 Err(e) => {
+                    metrics_handle().record_reconcile_resolved("inspect_error");
+                    emit_event(
+                        "reconcile_inspect_error",
+                        json!({
+                            "signal_id": entry.signal_id,
+                            "tx_hash": entry.tx_hash,
+                            "error": e.to_string(),
+                        }),
+                    );
                     warn!(
                         signal = %entry.signal_id,
                         tx = %entry.tx_hash,

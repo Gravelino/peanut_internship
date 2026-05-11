@@ -2,8 +2,14 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::safety::killswitch::{ABSOLUTE_MIN_CAPITAL, SafetyDecision, safety_check};
-use crate::strategy::Signal;
+use crate::core::types::{
+    ABSOLUTE_MIN_CAPITAL, BPS_SCALE, DEFAULT_CONSECUTIVE_LOSS_LIMIT,
+    DEFAULT_MAX_DAILY_LOSS_LIMIT_USD, DEFAULT_MAX_DRAWDOWN_BPS, DEFAULT_MAX_LOSS_PER_TRADE_USD,
+    DEFAULT_MAX_OPEN_POSITIONS, DEFAULT_MAX_POSITION_PER_TOKEN, DEFAULT_MAX_TRADE_BPS,
+    DEFAULT_MAX_TRADE_USD, DEFAULT_MAX_TRADES_PER_HOUR,
+};
+use crate::safety::killswitch::{SafetyDecision, safety_check};
+use crate::strategy::signal::Signal;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskLimits {
@@ -21,15 +27,15 @@ pub struct RiskLimits {
 impl Default for RiskLimits {
     fn default() -> Self {
         Self {
-            max_trade_usd: Decimal::from(5),
-            max_trade_pct: Decimal::new(20, 2),
-            max_position_per_token: Decimal::from(30),
-            max_open_positions: 1,
-            max_loss_per_trade: Decimal::from(5),
-            max_daily_loss: Decimal::from(10),
-            max_drawdown_pct: Decimal::new(20, 2),
-            max_trades_per_hour: 20,
-            consecutive_loss_limit: 3,
+            max_trade_usd: Decimal::from(DEFAULT_MAX_TRADE_USD),
+            max_trade_pct: Decimal::from(DEFAULT_MAX_TRADE_BPS) / Decimal::from(BPS_SCALE),
+            max_position_per_token: Decimal::from(DEFAULT_MAX_POSITION_PER_TOKEN),
+            max_open_positions: DEFAULT_MAX_OPEN_POSITIONS,
+            max_loss_per_trade: Decimal::from(DEFAULT_MAX_LOSS_PER_TRADE_USD),
+            max_daily_loss: Decimal::from(DEFAULT_MAX_DAILY_LOSS_LIMIT_USD),
+            max_drawdown_pct: Decimal::from(DEFAULT_MAX_DRAWDOWN_BPS) / Decimal::from(BPS_SCALE),
+            max_trades_per_hour: DEFAULT_MAX_TRADES_PER_HOUR,
+            consecutive_loss_limit: DEFAULT_CONSECUTIVE_LOSS_LIMIT,
         }
     }
 }
@@ -64,7 +70,7 @@ impl RiskManager {
 
     pub fn check_pre_trade(&mut self, signal: &Signal) -> SafetyDecision {
         self.reset_hour_if_needed();
-        let trade_value = signal.size * signal.cex_price;
+        let trade_value = signal.notional_usd;
 
         if trade_value > self.limits.max_trade_usd {
             return SafetyDecision::Blocked {
@@ -129,18 +135,92 @@ impl RiskManager {
         )
     }
 
+    pub fn trading_pause(&mut self) -> SafetyDecision {
+        self.reset_hour_if_needed();
+
+        if self.open_positions >= self.limits.max_open_positions {
+            return SafetyDecision::Blocked {
+                reason: format!("Open position limit ({}) reached", self.open_positions),
+            };
+        }
+
+        if self.daily_pnl <= -self.limits.max_daily_loss {
+            return SafetyDecision::Blocked {
+                reason: format!("Daily loss limit reached: ${:.2}", self.daily_pnl),
+            };
+        }
+
+        let drawdown = self.drawdown_pct();
+        if drawdown >= self.limits.max_drawdown_pct {
+            return SafetyDecision::Blocked {
+                reason: format!(
+                    "Drawdown {:.1}% exceeds limit",
+                    drawdown * Decimal::from(100)
+                ),
+            };
+        }
+
+        if self.consecutive_losses >= self.limits.consecutive_loss_limit {
+            return SafetyDecision::Blocked {
+                reason: format!(
+                    "Consecutive loss limit ({}) reached",
+                    self.consecutive_losses
+                ),
+            };
+        }
+
+        if self.trades_this_hour >= self.limits.max_trades_per_hour {
+            let elapsed = Utc::now() - self.hour_started_at;
+            let remaining = Duration::hours(1) - elapsed;
+            let remaining_secs = remaining.num_seconds().max(0);
+            return SafetyDecision::Blocked {
+                reason: format!(
+                    "Hourly trade limit reached ({}/{}); resumes in ~{}s",
+                    self.trades_this_hour, self.limits.max_trades_per_hour, remaining_secs
+                ),
+            };
+        }
+
+        safety_check(
+            Decimal::ZERO,
+            self.daily_pnl,
+            self.current_capital,
+            self.trades_this_hour,
+        )
+    }
+
     pub fn record_trade(&mut self, pnl: Decimal) {
+        self.record_trade_started();
+        self.record_trade_result(pnl);
+    }
+
+    pub fn record_trade_started(&mut self) {
+        self.reset_hour_if_needed();
+        self.trades_this_hour += 1;
+        self.open_positions += 1;
+    }
+
+    pub fn record_trade_result(&mut self, pnl: Decimal) {
         self.daily_pnl += pnl;
         self.current_capital += pnl;
         if self.current_capital > self.peak_capital {
             self.peak_capital = self.current_capital;
         }
-        self.trades_this_hour += 1;
+        self.open_positions = self.open_positions.saturating_sub(1);
         if pnl < Decimal::ZERO {
             self.consecutive_losses += 1;
         } else {
             self.consecutive_losses = 0;
         }
+    }
+
+    pub fn record_trade_cancelled(&mut self) {
+        self.open_positions = self.open_positions.saturating_sub(1);
+    }
+
+    pub fn record_trade_not_started(&mut self) {
+        self.trades_this_hour = self.trades_this_hour.saturating_sub(1);
+        self.open_positions = self.open_positions.saturating_sub(1);
     }
 
     pub fn reset_daily(&mut self) {
@@ -210,6 +290,7 @@ mod tests {
             dex_price: cex_price + Decimal::from(20),
             spread_bps: Decimal::from(100),
             size,
+            notional_usd: size * cex_price,
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(1),
             expected_net_pnl: Decimal::from(19),

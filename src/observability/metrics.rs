@@ -51,6 +51,13 @@ pub struct Metrics {
     pub flashbots_bundles_included_total: IntCounterVec,
     pub flashbots_bundles_not_included_total: IntCounterVec,
     pub flashbots_relay_errors_total: IntCounterVec,
+    pub dex_pending_timeouts_total: IntCounterVec,
+    pub dex_cancel_attempts_total: IntCounterVec,
+    pub dex_cancel_outcomes_total: IntCounterVec,
+    pub reconcile_entries_total: IntCounterVec,
+    pub reconcile_resolved_total: IntCounterVec,
+    pub reconcile_expired_total: IntCounter,
+    pub leg_outcomes_total: IntCounterVec,
 
     // Gauges
     pub breaker_open: IntGauge,
@@ -191,6 +198,87 @@ impl Metrics {
             .register(Box::new(flashbots_relay_errors_total.clone()))
             .expect("unique metric");
 
+        let dex_pending_timeouts_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_dex_pending_timeouts_total",
+                "DEX leg transactions that exceeded the executor wait window.",
+            ),
+            &["pool_kind", "private"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(dex_pending_timeouts_total.clone()))
+            .expect("unique metric");
+
+        let dex_cancel_attempts_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_dex_cancel_attempts_total",
+                "Attempts to cancel or replace a pending DEX transaction.",
+            ),
+            &["backend"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(dex_cancel_attempts_total.clone()))
+            .expect("unique metric");
+
+        let dex_cancel_outcomes_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_dex_cancel_outcomes_total",
+                "Outcomes of pending DEX transaction cancel or replacement attempts.",
+            ),
+            &["outcome"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(dex_cancel_outcomes_total.clone()))
+            .expect("unique metric");
+
+        let reconcile_entries_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_reconcile_entries_total",
+                "Reconcile entries grouped by bounded enqueue reason.",
+            ),
+            &["reason"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(reconcile_entries_total.clone()))
+            .expect("unique metric");
+
+        let reconcile_resolved_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_reconcile_resolved_total",
+                "Reconcile worker terminal outcomes.",
+            ),
+            &["outcome"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(reconcile_resolved_total.clone()))
+            .expect("unique metric");
+
+        let reconcile_expired_total = IntCounter::new(
+            "peanut_reconcile_expired_total",
+            "Reconcile entries that expired and require manual review.",
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(reconcile_expired_total.clone()))
+            .expect("unique metric");
+
+        let leg_outcomes_total = IntCounterVec::new(
+            Opts::new(
+                "peanut_leg_outcomes_total",
+                "Leg outcomes grouped by bounded venue, leg, and outcome labels.",
+            ),
+            &["venue", "leg", "outcome"],
+        )
+        .expect("valid counter opts");
+        registry
+            .register(Box::new(leg_outcomes_total.clone()))
+            .expect("unique metric");
+
         let breaker_open = IntGauge::new(
             "peanut_breaker_open",
             "1 when the circuit breaker is currently open, 0 otherwise.",
@@ -307,6 +395,13 @@ impl Metrics {
             flashbots_bundles_included_total,
             flashbots_bundles_not_included_total,
             flashbots_relay_errors_total,
+            dex_pending_timeouts_total,
+            dex_cancel_attempts_total,
+            dex_cancel_outcomes_total,
+            reconcile_entries_total,
+            reconcile_resolved_total,
+            reconcile_expired_total,
+            leg_outcomes_total,
             breaker_open,
             pnl_breaker_halted,
             signal_queue_depth,
@@ -386,6 +481,45 @@ impl Metrics {
     pub fn record_queue_drop(&self, reason: &str) {
         self.signal_queue_drops_total
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    pub fn record_dex_pending_timeout(&self, pool_kind: &str, private: bool) {
+        self.dex_pending_timeouts_total
+            .with_label_values(&[pool_kind, if private { "true" } else { "false" }])
+            .inc();
+    }
+
+    pub fn record_dex_cancel_attempt(&self, backend: &str) {
+        self.dex_cancel_attempts_total
+            .with_label_values(&[backend])
+            .inc();
+    }
+
+    pub fn record_dex_cancel_outcome(&self, outcome: &str) {
+        self.dex_cancel_outcomes_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    pub fn record_reconcile_entry(&self, reason: &str) {
+        self.reconcile_entries_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    pub fn record_reconcile_resolved(&self, outcome: &str) {
+        self.reconcile_resolved_total
+            .with_label_values(&[outcome])
+            .inc();
+        if outcome == "expired" {
+            self.reconcile_expired_total.inc();
+        }
+    }
+
+    pub fn record_leg_outcome(&self, venue: &str, leg: &str, outcome: &str) {
+        self.leg_outcomes_total
+            .with_label_values(&[venue, leg, outcome])
             .inc();
     }
 
@@ -484,6 +618,12 @@ mod tests {
         m.record_flashbots_bundle_included("relay", 1);
         m.record_flashbots_bundle_not_included("relay");
         m.record_flashbots_relay_error("relay", "send");
+        m.record_dex_pending_timeout("v2", false);
+        m.record_dex_cancel_attempt("public");
+        m.record_dex_cancel_outcome("cancelled");
+        m.record_reconcile_entry("leg2_timeout");
+        m.record_reconcile_resolved("expired");
+        m.record_leg_outcome("dex", "leg2", "timeout");
 
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         for name in [
@@ -501,6 +641,13 @@ mod tests {
             "peanut_flashbots_bundle_simulation_seconds",
             "peanut_flashbots_bundle_inclusion_blocks",
             "peanut_flashbots_relay_errors_total",
+            "peanut_dex_pending_timeouts_total",
+            "peanut_dex_cancel_attempts_total",
+            "peanut_dex_cancel_outcomes_total",
+            "peanut_reconcile_entries_total",
+            "peanut_reconcile_resolved_total",
+            "peanut_reconcile_expired_total",
+            "peanut_leg_outcomes_total",
         ] {
             assert!(body.contains(name), "missing metric: {name}\n{body}");
         }

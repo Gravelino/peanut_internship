@@ -11,6 +11,7 @@ pub mod builder;
 pub mod client;
 pub mod errors;
 pub mod flashbots;
+pub mod nonce_manager;
 pub mod selectors;
 
 pub use builder::{SignedTransaction, TransactionBuilder};
@@ -20,3 +21,4 @@ pub use flashbots::{
     BundleRelay, BundleRequest, BundleResult, BundleStatus, BundleSubmission, BundleTx,
     FlashbotsConfig, FlashbotsRelayClient,
 };
+pub use nonce_manager::NonceManager;

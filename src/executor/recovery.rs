@@ -19,6 +19,10 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::core::types::{
+    DEFAULT_BREAKER_COOLDOWN_SECS, DEFAULT_BREAKER_FAILURE_THRESHOLD, DEFAULT_BREAKER_WINDOW_SECS,
+    DEFAULT_MAX_DAILY_LOSS_USD, DEFAULT_REPLAY_TTL_SECS,
+};
 use crate::executor::errors::{ExecutorError, ExecutorResult};
 use crate::executor::migrations::{SqlMigration, migrate_executor_db};
 use crate::strategy::signal::Signal;
@@ -37,9 +41,9 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_threshold: 3,
-            window: Duration::from_secs(300),
-            cooldown: Duration::from_secs(600),
+            failure_threshold: DEFAULT_BREAKER_FAILURE_THRESHOLD,
+            window: Duration::from_secs(DEFAULT_BREAKER_WINDOW_SECS),
+            cooldown: Duration::from_secs(DEFAULT_BREAKER_COOLDOWN_SECS),
         }
     }
 }
@@ -152,7 +156,7 @@ pub struct PnlBreakerConfig {
 impl Default for PnlBreakerConfig {
     fn default() -> Self {
         Self {
-            max_daily_loss_usd: rust_decimal::Decimal::from(100),
+            max_daily_loss_usd: rust_decimal::Decimal::from(DEFAULT_MAX_DAILY_LOSS_USD),
         }
     }
 }
@@ -462,9 +466,9 @@ fn now_unix() -> i64 {
 }
 
 impl Default for ReplayProtection {
-    /// 60-second TTL matches the Python spec default.
+    /// Default TTL matches the Python spec default.
     fn default() -> Self {
-        Self::new(Duration::from_secs(60))
+        Self::new(Duration::from_secs(DEFAULT_REPLAY_TTL_SECS))
     }
 }
 
@@ -481,6 +485,7 @@ mod tests {
             dex_price: rust_decimal::Decimal::from(2020),
             spread_bps: rust_decimal::Decimal::from(100),
             size: rust_decimal::Decimal::ONE,
+            notional_usd: rust_decimal::Decimal::from(2000),
             expected_gross_pnl: rust_decimal::Decimal::from(20),
             expected_fees: rust_decimal::Decimal::from(5),
             expected_net_pnl: rust_decimal::Decimal::from(15),

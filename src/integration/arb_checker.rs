@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::chain::ChainClient;
-use crate::core::types::Address;
+use crate::core::types::{
+    Address, BPS_SCALE, DEFAULT_CEX_FEE_BPS, DEFAULT_ORDERBOOK_DEPTH, split_pair_symbols,
+};
 use crate::exchange::client::ExchangeClient;
 use crate::exchange::orderbook::OrderBookAnalyzer;
 use crate::exchange::price_oracle::{AggregatedPrice, PriceOracle};
@@ -176,7 +178,8 @@ impl ArbChecker {
             .await
             .map_err(|e| ArbCheckError::DexError(e.to_string()))?;
 
-        let base_asset = pair.split('/').next().unwrap_or("ETH");
+        let (base_asset, quote_asset) =
+            split_pair_symbols(pair).map_err(|error| ArbCheckError::DexError(error.to_string()))?;
 
         let weth_alias = |s: &str| s == "WETH" || s == "ETH";
         let token_in = if weth_alias(pool.token0.symbol.as_str()) && weth_alias(base_asset) {
@@ -228,7 +231,7 @@ impl ArbChecker {
         let price_impact = pool.get_price_impact(amount_in, &token_in).map_err(|e| {
             ArbCheckError::DexError(format!("price impact calculation failed: {e}"))
         })?;
-        let price_impact_bps = price_impact * Decimal::from(10000);
+        let price_impact_bps = price_impact * Decimal::from(BPS_SCALE);
 
         let dex_pool_info = DexPoolInfo {
             pool_address: pool_address.to_string(),
@@ -264,7 +267,7 @@ impl ArbChecker {
 
         let orderbook = self
             .exchange_client
-            .fetch_order_book(pair, 20)
+            .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
             .await
             .map_err(ArbCheckError::Exchange)?;
 
@@ -288,13 +291,13 @@ impl ArbChecker {
             });
 
         let buy_dex_sell_cex_gap = if dex_price > Decimal::ZERO && cex_bid > Decimal::ZERO {
-            (cex_bid - dex_price) / dex_price * Decimal::from(10000)
+            (cex_bid - dex_price) / dex_price * Decimal::from(BPS_SCALE)
         } else {
             Decimal::ZERO
         };
 
         let buy_cex_sell_dex_gap = if cex_ask > Decimal::ZERO && dex_price > Decimal::ZERO {
-            (dex_price - cex_ask) / cex_ask * Decimal::from(10000)
+            (dex_price - cex_ask) / cex_ask * Decimal::from(BPS_SCALE)
         } else {
             Decimal::ZERO
         };
@@ -307,7 +310,7 @@ impl ArbChecker {
             (None, Decimal::ZERO)
         };
 
-        let cex_fee_bps = Decimal::from(10);
+        let cex_fee_bps = Decimal::from(DEFAULT_CEX_FEE_BPS);
         let walk_buy = analyzer.walk_the_book("buy", size)?;
         let walk_sell = analyzer.walk_the_book("sell", size)?;
         let cex_slippage_bps = walk_buy.slippage_bps.max(walk_sell.slippage_bps);
@@ -315,7 +318,7 @@ impl ArbChecker {
         let mid_price = analyzer.orderbook().mid_price;
         let gas_cost_bps = match mid_price {
             Some(m) if m > Decimal::ZERO && size > Decimal::ZERO => {
-                gas_cost_usd / (size * m) * Decimal::from(10000)
+                gas_cost_usd / (size * m) * Decimal::from(BPS_SCALE)
             }
             _ => {
                 warn!("Cannot compute gas_cost_bps: mid_price unavailable");
@@ -327,7 +330,6 @@ impl ArbChecker {
             dex_fee_bps + price_impact_bps + cex_fee_bps + cex_slippage_bps + gas_cost_bps;
         let estimated_net_pnl_bps = gap_bps - estimated_costs_bps;
 
-        let quote_asset = pair.split('/').next_back().unwrap_or("USDT");
         let quote_needed = size * dex_price;
 
         let inventory_ok = match direction.as_deref() {
@@ -535,7 +537,10 @@ impl ArbChecker {
     ) -> crate::exchange::errors::ExchangeResult<ArbCheckResult> {
         info!(pair, size = %size, "Running arb check");
 
-        let orderbook = self.exchange_client.fetch_order_book(pair, 20).await?;
+        let orderbook = self
+            .exchange_client
+            .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
+            .await?;
         let cex_mid = orderbook.mid_price;
         let analyzer = OrderBookAnalyzer::new(orderbook);
 
@@ -560,13 +565,13 @@ impl ArbChecker {
             });
 
         let buy_dex_sell_cex_gap = if dex_price > Decimal::ZERO && cex_bid > Decimal::ZERO {
-            (cex_bid - dex_price) / dex_price * Decimal::from(10000)
+            (cex_bid - dex_price) / dex_price * Decimal::from(BPS_SCALE)
         } else {
             Decimal::ZERO
         };
 
         let buy_cex_sell_dex_gap = if cex_ask > Decimal::ZERO && dex_price > Decimal::ZERO {
-            (dex_price - cex_ask) / cex_ask * Decimal::from(10000)
+            (dex_price - cex_ask) / cex_ask * Decimal::from(BPS_SCALE)
         } else {
             Decimal::ZERO
         };
@@ -579,7 +584,7 @@ impl ArbChecker {
             (None, Decimal::ZERO)
         };
 
-        let cex_fee_bps = Decimal::from(10);
+        let cex_fee_bps = Decimal::from(DEFAULT_CEX_FEE_BPS);
         let walk_buy = analyzer.walk_the_book("buy", size)?;
         let walk_sell = analyzer.walk_the_book("sell", size)?;
         let cex_slippage_bps = walk_buy.slippage_bps.max(walk_sell.slippage_bps);
@@ -591,7 +596,7 @@ impl ArbChecker {
         let mid_price = analyzer.orderbook().mid_price;
         let gas_cost_bps = match mid_price {
             Some(m) if m > Decimal::ZERO && size > Decimal::ZERO => {
-                gas_cost_usd / (size * m) * Decimal::from(10000)
+                gas_cost_usd / (size * m) * Decimal::from(BPS_SCALE)
             }
             _ => {
                 warn!("Cannot compute gas_cost_bps: mid_price unavailable");
@@ -602,8 +607,9 @@ impl ArbChecker {
         let estimated_costs_bps = total_cost_bps + gas_cost_bps;
         let estimated_net_pnl_bps = gap_bps - estimated_costs_bps;
 
-        let base_asset = pair.split('/').next().unwrap_or("ETH");
-        let quote_asset = pair.split('/').next_back().unwrap_or("USDT");
+        let (base_asset, quote_asset) = split_pair_symbols(pair).map_err(|error| {
+            crate::exchange::errors::ExchangeError::InvalidSymbol(error.to_string())
+        })?;
         let quote_needed = size * dex_price;
 
         let inventory_ok = match direction.as_deref() {

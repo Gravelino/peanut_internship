@@ -1,0 +1,13 @@
+{
+  "LINK/ETH": {
+    "base": "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4",
+    "base_decimals": 18,
+    "quote": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    "quote_decimals": 18,
+    "pool": "0x91308bC9Ce8Ca2db82aA30C65619856cC939d907",
+    "pool_type": "v3",
+    "fee": 500,
+    "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+    "quoter_type": "quoter_v2"
+  }
+}

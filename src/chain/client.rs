@@ -16,6 +16,8 @@ use tracing::{debug, info, instrument, warn};
 /// Minimum interval between polling for transaction receipts.
 pub const MIN_POLL_INTERVAL: f64 = 0.1;
 
+const RPC_RETRY_BASE_BACKOFF_MS: u64 = 100;
+
 /// A high-level client for interacting with the Ethereum blockchain.
 ///
 /// Supports multiple RPC endpoints with automatic failover and retries.
@@ -185,6 +187,22 @@ impl ChainClient {
         .map(|gas| gas.as_u64())
     }
 
+    pub async fn estimate_gas_from(
+        &self,
+        tx: &TransactionRequest,
+        from: &Address,
+    ) -> ChainResult<u64> {
+        let mut request = tx.to_ethers_typed();
+        request.set_from(from.as_eth_address());
+        let request = Arc::new(request);
+        self.with_provider(|provider| {
+            let request = Arc::clone(&request);
+            async move { provider.estimate_gas(&request, None).await }
+        })
+        .await
+        .map(|gas| gas.as_u64())
+    }
+
     /// Sends a raw signed transaction to the network.
     #[instrument(skip(self, signed_tx))]
     pub async fn send_transaction(&self, signed_tx: &[u8]) -> ChainResult<String> {
@@ -298,20 +316,37 @@ impl ChainClient {
                         retry,
                         "Retrying RPC operation"
                     );
-                    tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(retry as u32 - 1)))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(
+                        RPC_RETRY_BASE_BACKOFF_MS * 2u64.pow(retry as u32 - 1),
+                    ))
+                    .await;
                 }
                 let result = operation(Arc::clone(provider)).await;
                 match result {
                     Ok(value) => return Ok(value),
                     Err(error) => {
-                        warn!(
-                            url_idx,
-                            url = %self.rpc_urls.get(url_idx).map(String::as_str).unwrap_or("<unknown>"),
-                            retry,
-                            error = %error,
-                            "RPC operation failed"
-                        );
+                        let url = self
+                            .rpc_urls
+                            .get(url_idx)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        if retry == self.max_retries {
+                            warn!(
+                                url_idx,
+                                url = %url,
+                                attempts = self.max_retries + 1,
+                                error = %error,
+                                "RPC operation failed after retries"
+                            );
+                        } else {
+                            debug!(
+                                url_idx,
+                                url = %url,
+                                retry,
+                                error = %error,
+                                "RPC operation failed; retrying"
+                            );
+                        }
                         last_error = Some(error);
                     }
                 }

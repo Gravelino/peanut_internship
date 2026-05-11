@@ -6,6 +6,8 @@
 //! - **Wallet Management**: Encrypted keystore support and transaction signing.
 //! - **Serialization**: Deterministic canonical JSON serialization for signing.
 
+pub mod assets;
+pub mod format;
 pub mod serializer;
 pub mod types;
 pub mod wallet;
@@ -48,7 +50,7 @@ mod tests {
     fn token_amount_from_human_uses_integer_scaling() {
         let amount = TokenAmount::from_eth("1.5").unwrap();
         assert_eq!(amount.raw.to_string(), "1500000000000000000");
-        assert_eq!(amount.human(), Some(Decimal::new(15, 1)));
+        assert_eq!(amount.human().unwrap(), Decimal::new(15, 1));
     }
 
     #[test]

@@ -154,7 +154,10 @@ impl RebalanceExecutor {
             }
         }
 
-        let ob = match client.fetch_order_book(&trade.symbol, 20).await {
+        let ob = match client
+            .fetch_order_book(&trade.symbol, crate::core::types::DEFAULT_ORDERBOOK_DEPTH)
+            .await
+        {
             Ok(ob) => ob,
             Err(e) => {
                 warn!(error = %e, "Failed to fetch order book for slippage check");
@@ -384,7 +387,7 @@ impl RebalanceExecutor {
     /// Gets a rough price estimate from a cached/fresh order book.
     async fn estimate_price(&self, client: &ExchangeClient, symbol: &str) -> Option<Decimal> {
         client
-            .fetch_order_book(symbol, 5)
+            .fetch_order_book(symbol, crate::core::types::ESTIMATE_PRICE_DEPTH)
             .await
             .ok()
             .and_then(|ob| OrderBookAnalyzer::new(ob).orderbook().mid_price)
@@ -411,6 +414,7 @@ fn make_rejected_result(trade: &TradeStep) -> RebalanceResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::MAINNET_CHAIN_ID;
     use crate::inventory::types::WithdrawStep;
 
     #[test]
@@ -474,10 +478,10 @@ mod tests {
             }),
         ];
 
-        let tracker = Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(vec![
-            Venue::Binance,
-            Venue::Wallet,
-        ])));
+        let tracker = Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(
+            vec![Venue::Binance, Venue::Wallet],
+            MAINNET_CHAIN_ID,
+        )));
         let pnl = Arc::new(tokio::sync::Mutex::new(PnLEngine::new()));
         let executor =
             RebalanceExecutor::new(HashMap::new(), tracker, pnl, ExecutorConfig::default());
@@ -502,9 +506,10 @@ mod tests {
             max_slippage_bps: Decimal::from(50),
         };
 
-        let tracker = Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(vec![
-            Venue::Binance,
-        ])));
+        let tracker = Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(
+            vec![Venue::Binance],
+            MAINNET_CHAIN_ID,
+        )));
         let pnl = Arc::new(tokio::sync::Mutex::new(PnLEngine::new()));
         let config = ExecutorConfig {
             dry_run: true,
@@ -532,9 +537,10 @@ mod tests {
             max_slippage_bps: Decimal::from(50),
         };
 
-        let tracker = Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(vec![
-            Venue::Binance,
-        ])));
+        let tracker = Arc::new(tokio::sync::Mutex::new(InventoryTracker::new(
+            vec![Venue::Binance],
+            MAINNET_CHAIN_ID,
+        )));
         let pnl = Arc::new(tokio::sync::Mutex::new(PnLEngine::new()));
         let executor = RebalanceExecutor::new(
             HashMap::new(),

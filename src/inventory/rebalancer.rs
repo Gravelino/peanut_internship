@@ -326,6 +326,14 @@ impl RebalancePlanner {
 
                 let mut consumed = false;
                 if surplus_venue.is_cex() && deficit_venue.is_cex() {
+                    if asset.eq_ignore_ascii_case(quote_asset) {
+                        warn!(
+                            asset,
+                            quote_asset,
+                            "Skipping CEX-to-CEX rebalance trade where asset equals quote asset"
+                        );
+                        continue;
+                    }
                     let symbol = format!("{asset}{quote_asset}");
                     steps.push(RebalanceStep::Trade(TradeStep {
                         venue: *surplus_venue,
@@ -365,8 +373,15 @@ impl RebalancePlanner {
                         consumed = true;
                     }
                 } else if !surplus_venue.is_cex() && deficit_venue.is_cex() {
-                    let withdrawal_fee =
-                        fee_info.map(|f| f.withdrawal_fee).unwrap_or(Decimal::ZERO);
+                    let withdrawal_fee = fee_info.map(|f| f.withdrawal_fee).unwrap_or_else(|| {
+                        warn!(
+                            asset,
+                            from = %surplus_venue,
+                            to = %deficit_venue,
+                            "No withdrawal fee info for wallet-to-CEX rebalance, assuming zero"
+                        );
+                        Decimal::ZERO
+                    });
                     if amount > withdrawal_fee {
                         steps.push(RebalanceStep::Withdraw(WithdrawStep {
                             from_venue: *surplus_venue,
@@ -427,11 +442,13 @@ impl RebalancePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::MAINNET_CHAIN_ID;
     use crate::exchange::types::NormalizedBalance;
     use crate::inventory::tracker::InventoryTracker;
 
     fn setup_imbalanced() -> RebalancePlanner {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
@@ -471,7 +488,8 @@ mod tests {
 
     #[test]
     fn test_check_passes_balanced_asset() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
             "USDT".into(),
@@ -528,7 +546,8 @@ mod tests {
 
     #[test]
     fn test_plan_empty_when_balanced() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
             "ETH".into(),
@@ -573,7 +592,8 @@ mod tests {
 
     #[test]
     fn test_plan_empty_when_total_zero() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
             "ETH".into(),
@@ -623,7 +643,10 @@ mod tests {
 
     #[test]
     fn test_plan_distributes_surplus_across_multiple_deficits() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Bybit, Venue::Wallet]);
+        let mut tracker = InventoryTracker::new(
+            vec![Venue::Binance, Venue::Bybit, Venue::Wallet],
+            MAINNET_CHAIN_ID,
+        );
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
@@ -666,7 +689,8 @@ mod tests {
 
     #[test]
     fn test_plan_executable_wallet_to_cex_generates_withdraw() {
-        let mut tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
 
         let mut binance_bals = HashMap::new();
         binance_bals.insert(
@@ -688,5 +712,43 @@ mod tests {
         assert!(!steps.is_empty());
         assert!(matches!(steps[0], RebalanceStep::Withdraw(ref w)
             if w.from_venue == Venue::Wallet && w.to_venue == Venue::Binance));
+    }
+
+    #[test]
+    fn test_plan_executable_link_eth_cex_trade() {
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Bybit], MAINNET_CHAIN_ID);
+
+        let mut binance_bals = HashMap::new();
+        binance_bals.insert(
+            "LINK".into(),
+            NormalizedBalance {
+                free: Decimal::from(100),
+                locked: Decimal::ZERO,
+                total: Decimal::from(100),
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, binance_bals);
+
+        let mut bybit_bals = HashMap::new();
+        bybit_bals.insert(
+            "LINK".into(),
+            NormalizedBalance {
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+                total: Decimal::ZERO,
+            },
+        );
+        tracker.update_from_cex(Venue::Bybit, bybit_bals);
+
+        let planner = RebalancePlanner::new(tracker, 30.0);
+        let steps = planner.plan_executable("LINK", "ETH", Decimal::from(50));
+
+        assert!(matches!(steps[0], RebalanceStep::Trade(ref t)
+            if t.venue == Venue::Binance
+                && t.symbol == "LINKETH"
+                && t.base_asset == "LINK"
+                && t.quote_asset == "ETH"
+                && t.side == "SELL"));
     }
 }

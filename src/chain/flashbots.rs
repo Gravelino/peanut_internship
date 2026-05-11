@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::core::types::{
+    DEFAULT_FLASHBOTS_INCLUSION_TIMEOUT_SECS, DEFAULT_FLASHBOTS_MAX_BLOCKS_TO_TRY,
+    DEFAULT_FLASHBOTS_RELAY_URL, DEFAULT_FLASHBOTS_SIMULATION_TIMEOUT_SECS,
+    DEFAULT_FLASHBOTS_TARGET_BLOCK_OFFSET,
+};
 use crate::core::wallet::WalletManager;
 
 #[derive(Debug, Clone)]
@@ -17,11 +22,11 @@ pub struct FlashbotsConfig {
 impl Default for FlashbotsConfig {
     fn default() -> Self {
         Self {
-            relay_url: "https://relay.flashbots.net".to_string(),
-            target_block_offset: 1,
-            max_blocks_to_try: 3,
-            simulation_timeout_secs: 5,
-            inclusion_timeout_secs: 30,
+            relay_url: DEFAULT_FLASHBOTS_RELAY_URL.to_string(),
+            target_block_offset: DEFAULT_FLASHBOTS_TARGET_BLOCK_OFFSET,
+            max_blocks_to_try: DEFAULT_FLASHBOTS_MAX_BLOCKS_TO_TRY,
+            simulation_timeout_secs: DEFAULT_FLASHBOTS_SIMULATION_TIMEOUT_SECS,
+            inclusion_timeout_secs: DEFAULT_FLASHBOTS_INCLUSION_TIMEOUT_SECS,
         }
     }
 }

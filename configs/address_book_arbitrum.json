@@ -6,16 +6,18 @@
     "quote_decimals": 6,
     "pool": "0xC6962004f452bE9203591991D15f6b388e09E8D0",
     "pool_type": "v3",
+    "fee": 500,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   },
-  "ARB/USDC": {
+  "ARB/USDC_E": {
     "base": "0x912ce59144191c1204e64559fe8253a0e49e6548",
     "base_decimals": 18,
     "quote": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
     "quote_decimals": 6,
     "pool": "0xcda53b1f66614552f834ceef361a8d12a0b8dad8",
     "pool_type": "v3",
+    "fee": 500,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   },
@@ -26,6 +28,7 @@
     "quote_decimals": 18,
     "pool": "0xC6F780497A95e246EB9449f5e4770916DCd6396A",
     "pool_type": "v3",
+    "fee": 500,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   },
@@ -36,6 +39,7 @@
     "quote_decimals": 18,
     "pool": "0x80a9ae39310abf666a87c743d6ebbd0e8c42158e",
     "pool_type": "v3",
+    "fee": 10000,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   },
@@ -46,6 +50,7 @@
     "quote_decimals": 18,
     "pool": "0x468b88941e7cc0b88c1869d68ab6b570bcef62ff",
     "pool_type": "v3",
+    "fee": 3000,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   },
@@ -56,6 +61,7 @@
     "quote_decimals": 18,
     "pool": "0xdbaeb7f0dfe3a0aafd798ccecb5b22e708f7852c",
     "pool_type": "v3",
+    "fee": 3000,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   },
@@ -66,6 +72,7 @@
     "quote_decimals": 18,
     "pool": "0x52f9d14bed8ce6536da063aaf274ae2747ef4853",
     "pool_type": "v3",
+    "fee": 3000,
     "quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     "quoter_type": "quoter_v2"
   }

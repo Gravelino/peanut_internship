@@ -13,8 +13,10 @@ pub mod reconcile;
 pub mod recovery;
 
 pub use dex_swapper::{
-    DexSwapper, DexSwapperConfig, FlashbotsSwapper, PairAddressBook, PairTokens, SwapResult,
-    SwapperError, UniswapV2Swapper,
+    CompositeDexSwapper, DexPoolKind, DexSwapper, DexSwapperConfig, FlashbotsSwapper,
+    PairAddressBook, PairTokens, SwapResult, SwapperError, UniswapV2Swapper, UniswapV3Swapper,
+    apply_slippage, build_allowance_calldata, build_approve_calldata, build_swap_calldata,
+    v3_swap_calldata_for_pair,
 };
 pub use reconcile::{
     ChainReceiptProvider, PendingReconcile, ReceiptProvider, ReconcileConfig, ReconcileError,

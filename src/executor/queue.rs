@@ -33,13 +33,23 @@ use rust_decimal::Decimal;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
+use crate::core::types::{DEFAULT_QUEUE_MAX_AGE_SECS, DEFAULT_QUEUE_MAX_SIZE, split_pair_symbols};
 use crate::executor::engine::{ExecutionContext, Executor};
+use crate::inventory::types::Venue;
 use crate::observability::metrics_handle;
+use crate::strategy::signal::Direction;
 use crate::strategy::signal::Signal;
 
 /// Receives completed executions from a [`QueueWorker`]. Downstream consumers
 /// typically update the scorer history + PnL ledger from this channel.
 pub type ExecutionSink = mpsc::UnboundedSender<ExecutionContext>;
+
+#[derive(Debug, Clone)]
+struct InventoryReservation {
+    venue: Venue,
+    asset: String,
+    amount: Decimal,
+}
 
 /// A signal annotated with ordering keys. Produced by the signal generator,
 /// consumed by [`QueueWorker`].
@@ -100,8 +110,8 @@ pub struct QueueConfig {
 impl Default for QueueConfig {
     fn default() -> Self {
         Self {
-            max_size: 256,
-            max_age: Duration::from_secs(30),
+            max_size: DEFAULT_QUEUE_MAX_SIZE,
+            max_age: Duration::from_secs(DEFAULT_QUEUE_MAX_AGE_SECS),
         }
     }
 }
@@ -220,6 +230,14 @@ impl SignalQueue {
     }
 }
 
+fn send_rejected_to_sink(sink: &Option<ExecutionSink>, signal: Signal, reason: String) {
+    if let Some(tx) = sink
+        && let Err(e) = tx.send(ExecutionContext::rejected(signal, reason))
+    {
+        warn!(error = %e, "completion sink closed; rejected execution context dropped");
+    }
+}
+
 /// Pulls from a [`SignalQueue`] and executes signals through [`Executor`],
 /// bounded by a concurrency cap.
 pub struct QueueWorker {
@@ -308,19 +326,45 @@ impl QueueWorker {
                 continue;
             };
 
+            let mut reservations: Vec<InventoryReservation> = Vec::new();
             // Attempt to lock inventory.
             if let Some(inv) = &self.inventory {
                 let mut tracker = inv.write().await;
-                let buy_venue = pending.signal.direction.buy_venue();
-                let sell_venue = pending.signal.direction.sell_venue();
-                let mut parts = pending.signal.pair.split('/');
-                let base = parts.next().unwrap();
-                let quote = parts.next().unwrap();
-
-                let buy_asset = quote;
-                let buy_amount = pending.signal.size * pending.signal.cex_price;
-                let sell_asset = base;
-                let sell_amount = pending.signal.size;
+                let (base, quote) = match split_pair_symbols(&pending.signal.pair) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        warn!(
+                            pair = %pending.signal.pair,
+                            error = %error,
+                            "invalid signal pair; dropping queued signal"
+                        );
+                        send_rejected_to_sink(
+                            &self.completion_sink,
+                            pending.signal.clone(),
+                            format!("invalid signal pair: {error}"),
+                        );
+                        continue;
+                    }
+                };
+                let (buy_venue, buy_asset, buy_amount, sell_venue, sell_asset, sell_amount) =
+                    match pending.signal.direction {
+                        Direction::BuyCexSellDex => (
+                            Venue::Binance,
+                            quote,
+                            pending.signal.size * pending.signal.cex_price,
+                            Venue::Wallet,
+                            base,
+                            pending.signal.size,
+                        ),
+                        Direction::BuyDexSellCex => (
+                            Venue::Wallet,
+                            quote,
+                            pending.signal.size * pending.signal.dex_price,
+                            Venue::Binance,
+                            base,
+                            pending.signal.size,
+                        ),
+                    };
 
                 let check = tracker.can_execute(
                     buy_venue,
@@ -336,18 +380,46 @@ impl QueueWorker {
                         reason = ?check.reason,
                         "Dropping popped signal due to insufficient inventory (locked by another execution)"
                     );
+                    send_rejected_to_sink(
+                        &self.completion_sink,
+                        pending.signal.clone(),
+                        format!(
+                            "insufficient inventory before execution: {}",
+                            check.reason.unwrap_or_else(|| "unknown".to_string())
+                        ),
+                    );
                     continue; // Skip executing this signal, lock failed
                 }
 
                 if let Err(e) = tracker.reserve(buy_venue, buy_asset, buy_amount) {
                     warn!(pair = %pending.signal.pair, error = %e, "Failed to reserve buy amount");
+                    send_rejected_to_sink(
+                        &self.completion_sink,
+                        pending.signal.clone(),
+                        format!("failed to reserve buy amount before execution: {e}"),
+                    );
                     continue;
                 }
+                reservations.push(InventoryReservation {
+                    venue: buy_venue,
+                    asset: buy_asset.to_string(),
+                    amount: buy_amount,
+                });
                 if let Err(e) = tracker.reserve(sell_venue, sell_asset, sell_amount) {
                     warn!(pair = %pending.signal.pair, error = %e, "Failed to reserve sell amount");
                     let _ = tracker.release(buy_venue, buy_asset, buy_amount);
+                    send_rejected_to_sink(
+                        &self.completion_sink,
+                        pending.signal.clone(),
+                        format!("failed to reserve sell amount before execution: {e}"),
+                    );
                     continue;
                 }
+                reservations.push(InventoryReservation {
+                    venue: sell_venue,
+                    asset: sell_asset.to_string(),
+                    amount: sell_amount,
+                });
             }
 
             // Acquire a concurrency slot (blocks when cap reached). Once a
@@ -357,6 +429,16 @@ impl QueueWorker {
             let permit = match self.semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => {
+                    if let Some(inv) = &self.inventory {
+                        let mut tracker = inv.write().await;
+                        for reservation in &reservations {
+                            let _ = tracker.release(
+                                reservation.venue,
+                                &reservation.asset,
+                                reservation.amount,
+                            );
+                        }
+                    }
                     warn!("semaphore closed; stopping worker");
                     return;
                 }
@@ -364,9 +446,20 @@ impl QueueWorker {
 
             let executor = Arc::clone(&self.executor);
             let sink = self.completion_sink.clone();
+            let inventory = self.inventory.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for duration of the execution
                 let ctx: ExecutionContext = executor.execute(pending.signal).await;
+                if let Some(inv) = inventory {
+                    let mut tracker = inv.write().await;
+                    for reservation in reservations {
+                        let _ = tracker.release(
+                            reservation.venue,
+                            &reservation.asset,
+                            reservation.amount,
+                        );
+                    }
+                }
                 if let Some(tx) = sink
                     && let Err(e) = tx.send(ctx)
                 {
@@ -394,7 +487,10 @@ impl QueueWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::engine::{ExecutorConfig, SimulatedLegs};
+    use crate::core::types::MAINNET_CHAIN_ID;
+    use crate::exchange::types::NormalizedBalance;
+    use crate::executor::engine::{ExecutorConfig, ExecutorState, SimulatedLegs};
+    use crate::inventory::tracker::InventoryTracker;
     use crate::strategy::signal::{Direction, SignalParams};
 
     fn mk_signal(score: Decimal, pair: &str) -> Signal {
@@ -405,6 +501,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(100),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(5),
             expected_net_pnl: Decimal::from(15),
@@ -424,6 +521,7 @@ mod tests {
             dex_price: Decimal::from(2020),
             spread_bps: Decimal::from(100),
             size: Decimal::ONE,
+            notional_usd: Decimal::from(2000),
             expected_gross_pnl: Decimal::from(20),
             expected_fees: Decimal::from(5),
             expected_net_pnl: Decimal::from(15),
@@ -596,5 +694,114 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(q.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn worker_inventory_reservations_block_overlap_and_release_after_execution() {
+        let q = SignalQueue::new(QueueConfig::default());
+        q.push(mk_signal(Decimal::from(90), "ETH/USDT")).await;
+        q.push(mk_signal(Decimal::from(80), "ETH/USDT")).await;
+
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
+        tracker.update_from_cex(
+            Venue::Binance,
+            std::collections::HashMap::from([(
+                "USDT".to_string(),
+                NormalizedBalance {
+                    free: Decimal::from(2000),
+                    locked: Decimal::ZERO,
+                    total: Decimal::from(2000),
+                },
+            )]),
+        );
+        tracker.update_from_wallet(
+            Venue::Wallet,
+            std::collections::HashMap::from([("ETH".to_string(), Decimal::ONE)]),
+        );
+        let inventory = Arc::new(tokio::sync::RwLock::new(tracker));
+
+        let executor = Arc::new(Executor::new(
+            Arc::new(SimulatedLegs {
+                cex_latency: Duration::from_millis(80),
+                dex_latency: Duration::from_millis(80),
+                ..Default::default()
+            }),
+            ExecutorConfig {
+                use_flashbots: false,
+                leg1_timeout: Duration::from_secs(2),
+                leg2_timeout: Duration::from_secs(2),
+                ..ExecutorConfig::default()
+            },
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = QueueWorker::new(q.clone(), executor, 2, Duration::from_millis(10))
+            .with_sink(tx)
+            .with_inventory(Arc::clone(&inventory));
+        let handle = tokio::spawn(async move { worker.run().await });
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let states = [first.state, second.state];
+        assert!(states.iter().any(|state| state.is_filled()));
+        assert!(states.contains(&ExecutorState::Rejected));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(q.len().await, 0);
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .get_available(Venue::Binance, "USDT")
+                .unwrap(),
+            Decimal::from(2000)
+        );
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .get_available(Venue::Wallet, "ETH")
+                .unwrap(),
+            Decimal::ONE
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_sends_rejected_completion_when_inventory_preflight_drops_signal() {
+        let q = SignalQueue::new(QueueConfig::default());
+        q.push(mk_signal(Decimal::from(90), "ETH/USDT")).await;
+
+        let tracker = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
+        let inventory = Arc::new(tokio::sync::RwLock::new(tracker));
+        let executor = Arc::new(Executor::new(
+            Arc::new(SimulatedLegs::default()),
+            ExecutorConfig::default(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = QueueWorker::new(q.clone(), executor, 1, Duration::from_millis(10))
+            .with_sink(tx)
+            .with_inventory(Arc::clone(&inventory));
+        let handle = tokio::spawn(async move { worker.run().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.state, crate::executor::engine::ExecutorState::Rejected);
+        assert!(
+            ctx.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("insufficient inventory")
+        );
+        assert_eq!(q.len().await, 0);
+        handle.abort();
     }
 }

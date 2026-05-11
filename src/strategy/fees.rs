@@ -5,7 +5,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::core::types::BPS_SCALE as BPS_U64;
+use crate::core::types::{
+    BPS_SCALE as BPS_U64, DEFAULT_CEX_FEE_BPS, DEFAULT_DEX_FEE_BPS, DEFAULT_GAS_COST_USD,
+};
 
 fn bps_scale() -> Decimal {
     Decimal::from(BPS_U64)
@@ -22,13 +24,22 @@ pub struct FeeStructure {
     pub gas_cost_usd: Decimal,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeBreakdown {
+    pub cex_fee_usd: Decimal,
+    pub dex_fee_usd: Decimal,
+    pub gas_fee_usd: Decimal,
+    pub total_fee_usd: Decimal,
+    pub total_fee_bps: Decimal,
+}
+
 impl Default for FeeStructure {
-    /// Defaults: 10 / 30 bp and $5 gas.
+    /// Defaults from centralized types.
     fn default() -> Self {
         Self {
-            cex_taker_bps: Decimal::from(10),
-            dex_swap_bps: Decimal::from(30),
-            gas_cost_usd: Decimal::from(5),
+            cex_taker_bps: Decimal::from(DEFAULT_CEX_FEE_BPS),
+            dex_swap_bps: Decimal::from(DEFAULT_DEX_FEE_BPS),
+            gas_cost_usd: Decimal::from(DEFAULT_GAS_COST_USD),
         }
     }
 }
@@ -45,6 +56,30 @@ impl FeeStructure {
         self.cex_taker_bps + self.dex_swap_bps + gas_bps
     }
 
+    pub fn breakdown(&self, trade_value_usd: Decimal) -> FeeBreakdown {
+        if trade_value_usd <= Decimal::ZERO {
+            return FeeBreakdown {
+                cex_fee_usd: Decimal::ZERO,
+                dex_fee_usd: Decimal::ZERO,
+                gas_fee_usd: self.gas_cost_usd,
+                total_fee_usd: self.gas_cost_usd,
+                total_fee_bps: Decimal::MAX,
+            };
+        }
+        let bps = bps_scale();
+        let cex_fee_usd = self.cex_taker_bps / bps * trade_value_usd;
+        let dex_fee_usd = self.dex_swap_bps / bps * trade_value_usd;
+        let gas_fee_usd = self.gas_cost_usd;
+        let total_fee_usd = cex_fee_usd + dex_fee_usd + gas_fee_usd;
+        FeeBreakdown {
+            cex_fee_usd,
+            dex_fee_usd,
+            gas_fee_usd,
+            total_fee_usd,
+            total_fee_bps: total_fee_usd / trade_value_usd * bps,
+        }
+    }
+
     /// Minimum spread that covers all costs (alias for [`Self::total_fee_bps`]).
     pub fn breakeven_spread_bps(&self, trade_value_usd: Decimal) -> Decimal {
         self.total_fee_bps(trade_value_usd)
@@ -57,7 +92,7 @@ impl FeeStructure {
         }
         let bps = bps_scale();
         let gross = spread_bps / bps * trade_value_usd;
-        let fees = self.total_fee_bps(trade_value_usd) / bps * trade_value_usd;
+        let fees = self.breakdown(trade_value_usd).total_fee_usd;
         gross - fees
     }
 }

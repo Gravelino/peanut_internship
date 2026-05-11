@@ -18,6 +18,9 @@ use crate::strategy::errors::{StrategyError, StrategyResult};
 use crate::strategy::fees::FeeStructure;
 use crate::strategy::signal::{Direction, Signal, SignalParams};
 
+const SIGNIFICANT_SIZE_LOG_THRESHOLD_MANTISSA: i64 = 1;
+const SIGNIFICANT_SIZE_LOG_THRESHOLD_SCALE: u32 = 1;
+
 /// Best-of-book prices for both venues, normalised to quote-per-base.
 #[derive(Debug, Clone, Copy)]
 pub struct VenuePrices {
@@ -67,6 +70,12 @@ impl CexOrderBookSource for RestCexOrderBookSource {
     }
 }
 
+use crate::core::types::{
+    BPS_SCALE, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_POSITION_USD, DEFAULT_MIN_PROFIT_USD,
+    DEFAULT_MIN_SPREAD_BPS, DEFAULT_ORDERBOOK_DEPTH, DEFAULT_SIGNAL_TTL_SECS, ESTIMATE_PRICE_DEPTH,
+    split_pair_symbols as split_core_pair_symbols,
+};
+
 /// Tunables for the signal generator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorConfig {
@@ -85,11 +94,11 @@ pub struct GeneratorConfig {
 impl Default for GeneratorConfig {
     fn default() -> Self {
         Self {
-            min_spread_bps: Decimal::from(50),
-            min_profit_usd: Decimal::from(5),
-            max_position_usd: Decimal::from(10_000),
-            signal_ttl: Duration::from_secs(5),
-            cooldown: Duration::from_secs(2),
+            min_spread_bps: Decimal::from(DEFAULT_MIN_SPREAD_BPS),
+            min_profit_usd: Decimal::from(DEFAULT_MIN_PROFIT_USD),
+            max_position_usd: Decimal::from(DEFAULT_MAX_POSITION_USD),
+            signal_ttl: Duration::from_secs(DEFAULT_SIGNAL_TTL_SECS),
+            cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECS),
         }
     }
 }
@@ -112,6 +121,7 @@ pub struct MarketState {
     pub spread_buy_cex_bps: Decimal,
     pub spread_buy_dex_bps: Decimal,
     pub size: Decimal,
+    pub quote_usd_price: Decimal,
 }
 
 impl<P: PriceSource> SignalGenerator<P> {
@@ -136,6 +146,52 @@ impl<P: PriceSource> SignalGenerator<P> {
         &self.inventory
     }
 
+    pub fn set_fees(&mut self, fees: FeeStructure) {
+        self.fees = fees;
+    }
+
+    fn get_effective_balance(
+        &self,
+        inv: &InventoryTracker,
+        venue: Venue,
+        asset: &str,
+        missing_log: &str,
+    ) -> Decimal {
+        let mut total = Decimal::ZERO;
+        for eq in crate::core::assets::get_equivalent_assets(asset) {
+            total += inv.get_available(venue, &eq).unwrap_or_else(|| {
+                debug!(
+                    venue = %venue,
+                    requested_asset = asset,
+                    equivalent_asset = eq,
+                    "{missing_log}"
+                );
+                Decimal::ZERO
+            });
+        }
+        total
+    }
+
+    /// Returns the effective balance for an asset on the wallet, considering
+    /// common equivalencies (e.g., ETH <=> WETH, USDC <=> USDC.e).
+    fn get_effective_wallet_balance(&self, inv: &InventoryTracker, asset: &str) -> Decimal {
+        self.get_effective_balance(
+            inv,
+            Venue::Wallet,
+            asset,
+            "wallet inventory lookup missing; treating available balance as 0",
+        )
+    }
+
+    fn get_effective_cex_balance(&self, inv: &InventoryTracker, asset: &str) -> Decimal {
+        self.get_effective_balance(
+            inv,
+            Venue::Binance,
+            asset,
+            "cex inventory lookup missing; treating available balance as 0",
+        )
+    }
+
     /// Attempts to generate a fresh signal for `pair` at the given base-asset `size`.
     ///
     /// Returns `Ok(Some(signal))` when an opportunity exists.
@@ -154,14 +210,22 @@ impl<P: PriceSource> SignalGenerator<P> {
         let probe_size = Decimal::new(1, 3); // 0.001
         let probe_prices = match self.prices.fetch_prices(pair, probe_size).await {
             Ok(p) => p,
-            Err(_) => return Ok((None, None)),
+            Err(e) => {
+                warn!(
+                    pair,
+                    size = %probe_size,
+                    error = %e,
+                    "signal probe price fetch failed; skipping signal generation"
+                );
+                return Ok((None, None));
+            }
         };
         if probe_prices.cex_bid <= Decimal::ZERO || probe_prices.cex_ask <= Decimal::ZERO {
             return Err(StrategyError::EmptyOrderBook(pair.to_string()));
         }
 
         let mid_price = (probe_prices.cex_bid + probe_prices.cex_ask) / Decimal::TWO;
-        let bps = Decimal::from(10_000);
+        let bps = Decimal::from(BPS_SCALE);
         let spread_buy_cex =
             (probe_prices.dex_sell - probe_prices.cex_ask) / probe_prices.cex_ask * bps;
         let spread_buy_dex =
@@ -175,6 +239,7 @@ impl<P: PriceSource> SignalGenerator<P> {
             spread_buy_cex_bps: spread_buy_cex,
             spread_buy_dex_bps: spread_buy_dex,
             size: Decimal::ZERO,
+            quote_usd_price: Decimal::ONE,
         };
 
         let (base, quote) = split_pair(pair)?;
@@ -184,20 +249,26 @@ impl<P: PriceSource> SignalGenerator<P> {
             if quote == "USDC" || quote == "USDT" || quote == "USD" || quote == "DAI" {
                 Decimal::ONE
             } else {
-                // Attempt to fetch quote/USDC price for conversion (e.g. ETH/USDC)
-                let conv_pair = format!("{}/USDC", quote);
-                match self.prices.get_latest_price(&conv_pair).await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // Fallback for ETH if market data is missing
-                        if quote == "ETH" || quote == "WETH" {
-                            Decimal::from(3000)
-                        } else {
-                            Decimal::ONE
-                        }
-                    }
-                }
+                let conv_pair = if quote == "WETH" {
+                    "ETH/USDC".to_string()
+                } else {
+                    format!("{}/USDC", quote)
+                };
+                self.prices
+                    .get_latest_price(&conv_pair)
+                    .await
+                    .map_err(|e| {
+                        StrategyError::Pricing(format!(
+                            "missing USD conversion price for quote '{quote}' via {conv_pair}: {e}"
+                        ))
+                    })?
             };
+        if quote_usd_price <= Decimal::ZERO {
+            return Err(StrategyError::Pricing(format!(
+                "invalid USD conversion price for quote '{quote}': {quote_usd_price}"
+            )));
+        }
+        market_state.quote_usd_price = quote_usd_price;
 
         let price_in_usd = mid_price * quote_usd_price;
         let max_risk_size = if price_in_usd > Decimal::ZERO {
@@ -208,18 +279,10 @@ impl<P: PriceSource> SignalGenerator<P> {
 
         // 3. Read inventory to find theoretical maximums for both directions.
         let inv = self.inventory.read().await;
-        let base_wallet = inv
-            .get_available(Venue::Wallet, base)
-            .unwrap_or(Decimal::ZERO);
-        let base_cex = inv
-            .get_available(Venue::Binance, base)
-            .unwrap_or(Decimal::ZERO);
-        let quote_wallet = inv
-            .get_available(Venue::Wallet, quote)
-            .unwrap_or(Decimal::ZERO);
-        let quote_cex = inv
-            .get_available(Venue::Binance, quote)
-            .unwrap_or(Decimal::ZERO);
+        let base_wallet = self.get_effective_wallet_balance(&inv, base);
+        let base_cex = self.get_effective_cex_balance(&inv, base);
+        let quote_wallet = self.get_effective_wallet_balance(&inv, quote);
+        let quote_cex = self.get_effective_cex_balance(&inv, quote);
         drop(inv);
 
         let buffer = Decimal::new(101, 2); // 1.01
@@ -246,6 +309,13 @@ impl<P: PriceSource> SignalGenerator<P> {
 
         // Fallback to risk limit if inventory is zero or if no manual cap is set
         if max_size <= Decimal::ZERO {
+            warn!(
+                pair,
+                max_inventory_size = %max_inv_size,
+                max_risk_size = %max_risk_size,
+                cli_size = %_cli_size,
+                "sizing fell back to risk/CLI limit because inventory-derived size was zero"
+            );
             max_size = if _cli_size > Decimal::ZERO {
                 std::cmp::min(_cli_size, max_risk_size)
             } else {
@@ -275,13 +345,24 @@ impl<P: PriceSource> SignalGenerator<P> {
 
         for i in 1..=steps {
             let test_size = step_size * Decimal::from(i);
-            if let Ok(Some(signal)) = self.evaluate_size(pair, test_size).await
-                && signal.expected_net_pnl > best_pnl
-                && signal.inventory_ok
-                && signal.within_limits
-            {
-                best_pnl = signal.expected_net_pnl;
-                best_signal = Some(signal);
+            match self.evaluate_size(pair, test_size, quote_usd_price).await {
+                Ok(Some(signal))
+                    if signal.expected_net_pnl > best_pnl
+                        && signal.inventory_ok
+                        && signal.within_limits =>
+                {
+                    best_pnl = signal.expected_net_pnl;
+                    best_signal = Some(signal);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(
+                        pair,
+                        size = %test_size,
+                        error = %e,
+                        "size evaluation failed; skipping grid point"
+                    );
+                }
             }
         }
 
@@ -297,14 +378,23 @@ impl<P: PriceSource> SignalGenerator<P> {
     }
 
     /// Evaluates a specific trade size and returns the resulting signal if viable.
-    async fn evaluate_size(&self, pair: &str, size: Decimal) -> StrategyResult<Option<Signal>> {
+    async fn evaluate_size(
+        &self,
+        pair: &str,
+        size: Decimal,
+        quote_usd_price: Decimal,
+    ) -> StrategyResult<Option<Signal>> {
         let prices = self.prices.fetch_prices(pair, size).await?;
 
         if prices.cex_bid <= Decimal::ZERO || prices.cex_ask <= Decimal::ZERO {
             return Err(StrategyError::EmptyOrderBook(pair.to_string()));
         }
 
-        let bps = Decimal::from(10_000);
+        let significant_size_log_threshold = Decimal::new(
+            SIGNIFICANT_SIZE_LOG_THRESHOLD_MANTISSA,
+            SIGNIFICANT_SIZE_LOG_THRESHOLD_SCALE,
+        );
+        let bps = Decimal::from(BPS_SCALE);
         let spread_buy_cex_sell_dex = if prices.cex_ask > Decimal::ZERO {
             (prices.dex_sell - prices.cex_ask) / prices.cex_ask * bps
         } else {
@@ -336,7 +426,7 @@ impl<P: PriceSource> SignalGenerator<P> {
             )
         } else {
             // Only log if it's a significant size to avoid log spam during grid search
-            if size > Decimal::new(1, 1) {
+            if size > significant_size_log_threshold {
                 debug!(
                     pair,
                     cex_bid = %prices.cex_bid,
@@ -353,13 +443,13 @@ impl<P: PriceSource> SignalGenerator<P> {
             return Ok(None);
         };
 
-        let trade_value = size * cex_price;
+        let trade_value = size * cex_price * quote_usd_price;
         let gross_pnl = spread / bps * trade_value;
-        let fees_usd = self.fees.total_fee_bps(trade_value) / bps * trade_value;
+        let fees_usd = self.fees.breakdown(trade_value).total_fee_usd;
         let net_pnl = gross_pnl - fees_usd;
 
         if net_pnl < self.config.min_profit_usd {
-            if size > Decimal::new(1, 1) {
+            if size > significant_size_log_threshold {
                 debug!(
                     pair,
                     %spread,
@@ -387,11 +477,19 @@ impl<P: PriceSource> SignalGenerator<P> {
             dex_price,
             spread_bps: spread,
             size,
+            notional_usd: trade_value,
             expected_gross_pnl: gross_pnl,
             expected_fees: fees_usd,
             expected_net_pnl: net_pnl,
-            ttl: chrono::Duration::from_std(self.config.signal_ttl)
-                .unwrap_or_else(|_| chrono::Duration::seconds(5)),
+            ttl: chrono::Duration::from_std(self.config.signal_ttl).unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    configured_ttl_secs = self.config.signal_ttl.as_secs(),
+                    fallback_ttl_secs = DEFAULT_SIGNAL_TTL_SECS,
+                    "signal TTL conversion failed; using default TTL"
+                );
+                chrono::Duration::seconds(DEFAULT_SIGNAL_TTL_SECS as i64)
+            }),
             inventory_ok,
             within_limits,
         });
@@ -420,30 +518,22 @@ impl<P: PriceSource> SignalGenerator<P> {
         // Helper: log-and-default when a venue/asset pair is unknown to the
         // tracker. We treat "unknown" as "zero", but loudly so that missing
         // balance-sync regressions do not silently block execution.
-        let available = |venue: Venue, asset: &str| {
-            inv.get_available(venue, asset).unwrap_or_else(|| {
-                warn!(
-                    pair,
-                    %venue,
-                    asset,
-                    "inventory lookup missing; treating available balance as 0"
-                );
-                Decimal::ZERO
-            })
-        };
+        let available_wallet = |asset: &str| self.get_effective_wallet_balance(&inv, asset);
+
+        let available_cex = |asset: &str| self.get_effective_cex_balance(&inv, asset);
 
         let ok = match direction {
             Direction::BuyCexSellDex => {
                 let quote_needed = size * price * buffer;
-                let quote_have = available(Venue::Binance, quote);
-                let base_have = available(Venue::Wallet, base);
+                let quote_have = available_cex(quote);
+                let base_have = available_wallet(base);
                 quote_have >= quote_needed && base_have >= size
             }
             Direction::BuyDexSellCex => {
                 let quote_needed = size * price * buffer;
-                let base_have = available(Venue::Binance, base);
-                let quote_have = available(Venue::Wallet, quote);
-                base_have >= size && quote_have >= quote_needed
+                let quote_have = available_wallet(quote);
+                let base_have = available_cex(base);
+                quote_have >= quote_needed && base_have >= size
             }
         };
         Ok(ok)
@@ -452,17 +542,7 @@ impl<P: PriceSource> SignalGenerator<P> {
 
 /// Splits "BASE/QUOTE" into `(base, quote)`.
 pub fn split_pair(pair: &str) -> StrategyResult<(&str, &str)> {
-    let mut parts = pair.split('/');
-    let base = parts
-        .next()
-        .ok_or_else(|| StrategyError::InvalidPair(pair.to_string()))?;
-    let quote = parts
-        .next()
-        .ok_or_else(|| StrategyError::InvalidPair(pair.to_string()))?;
-    if base.is_empty() || quote.is_empty() || parts.next().is_some() {
-        return Err(StrategyError::InvalidPair(pair.to_string()));
-    }
-    Ok((base, quote))
+    split_core_pair_symbols(pair).map_err(|_| StrategyError::InvalidPair(pair.to_string()))
 }
 
 /// A [`PriceSource`] backed by a live [`ExchangeClient`] for CEX data and a
@@ -495,7 +575,10 @@ impl StubPriceSource {
 #[async_trait]
 impl PriceSource for StubPriceSource {
     async fn fetch_prices(&self, pair: &str, _size: Decimal) -> StrategyResult<VenuePrices> {
-        let ob = self.cex.fetch_order_book(pair, 20).await?;
+        let ob = self
+            .cex
+            .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
+            .await?;
         let cex_bid = ob
             .best_bid
             .map(|(p, _)| p)
@@ -515,7 +598,10 @@ impl PriceSource for StubPriceSource {
     }
 
     async fn get_latest_price(&self, pair: &str) -> StrategyResult<Decimal> {
-        let book = self.cex.fetch_order_book(pair, 5).await?;
+        let book = self
+            .cex
+            .fetch_order_book(pair, ESTIMATE_PRICE_DEPTH)
+            .await?;
         let bid = book
             .best_bid
             .map(|(p, _)| p)
@@ -532,6 +618,7 @@ impl PriceSource for StubPriceSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::MAINNET_CHAIN_ID;
 
     struct FixedPrices(VenuePrices);
 
@@ -553,7 +640,7 @@ mod tests {
     fn make_tracker() -> Arc<RwLock<InventoryTracker>> {
         use crate::exchange::types::NormalizedBalance;
         use std::collections::HashMap;
-        let mut t = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet]);
+        let mut t = InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
         let mut cex = HashMap::new();
         cex.insert(
             "USDT".into(),
@@ -649,6 +736,152 @@ mod tests {
         let mut g = make_gen(p);
         let (s, _) = g.generate("ETH/USDT", Decimal::ONE).await.unwrap();
         assert_eq!(s.expect("signal").direction, Direction::BuyDexSellCex);
+    }
+
+    #[tokio::test]
+    async fn eth_quoted_pair_uses_quote_usd_for_notional_and_risk() {
+        struct LinkEthPrices;
+
+        #[async_trait]
+        impl PriceSource for LinkEthPrices {
+            async fn fetch_prices(
+                &self,
+                _pair: &str,
+                _size: Decimal,
+            ) -> StrategyResult<VenuePrices> {
+                Ok(VenuePrices {
+                    cex_bid: d("0.0045"),
+                    cex_ask: d("0.0046"),
+                    dex_buy: d("0.0040"),
+                    dex_sell: d("0.0041"),
+                })
+            }
+
+            async fn get_latest_price(&self, pair: &str) -> StrategyResult<Decimal> {
+                if pair == "ETH/USDC" {
+                    Ok(Decimal::from(3000))
+                } else {
+                    Ok(Decimal::ONE)
+                }
+            }
+        }
+
+        use crate::exchange::types::NormalizedBalance;
+        use std::collections::HashMap;
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
+        let mut cex = HashMap::new();
+        cex.insert(
+            "LINK".into(),
+            NormalizedBalance {
+                free: Decimal::from(100),
+                locked: Decimal::ZERO,
+                total: Decimal::from(100),
+            },
+        );
+        let mut wallet = HashMap::new();
+        wallet.insert("ETH".into(), Decimal::ONE);
+        tracker.update_from_cex(Venue::Binance, cex);
+        tracker.update_from_wallet(Venue::Wallet, wallet);
+
+        let config = GeneratorConfig {
+            max_position_usd: Decimal::from(5),
+            min_profit_usd: Decimal::ZERO,
+            ..Default::default()
+        };
+        let fees = FeeStructure {
+            cex_taker_bps: Decimal::from(10),
+            dex_swap_bps: Decimal::ZERO,
+            gas_cost_usd: Decimal::ZERO,
+        };
+        let mut generator = SignalGenerator::new(
+            Arc::new(LinkEthPrices),
+            Arc::new(RwLock::new(tracker)),
+            fees,
+            config,
+        );
+
+        let (signal, market) = generator
+            .generate("LINK/ETH", Decimal::from(10))
+            .await
+            .unwrap();
+        let signal = signal.expect("signal");
+        let market = market.expect("market");
+        assert_eq!(market.quote_usd_price, Decimal::from(3000));
+        assert!(signal.notional_usd <= Decimal::from(5));
+        assert!(signal.notional_usd > Decimal::from(4));
+        assert!(signal.size * signal.cex_price < Decimal::new(1, 2));
+    }
+
+    #[test]
+    fn cex_effective_balance_counts_weth_when_eth_requested() {
+        use crate::exchange::types::NormalizedBalance;
+        use std::collections::HashMap;
+
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], MAINNET_CHAIN_ID);
+        let mut cex = HashMap::new();
+        cex.insert(
+            "WETH".into(),
+            NormalizedBalance {
+                free: d("0.05"),
+                locked: Decimal::ZERO,
+                total: d("0.05"),
+            },
+        );
+        tracker.update_from_cex(Venue::Binance, cex);
+
+        let generator = make_gen(VenuePrices {
+            cex_bid: d("0.0045"),
+            cex_ask: d("0.0046"),
+            dex_buy: d("0.0040"),
+            dex_sell: d("0.0041"),
+        });
+
+        assert_eq!(
+            generator.get_effective_cex_balance(&tracker, "ETH"),
+            d("0.05")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_usd_quote_requires_explicit_conversion_price() {
+        struct MissingConversionPrices;
+
+        #[async_trait]
+        impl PriceSource for MissingConversionPrices {
+            async fn fetch_prices(
+                &self,
+                _pair: &str,
+                _size: Decimal,
+            ) -> StrategyResult<VenuePrices> {
+                Ok(VenuePrices {
+                    cex_bid: d("0.0045"),
+                    cex_ask: d("0.0046"),
+                    dex_buy: d("0.0040"),
+                    dex_sell: d("0.0041"),
+                })
+            }
+
+            async fn get_latest_price(&self, pair: &str) -> StrategyResult<Decimal> {
+                Err(StrategyError::Pricing(format!("no price for {pair}")))
+            }
+        }
+
+        let mut generator = SignalGenerator::new(
+            Arc::new(MissingConversionPrices),
+            make_tracker(),
+            FeeStructure::default(),
+            GeneratorConfig::default(),
+        );
+
+        let err = generator
+            .generate("LINK/ETH", Decimal::ONE)
+            .await
+            .expect_err("missing ETH/USDC conversion must fail fast")
+            .to_string();
+        assert!(err.contains("missing USD conversion price"));
+        assert!(err.contains("ETH/USDC"));
     }
 
     #[test]

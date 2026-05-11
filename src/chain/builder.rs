@@ -21,6 +21,7 @@ pub struct SignedTransaction {
     pub raw: Vec<u8>,
     pub raw_hex: String,
     pub tx_hash: String,
+    pub nonce: Option<u64>,
 }
 
 /// A fluent builder for creating and sending Ethereum transactions.
@@ -108,7 +109,12 @@ impl TransactionBuilder {
     /// [`DEFAULT_GAS_BUFFER_BPS`] is applied (12_000 bps = 1.2×).
     pub async fn with_gas_estimate(mut self, buffer_bps: Option<u64>) -> ChainResult<Self> {
         let request = self.build_partial_request(self.nonce)?;
-        let estimated = self.client.estimate_gas(&request).await?;
+        let wallet_address =
+            Address::new(self.wallet.address()).map_err(|_| ChainError::InvalidWalletAddress)?;
+        let estimated = self
+            .client
+            .estimate_gas_from(&request, &wallet_address)
+            .await?;
         let multiplier_bps = buffer_bps
             .filter(|&b| b >= MIN_GAS_ESTIMATE_BUFFER_BPS)
             .unwrap_or(DEFAULT_GAS_BUFFER_BPS);
@@ -160,12 +166,19 @@ impl TransactionBuilder {
     }
 
     pub async fn build_and_sign_with_hash(self) -> ChainResult<SignedTransaction> {
-        let raw = self.build_and_sign().await?;
+        let wallet = self.wallet.clone();
+        let request = self.build().await?;
+        let nonce = request.nonce;
+        let raw = wallet
+            .sign_transaction_bytes(&request)
+            .await
+            .map_err(|e| ChainError::SignTransactionFailed(e.to_string()))?;
         let hash = ethers::utils::keccak256(&raw);
         Ok(SignedTransaction {
             raw_hex: format!("0x{}", hex::encode(&raw)),
             tx_hash: format!("0x{}", hex::encode(hash)),
             raw,
+            nonce,
         })
     }
 

@@ -210,6 +210,16 @@ mod tests {
                 fee_asset: "USDT".to_string(),
             },
             gas_cost_usd: Decimal::ZERO,
+            expected_gross_pnl_usd: net_pnl,
+            expected_fees_usd: Decimal::ZERO,
+            expected_net_pnl_usd: net_pnl,
+            actual_gross_pnl_usd: net_pnl,
+            actual_fees_usd: Decimal::ZERO,
+            actual_cex_fee_usd: Decimal::ZERO,
+            actual_onchain_gas_fee_usd: Decimal::ZERO,
+            actual_net_pnl_usd: net_pnl,
+            onchain_gas_used: None,
+            onchain_gas_fee_wei: None,
         }
     }
 

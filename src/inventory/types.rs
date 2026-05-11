@@ -2,7 +2,11 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::core::types::{DEFAULT_TRANSFER_TIME_MIN, ETH_CONFIRMATIONS};
+use crate::core::types::{
+    DEFAULT_MAX_SINGLE_TRADE_USD, DEFAULT_MAX_SLIPPAGE_BPS, DEFAULT_MIN_FILL_PCT,
+    DEFAULT_ORDER_POLL_INTERVAL_MS, DEFAULT_ORDER_POLL_MAX_ATTEMPTS, DEFAULT_TRANSFER_TIME_MIN,
+    ETH_CONFIRMATIONS,
+};
 
 /// A trading venue that holds asset balances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -207,11 +211,11 @@ pub struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
-            max_slippage_bps: Decimal::from(50),
-            max_single_trade_usd: Decimal::from(1000),
-            min_fill_pct: 0.8,
-            order_poll_interval_ms: 500,
-            order_poll_max_attempts: 10,
+            max_slippage_bps: Decimal::from(DEFAULT_MAX_SLIPPAGE_BPS),
+            max_single_trade_usd: Decimal::from(DEFAULT_MAX_SINGLE_TRADE_USD),
+            min_fill_pct: DEFAULT_MIN_FILL_PCT,
+            order_poll_interval_ms: DEFAULT_ORDER_POLL_INTERVAL_MS,
+            order_poll_max_attempts: DEFAULT_ORDER_POLL_MAX_ATTEMPTS,
             dry_run: false,
         }
     }
@@ -221,15 +225,14 @@ impl Default for ExecutorConfig {
 /// Sources: https://www.binance.com/en/fee/cryptoFee
 pub fn transfer_fees() -> HashMap<String, TransferFeeInfo> {
     let mut fees = HashMap::new();
-    fees.insert(
-        "ETH".into(),
-        TransferFeeInfo {
-            withdrawal_fee: Decimal::from_str_exact("0.005").expect("valid withdrawal_fee literal"),
-            min_withdrawal: Decimal::from_str_exact("0.01").expect("valid min_withdrawal literal"),
-            confirmations: ETH_CONFIRMATIONS,
-            estimated_time_min: DEFAULT_TRANSFER_TIME_MIN,
-        },
-    );
+    let eth_fee = TransferFeeInfo {
+        withdrawal_fee: Decimal::from_str_exact("0.005").expect("valid withdrawal_fee literal"),
+        min_withdrawal: Decimal::from_str_exact("0.01").expect("valid min_withdrawal literal"),
+        confirmations: ETH_CONFIRMATIONS,
+        estimated_time_min: DEFAULT_TRANSFER_TIME_MIN,
+    };
+    fees.insert("ETH".into(), eth_fee.clone());
+    fees.insert("WETH".into(), eth_fee);
     fees.insert(
         "USDT".into(),
         TransferFeeInfo {
@@ -244,6 +247,15 @@ pub fn transfer_fees() -> HashMap<String, TransferFeeInfo> {
         TransferFeeInfo {
             withdrawal_fee: Decimal::from_str_exact("1.0").expect("valid withdrawal_fee literal"),
             min_withdrawal: Decimal::from_str_exact("10.0").expect("valid min_withdrawal literal"),
+            confirmations: ETH_CONFIRMATIONS,
+            estimated_time_min: DEFAULT_TRANSFER_TIME_MIN,
+        },
+    );
+    fees.insert(
+        "LINK".into(),
+        TransferFeeInfo {
+            withdrawal_fee: Decimal::from_str_exact("0.2").expect("valid withdrawal_fee literal"),
+            min_withdrawal: Decimal::from_str_exact("1.0").expect("valid min_withdrawal literal"),
             confirmations: ETH_CONFIRMATIONS,
             estimated_time_min: DEFAULT_TRANSFER_TIME_MIN,
         },
@@ -260,12 +272,20 @@ pub fn min_operating_balance() -> HashMap<String, Decimal> {
         Decimal::from_str_exact("0.5").expect("valid min_balance literal"), // enough for 1 arb leg
     );
     balances.insert(
+        "WETH".into(),
+        Decimal::from_str_exact("0.5").expect("valid min_balance literal"),
+    );
+    balances.insert(
         "USDT".into(),
         Decimal::from_str_exact("500").expect("valid min_balance literal"), // ~0.25 ETH worth
     );
     balances.insert(
         "USDC".into(),
         Decimal::from_str_exact("500").expect("valid min_balance literal"),
+    );
+    balances.insert(
+        "LINK".into(),
+        Decimal::from_str_exact("5").expect("valid min_balance literal"),
     );
     balances
 }

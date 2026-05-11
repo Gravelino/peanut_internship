@@ -1,7 +1,7 @@
 use ethers::types::U256;
 use peanut_internship_rust::{
-    Address, ArbDetector, ChainClient, MempoolMonitor, ParsedSwap, PricingEngine, Token,
-    UniswapV2Pair, UniswapV3Pool, WEI_PER_GWEI,
+    Address, ArbDetector, ChainClient, DEFAULT_ARB_GAS_UNITS, MempoolMonitor, ParsedSwap,
+    PricingEngine, Token, UniswapV2Pair, UniswapV3Pool, WEI_PER_GWEI,
 };
 use std::env;
 
@@ -167,7 +167,7 @@ fn demo_local_arb() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let gas_cost = 250_000u128 * 20 * WEI_PER_GWEI;
+    let gas_cost = u128::from(DEFAULT_ARB_GAS_UNITS) * 20 * WEI_PER_GWEI;
     let detector_20gwei = ArbDetector::new(vec![v2_pool], vec![v3_pool], 20);
     let opps_gas = detector_20gwei.detect_from_swap(&swap);
     if opps_gas.is_empty() {

@@ -35,10 +35,11 @@ pub use price_oracle::{AggregatedPrice, PriceOracle, PriceSource};
 pub use rate_limiter::{ApiQuota, LimitInterval, LimitKey, LimitType, RateLimiter};
 pub use traits::{ExchangeAdapter, ExchangeConfig};
 pub use types::{
-    CanExecuteResult, FeeStructure, FillLevel, MyTrade, NormalizedBalance, OrderBookSnapshot,
-    OrderResult, PortfolioSnapshot, SkewResult, VenueSkew, WalkResult,
+    CanExecuteResult, CapitalCoinConfig, CapitalNetworkConfig, DepositRecord, FeeStructure,
+    FillLevel, MyTrade, NormalizedBalance, OrderBookSnapshot, OrderResult, PortfolioSnapshot,
+    SkewResult, VenueSkew, WalkResult, WithdrawalRecord,
 };
 pub use ws::{
     BookTickerEvent, DepthEvent, DepthSnapshot, DepthUpdate, LocalOrderBook, SequenceStatus,
-    subscribe_book_ticker_stream,
+    subscribe_book_ticker_stream, subscribe_depth_stream,
 };
