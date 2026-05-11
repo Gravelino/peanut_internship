@@ -178,3 +178,62 @@ pub struct MyTrade {
     /// Unix-millisecond timestamp of the fill.
     pub timestamp: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapitalNetworkConfig {
+    pub network: String,
+    pub name: Option<String>,
+    pub withdraw_enable: bool,
+    pub deposit_enable: bool,
+    pub withdraw_fee: Decimal,
+    pub withdraw_min: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapitalCoinConfig {
+    pub coin: String,
+    pub name: Option<String>,
+    pub networks: Vec<CapitalNetworkConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WithdrawalRecord {
+    pub id: String,
+    pub coin: String,
+    pub amount: Decimal,
+    pub network: Option<String>,
+    pub address: Option<String>,
+    pub tx_id: Option<String>,
+    pub status: i64,
+}
+
+impl WithdrawalRecord {
+    pub fn completed(&self) -> bool {
+        self.status == 6
+    }
+
+    pub fn failed(&self) -> bool {
+        matches!(self.status, 1 | 3 | 5)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DepositRecord {
+    pub id: String,
+    pub coin: String,
+    pub amount: Decimal,
+    pub network: Option<String>,
+    pub address: Option<String>,
+    pub tx_id: Option<String>,
+    pub status: i64,
+}
+
+impl DepositRecord {
+    pub fn credited(&self) -> bool {
+        matches!(self.status, 1 | 6)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.status == 2
+    }
+}

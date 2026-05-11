@@ -1,3 +1,4 @@
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -93,6 +94,9 @@ pub trait ExchangeAdapter: Send + Sync {
         symbol: &str,
         limit: u32,
     ) -> impl Future<Output = ExchangeResult<Vec<MyTrade>>> + Send;
+
+    /// Fetches the current price for a symbol.
+    fn fetch_price(&self, symbol: &str) -> impl Future<Output = ExchangeResult<Decimal>> + Send;
 
     /// Returns the exchange configuration.
     fn config(&self) -> &ExchangeConfig;

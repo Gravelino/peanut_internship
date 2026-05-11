@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use sha2::Sha256;
 use tracing::{debug, info, warn};
 
+use crate::core::types::{BPS_SCALE, split_pair_symbols};
 use crate::exchange::bybit_config::BybitConfig;
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
 use crate::exchange::http_client::{HttpClient, RetryConfig};
@@ -225,7 +226,7 @@ impl ExchangeAdapter for BybitAdapter {
                 let bps = if mid.is_zero() {
                     None
                 } else {
-                    Some(spread / mid * Decimal::from(10000))
+                    Some(spread / mid * Decimal::from(BPS_SCALE))
                 };
                 (Some(mid), bps)
             }
@@ -430,10 +431,12 @@ impl ExchangeAdapter for BybitAdapter {
     }
 
     async fn get_trading_fees(&self, symbol: &str) -> ExchangeResult<FeeStructure> {
+        let (base, _) = split_pair_symbols(symbol)
+            .map_err(|error| ExchangeError::InvalidSymbol(error.to_string()))?;
         let query = format!(
             "category=spot&symbol={}&baseCoin={}",
             symbol.replace('/', ""),
-            symbol.split('/').next().unwrap_or("ETH"),
+            base,
         );
         let resp = self.signed_get("/v5/account/fee-rate", &query).await?;
 
@@ -495,6 +498,23 @@ impl ExchangeAdapter for BybitAdapter {
         }
 
         Ok(trades)
+    }
+
+    async fn fetch_price(&self, symbol: &str) -> ExchangeResult<Decimal> {
+        let url = format!(
+            "{}/v5/market/tickers?category=spot&symbol={}",
+            self.config.base_url,
+            symbol.replace('/', "")
+        );
+        let resp: serde_json::Value = self.http.get(&url, None, 1).await?.json().await?;
+        self.check_api_error(&resp)?;
+
+        let ticker = &resp["result"]["list"]
+            .as_array()
+            .and_then(|a| a.first())
+            .ok_or_else(|| ExchangeError::DecimalParse("missing ticker in response".into()))?;
+
+        Self::parse_decimal(&ticker["lastPrice"])
     }
 
     fn config(&self) -> &ExchangeConfig {

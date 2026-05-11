@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::core::types::ESTIMATED_SPREAD_BPS;
+use crate::core::types::{ESTIMATED_SPREAD_BPS, split_pair_symbols};
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
 use crate::exchange::http_client::{HttpClient, RetryConfig};
 use crate::exchange::rate_limiter::RateLimiter;
@@ -89,7 +89,8 @@ impl PriceOracle {
         pair: &str,
         orderbook_mid: Option<Decimal>,
     ) -> ExchangeResult<AggregatedPrice> {
-        let base_asset = pair.split('/').next().unwrap_or("ETH");
+        let (base_asset, _) = split_pair_symbols(pair)
+            .map_err(|error| ExchangeError::InvalidSymbol(error.to_string()))?;
         let mut sources: Vec<PriceSource> = Vec::new();
 
         if let Ok(price) = self.fetch_binance_ticker(pair).await {

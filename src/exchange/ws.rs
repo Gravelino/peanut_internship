@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::core::types::BPS_SCALE;
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
 use crate::exchange::types::OrderBookSnapshot;
 
@@ -224,7 +225,7 @@ impl LocalOrderBook {
                 let bps = if mid.is_zero() {
                     None
                 } else {
-                    Some(spread / mid * Decimal::from(10000))
+                    Some(spread / mid * Decimal::from(BPS_SCALE))
                 };
                 (Some(mid), bps)
             }

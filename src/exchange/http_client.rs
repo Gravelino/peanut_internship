@@ -206,6 +206,22 @@ impl HttpClient {
         request: reqwest::RequestBuilder,
         weight: u32,
     ) -> ExchangeResult<reqwest::Response> {
+        self.send_tracked_fresh(weight, || {
+            request
+                .try_clone()
+                .ok_or_else(|| ExchangeError::Network("non-retryable request body".into()))
+        })
+        .await
+    }
+
+    pub async fn send_tracked_fresh<F>(
+        &self,
+        weight: u32,
+        mut build_request: F,
+    ) -> ExchangeResult<reqwest::Response>
+    where
+        F: FnMut() -> ExchangeResult<reqwest::RequestBuilder>,
+    {
         let _permit = self
             .concurrency
             .acquire()
@@ -221,11 +237,7 @@ impl HttpClient {
                 self.check_rate_limit(weight).await;
             }
 
-            let cloned = request
-                .try_clone()
-                .ok_or_else(|| ExchangeError::Network("non-retryable request body".into()))?;
-
-            let result = cloned.send().await;
+            let result = build_request()?.send().await;
 
             match result {
                 Ok(response) => {

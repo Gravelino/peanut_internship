@@ -11,7 +11,7 @@ use crate::core::types::{
     BINANCE_ERR_RATE_LIMIT, BINANCE_WEIGHT_ACCOUNT, BINANCE_WEIGHT_DEPTH_100,
     BINANCE_WEIGHT_DEPTH_500, BINANCE_WEIGHT_DEPTH_1000, BINANCE_WEIGHT_DEPTH_5000,
     BINANCE_WEIGHT_EXCHANGE_INFO, BINANCE_WEIGHT_MY_TRADES, BINANCE_WEIGHT_ORDER,
-    BINANCE_WEIGHT_ORDER_STATUS, BINANCE_WEIGHT_SERVER_TIME, BINANCE_WEIGHT_TRADE_FEE,
+    BINANCE_WEIGHT_ORDER_STATUS, BINANCE_WEIGHT_SERVER_TIME, BINANCE_WEIGHT_TRADE_FEE, BPS_SCALE,
 };
 use crate::exchange::config::BinanceConfig;
 use crate::exchange::errors::{ExchangeError, ExchangeResult};
@@ -19,7 +19,8 @@ use crate::exchange::http_client::{HttpClient, RetryConfig};
 use crate::exchange::rate_limiter::{LimitInterval, LimitKey, LimitType};
 use crate::exchange::traits::ExchangeAdapter;
 use crate::exchange::types::{
-    FeeStructure, MyTrade, NormalizedBalance, OrderBookSnapshot, OrderResult,
+    CapitalCoinConfig, CapitalNetworkConfig, DepositRecord, FeeStructure, MyTrade,
+    NormalizedBalance, OrderBookSnapshot, OrderResult, WithdrawalRecord,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -239,6 +240,13 @@ impl ExchangeClient {
         }
     }
 
+    pub async fn fetch_price(&self, symbol: &str) -> ExchangeResult<Decimal> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_price(symbol).await,
+            ExchangeClientInner::Bybit(b) => b.fetch_price(symbol).await,
+        }
+    }
+
     pub async fn create_limit_gtc_order(
         &self,
         symbol: &str,
@@ -336,6 +344,40 @@ impl ExchangeClient {
         }
     }
 
+    pub async fn fetch_capital_config(&self) -> ExchangeResult<Vec<CapitalCoinConfig>> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_capital_config().await,
+            ExchangeClientInner::Bybit(_) => Err(ExchangeError::Config(
+                "fetch_capital_config is only implemented for Binance".into(),
+            )),
+        }
+    }
+
+    pub async fn fetch_withdrawal_history(
+        &self,
+        asset: &str,
+    ) -> ExchangeResult<Vec<WithdrawalRecord>> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_withdrawal_history(asset).await,
+            ExchangeClientInner::Bybit(_) => Err(ExchangeError::Config(
+                "fetch_withdrawal_history is only implemented for Binance".into(),
+            )),
+        }
+    }
+
+    pub async fn fetch_deposit_history(
+        &self,
+        asset: &str,
+        tx_id: Option<&str>,
+    ) -> ExchangeResult<Vec<DepositRecord>> {
+        match &self.inner {
+            ExchangeClientInner::Binance(b) => b.fetch_deposit_history(asset, tx_id).await,
+            ExchangeClientInner::Bybit(_) => Err(ExchangeError::Config(
+                "fetch_deposit_history is only implemented for Binance".into(),
+            )),
+        }
+    }
+
     /// Returns a reference to the underlying Binance configuration.
     ///
     /// Panics if the client is not a Binance client.
@@ -354,6 +396,7 @@ impl ExchangeClient {
 struct BinanceClient {
     config: BinanceConfig,
     http: HttpClient,
+    filters_cache: tokio::sync::RwLock<HashMap<String, BinanceSymbolFilters>>,
 }
 
 impl BinanceClient {
@@ -361,7 +404,11 @@ impl BinanceClient {
     fn new(config: BinanceConfig) -> ExchangeResult<Self> {
         let http = HttpClient::new(RetryConfig::default(), config.enable_rate_limit)?;
 
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            filters_cache: tokio::sync::RwLock::new(HashMap::new()),
+        })
     }
 
     /// Sends a GET request and deserializes the JSON body.
@@ -374,21 +421,67 @@ impl BinanceClient {
         Ok(resp)
     }
 
-    /// Sends a POST request and deserializes the JSON body.
-    async fn post_json(&self, url: &str, weight: u32) -> ExchangeResult<serde_json::Value> {
+    async fn signed_get_json(
+        &self,
+        path: &str,
+        query: &str,
+        weight: u32,
+    ) -> ExchangeResult<serde_json::Value> {
         let response = self
             .http
-            .post(url, Some(&self.config.api_key), weight)
+            .send_tracked_fresh(weight, || {
+                let signed = self.sign_request(query)?;
+                let url = format!("{}{}?{}&{}", self.config.base_url, path, query, signed);
+                Ok(self
+                    .http
+                    .inner()
+                    .get(url)
+                    .header("X-MBX-APIKEY", &self.config.api_key))
+            })
             .await?;
         let resp: serde_json::Value = response.json().await?;
         Ok(resp)
     }
 
-    /// Sends a DELETE request and deserializes the JSON body.
-    async fn delete_json(&self, url: &str, weight: u32) -> ExchangeResult<serde_json::Value> {
+    async fn signed_post_json(
+        &self,
+        path: &str,
+        query: &str,
+        weight: u32,
+    ) -> ExchangeResult<serde_json::Value> {
         let response = self
             .http
-            .delete(url, Some(&self.config.api_key), weight)
+            .send_tracked_fresh(weight, || {
+                let signed = self.sign_request(query)?;
+                let url = format!("{}{}?{}&{}", self.config.base_url, path, query, signed);
+                Ok(self
+                    .http
+                    .inner()
+                    .post(url)
+                    .header("X-MBX-APIKEY", &self.config.api_key))
+            })
+            .await?;
+        let resp: serde_json::Value = response.json().await?;
+        Ok(resp)
+    }
+
+    async fn signed_delete_json(
+        &self,
+        path: &str,
+        query: &str,
+        weight: u32,
+    ) -> ExchangeResult<serde_json::Value> {
+        let response = self
+            .http
+            .send_tracked_fresh(weight, || {
+                let signed = self.sign_request(query)?;
+                let url = format!("{}{}?{}&{}", self.config.base_url, path, query, signed);
+                Ok(self
+                    .http
+                    .inner()
+                    .delete(url)
+                    .header("X-MBX-APIKEY", &self.config.api_key))
+            })
             .await?;
         let resp: serde_json::Value = response.json().await?;
         Ok(resp)
@@ -448,6 +541,13 @@ impl BinanceClient {
     }
 
     async fn fetch_symbol_filters(&self, symbol: &str) -> ExchangeResult<BinanceSymbolFilters> {
+        {
+            let cache = self.filters_cache.read().await;
+            if let Some(filters) = cache.get(symbol) {
+                return Ok(filters.clone());
+            }
+        }
+
         let normalized_symbol = symbol.replace('/', "");
         let url = format!(
             "{}/api/v3/exchangeInfo?symbol={}",
@@ -462,7 +562,13 @@ impl BinanceClient {
             .iter()
             .find(|entry| entry["symbol"].as_str() == Some(normalized_symbol.as_str()))
             .ok_or_else(|| ExchangeError::InvalidSymbol(normalized_symbol.clone()))?;
-        parse_symbol_filters(symbol_info)
+        let filters = parse_symbol_filters(symbol_info)?;
+
+        self.filters_cache
+            .write()
+            .await
+            .insert(symbol.to_string(), filters.clone());
+        Ok(filters)
     }
 
     /// Fetches the order book snapshot for the given symbol and depth limit.
@@ -523,7 +629,7 @@ impl BinanceClient {
                 let bps = if mid.is_zero() {
                     None
                 } else {
-                    Some(spread / mid * Decimal::from(10000))
+                    Some(spread / mid * Decimal::from(BPS_SCALE))
                 };
                 (Some(mid), bps)
             }
@@ -547,19 +653,31 @@ impl BinanceClient {
         })
     }
 
+    pub(crate) async fn fetch_price(&self, symbol: &str) -> ExchangeResult<Decimal> {
+        let url = format!(
+            "{}/api/v3/ticker/price?symbol={}",
+            self.config.base_url,
+            symbol.to_uppercase()
+        );
+        let resp = self.get_json(&url, 1).await?;
+        self.check_api_error(&resp)?;
+
+        let price_str = resp["price"].as_str().ok_or_else(|| {
+            ExchangeError::DecimalParse("missing price field in ticker response".into())
+        })?;
+
+        Decimal::from_str_exact(price_str)
+            .map_err(|e| ExchangeError::DecimalParse(format!("failed to parse price: {e}")))
+    }
+
     /// Fetches the account balance for all non-zero assets.
     pub(crate) async fn fetch_balance(&self) -> ExchangeResult<HashMap<String, NormalizedBalance>> {
         let query = format!("recvWindow={}", self.config.recv_window);
-        let signed = self.sign_request(&query)?;
+        debug!("Fetching account balance");
 
-        let url = format!(
-            "{}/api/v3/account?{}&{}",
-            self.config.base_url, query, signed
-        );
-
-        debug!(url = %url, "Fetching account balance");
-
-        let resp = self.get_json(&url, BINANCE_WEIGHT_ACCOUNT).await?;
+        let resp = self
+            .signed_get_json("/api/v3/account", &query, BINANCE_WEIGHT_ACCOUNT)
+            .await?;
         self.check_api_error(&resp)?;
 
         let balances_raw = resp["balances"]
@@ -604,12 +722,11 @@ impl BinanceClient {
             self.config.recv_window,
         );
 
-        let signed = self.sign_request(&query)?;
-        let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
-
         debug!(symbol, side, amount, price, "Placing LIMIT GTC order");
 
-        let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
+        let resp = self
+            .signed_post_json("/api/v3/order", &query, BINANCE_WEIGHT_ORDER)
+            .await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
@@ -634,9 +751,6 @@ impl BinanceClient {
             self.config.recv_window,
         );
 
-        let signed = self.sign_request(&query)?;
-        let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
-
         debug!(
             symbol,
             side,
@@ -645,7 +759,9 @@ impl BinanceClient {
             "Placing LIMIT IOC order"
         );
 
-        let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
+        let resp = self
+            .signed_post_json("/api/v3/order", &query, BINANCE_WEIGHT_ORDER)
+            .await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
@@ -666,12 +782,11 @@ impl BinanceClient {
             self.config.recv_window,
         );
 
-        let signed = self.sign_request(&query)?;
-        let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
-
         debug!(symbol, side, amount, "Placing MARKET order");
 
-        let resp = self.post_json(&url, BINANCE_WEIGHT_ORDER).await?;
+        let resp = self
+            .signed_post_json("/api/v3/order", &query, BINANCE_WEIGHT_ORDER)
+            .await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
@@ -690,12 +805,11 @@ impl BinanceClient {
             self.config.recv_window,
         );
 
-        let signed = self.sign_request(&query)?;
-        let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
-
         debug!(order_id, symbol, "Cancelling order");
 
-        let resp = self.delete_json(&url, BINANCE_WEIGHT_ORDER).await?;
+        let resp = self
+            .signed_delete_json("/api/v3/order", &query, BINANCE_WEIGHT_ORDER)
+            .await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
@@ -714,12 +828,11 @@ impl BinanceClient {
             self.config.recv_window,
         );
 
-        let signed = self.sign_request(&query)?;
-        let url = format!("{}/api/v3/order?{}&{}", self.config.base_url, query, signed);
-
         debug!(order_id, symbol, "Fetching order status");
 
-        let resp = self.get_json(&url, BINANCE_WEIGHT_ORDER_STATUS).await?;
+        let resp = self
+            .signed_get_json("/api/v3/order", &query, BINANCE_WEIGHT_ORDER_STATUS)
+            .await?;
         self.check_api_error(&resp)?;
 
         Self::parse_order_result(&resp)
@@ -732,15 +845,11 @@ impl BinanceClient {
             symbol.replace('/', ""),
             self.config.recv_window
         );
-        let signed = self.sign_request(&query)?;
-        let url = format!(
-            "{}/sapi/v1/asset/tradeFee?{}&{}",
-            self.config.base_url, query, signed
-        );
-
         debug!(symbol, "Fetching trading fees");
 
-        let resp = self.get_json(&url, BINANCE_WEIGHT_TRADE_FEE).await?;
+        let resp = self
+            .signed_get_json("/sapi/v1/asset/tradeFee", &query, BINANCE_WEIGHT_TRADE_FEE)
+            .await?;
         self.check_api_error(&resp)?;
 
         let arr = resp
@@ -770,15 +879,11 @@ impl BinanceClient {
             limit,
             self.config.recv_window,
         );
-        let signed = self.sign_request(&query)?;
-        let url = format!(
-            "{}/api/v3/myTrades?{}&{}",
-            self.config.base_url, query, signed
-        );
-
         debug!(symbol, limit, "Fetching my trades");
 
-        let resp = self.get_json(&url, BINANCE_WEIGHT_MY_TRADES).await?;
+        let resp = self
+            .signed_get_json("/api/v3/myTrades", &query, BINANCE_WEIGHT_MY_TRADES)
+            .await?;
         self.check_api_error(&resp)?;
 
         let arr = resp
@@ -839,17 +944,76 @@ impl BinanceClient {
             network,
             self.config.recv_window,
         );
-        let signed = self.sign_request(&query)?;
-        let url = format!(
-            "{}/sapi/v1/capital/withdraw/apply?{}&{}",
-            self.config.base_url, query, signed
-        );
-        let resp = self.post_json(&url, BINANCE_WEIGHT_ACCOUNT).await?;
+        let resp = self
+            .signed_post_json(
+                "/sapi/v1/capital/withdraw/apply",
+                &query,
+                BINANCE_WEIGHT_ACCOUNT,
+            )
+            .await?;
         self.check_api_error(&resp)?;
         resp["id"]
             .as_str()
             .map(ToOwned::to_owned)
             .ok_or_else(|| missing_field_err("id"))
+    }
+
+    pub(crate) async fn fetch_capital_config(&self) -> ExchangeResult<Vec<CapitalCoinConfig>> {
+        let query = format!("recvWindow={}", self.config.recv_window);
+        let resp = self
+            .signed_get_json(
+                "/sapi/v1/capital/config/getall",
+                &query,
+                BINANCE_WEIGHT_ACCOUNT,
+            )
+            .await?;
+        self.check_api_error(&resp)?;
+        Self::parse_capital_config(&resp)
+    }
+
+    pub(crate) async fn fetch_withdrawal_history(
+        &self,
+        asset: &str,
+    ) -> ExchangeResult<Vec<WithdrawalRecord>> {
+        let query = format!(
+            "coin={}&recvWindow={}",
+            asset.to_uppercase(),
+            self.config.recv_window,
+        );
+        let resp = self
+            .signed_get_json(
+                "/sapi/v1/capital/withdraw/history",
+                &query,
+                BINANCE_WEIGHT_ACCOUNT,
+            )
+            .await?;
+        self.check_api_error(&resp)?;
+        Self::parse_withdrawal_records(&resp)
+    }
+
+    pub(crate) async fn fetch_deposit_history(
+        &self,
+        asset: &str,
+        tx_id: Option<&str>,
+    ) -> ExchangeResult<Vec<DepositRecord>> {
+        let mut query = format!(
+            "coin={}&recvWindow={}",
+            asset.to_uppercase(),
+            self.config.recv_window,
+        );
+        if let Some(tx_id) = tx_id {
+            query.push_str("&txId=");
+            query.push_str(tx_id);
+        }
+        let resp = self
+            .signed_get_json(
+                "/sapi/v1/capital/deposit/hisrec",
+                &query,
+                BINANCE_WEIGHT_ACCOUNT,
+            )
+            .await?;
+        self.check_api_error(&resp)?;
+        Self::parse_deposit_records(&resp)
     }
 
     fn sign_request(&self, query: &str) -> ExchangeResult<String> {
@@ -893,6 +1057,85 @@ impl BinanceClient {
             .ok_or_else(|| ExchangeError::DecimalParse("expected string decimal".into()))?;
         Decimal::from_str_exact(s)
             .map_err(|e| ExchangeError::DecimalParse(format!("decimal parse: {e}")))
+    }
+
+    fn parse_capital_config(resp: &serde_json::Value) -> ExchangeResult<Vec<CapitalCoinConfig>> {
+        let arr = resp
+            .as_array()
+            .ok_or_else(|| expected_array_err("capital/config/getall"))?;
+        arr.iter()
+            .map(|item| {
+                let network_list = item["networkList"]
+                    .as_array()
+                    .ok_or_else(|| missing_field_err("networkList"))?;
+                let networks = network_list
+                    .iter()
+                    .map(|network| {
+                        Ok(CapitalNetworkConfig {
+                            network: network["network"].as_str().unwrap_or_default().to_string(),
+                            name: network["name"].as_str().map(ToOwned::to_owned),
+                            withdraw_enable: network["withdrawEnable"].as_bool().unwrap_or(false),
+                            deposit_enable: network["depositEnable"].as_bool().unwrap_or(false),
+                            withdraw_fee: Self::parse_decimal(&network["withdrawFee"])
+                                .unwrap_or(Decimal::ZERO),
+                            withdraw_min: Self::parse_decimal(&network["withdrawMin"])
+                                .unwrap_or(Decimal::ZERO),
+                        })
+                    })
+                    .collect::<ExchangeResult<Vec<_>>>()?;
+                Ok(CapitalCoinConfig {
+                    coin: item["coin"].as_str().unwrap_or_default().to_string(),
+                    name: item["name"].as_str().map(ToOwned::to_owned),
+                    networks,
+                })
+            })
+            .collect()
+    }
+
+    fn parse_withdrawal_records(resp: &serde_json::Value) -> ExchangeResult<Vec<WithdrawalRecord>> {
+        let arr = resp
+            .as_array()
+            .ok_or_else(|| expected_array_err("withdraw/history"))?;
+        arr.iter()
+            .map(|item| {
+                Ok(WithdrawalRecord {
+                    id: item["id"]
+                        .as_str()
+                        .or_else(|| item["withdrawOrderId"].as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    coin: item["coin"].as_str().unwrap_or_default().to_string(),
+                    amount: Self::parse_decimal(&item["amount"]).unwrap_or(Decimal::ZERO),
+                    network: item["network"].as_str().map(ToOwned::to_owned),
+                    address: item["address"].as_str().map(ToOwned::to_owned),
+                    tx_id: item["txId"].as_str().map(ToOwned::to_owned),
+                    status: item["status"].as_i64().unwrap_or(-1),
+                })
+            })
+            .collect()
+    }
+
+    fn parse_deposit_records(resp: &serde_json::Value) -> ExchangeResult<Vec<DepositRecord>> {
+        let arr = resp
+            .as_array()
+            .ok_or_else(|| expected_array_err("deposit/hisrec"))?;
+        arr.iter()
+            .map(|item| {
+                Ok(DepositRecord {
+                    id: item["id"]
+                        .as_str()
+                        .or_else(|| item["insertTime"].as_i64().map(|_| ""))
+                        .unwrap_or_default()
+                        .to_string(),
+                    coin: item["coin"].as_str().unwrap_or_default().to_string(),
+                    amount: Self::parse_decimal(&item["amount"]).unwrap_or(Decimal::ZERO),
+                    network: item["network"].as_str().map(ToOwned::to_owned),
+                    address: item["address"].as_str().map(ToOwned::to_owned),
+                    tx_id: item["txId"].as_str().map(ToOwned::to_owned),
+                    status: item["status"].as_i64().unwrap_or(-1),
+                })
+            })
+            .collect()
     }
 
     fn parse_order_result(resp: &serde_json::Value) -> ExchangeResult<OrderResult> {
@@ -1264,6 +1507,77 @@ mod tests {
             "executedQty": "0.00000000"
         });
         assert!(BinanceClient::parse_order_result(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_capital_config() {
+        let resp = serde_json::json!([
+            {
+                "coin": "LINK",
+                "name": "ChainLink",
+                "networkList": [
+                    {
+                        "network": "ARBITRUM",
+                        "name": "Arbitrum One",
+                        "withdrawEnable": true,
+                        "depositEnable": true,
+                        "withdrawFee": "0.1",
+                        "withdrawMin": "1.0"
+                    }
+                ]
+            }
+        ]);
+        let configs = BinanceClient::parse_capital_config(&resp).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].coin, "LINK");
+        assert_eq!(configs[0].networks[0].network, "ARBITRUM");
+        assert!(configs[0].networks[0].withdraw_enable);
+        assert_eq!(
+            configs[0].networks[0].withdraw_fee,
+            Decimal::from_str_exact("0.1").unwrap()
+        );
+        assert_eq!(
+            configs[0].networks[0].withdraw_min,
+            Decimal::from_str_exact("1.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_withdrawal_records() {
+        let resp = serde_json::json!([
+            {
+                "id": "wd-1",
+                "coin": "LINK",
+                "amount": "1.5",
+                "network": "ARBITRUM",
+                "address": "0xabc",
+                "txId": "0xtx",
+                "status": 6
+            }
+        ]);
+        let records = BinanceClient::parse_withdrawal_records(&resp).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "wd-1");
+        assert!(records[0].completed());
+    }
+
+    #[test]
+    fn test_parse_deposit_records() {
+        let resp = serde_json::json!([
+            {
+                "id": "dep-1",
+                "coin": "ETH",
+                "amount": "0.01",
+                "network": "ARBITRUM",
+                "address": "0xabc",
+                "txId": "0xtx",
+                "status": 1
+            }
+        ]);
+        let records = BinanceClient::parse_deposit_records(&resp).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "dep-1");
+        assert!(records[0].credited());
     }
 
     #[test]
