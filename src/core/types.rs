@@ -21,6 +21,8 @@ pub const MIN_GAS_LIMIT: u64 = 21_000;
 /// Default buffer for gas estimation in basis points (1.2× = 12_000 bps).
 pub const DEFAULT_GAS_BUFFER_BPS: u64 = 12_000;
 
+pub const DEFAULT_ARB_GAS_UNITS: u64 = 250_000;
+
 /// Basis points scale (10,000 = 100%).
 pub const BPS_SCALE: u64 = 10_000;
 
@@ -56,6 +58,162 @@ pub const SUCCESS_HEX: &str = "0x1";
 
 /// String representation of success as a decimal.
 pub const SUCCESS_STR: &str = "1";
+
+/// Default tick interval for the main bot loop.
+pub const DEFAULT_TICK_MS: u64 = 1000;
+
+/// Default refresh rate for the dashboard TUI.
+pub const DEFAULT_TUI_REFRESH_MS: u64 = 250;
+
+/// Default interval for the halt watchdog in milliseconds.
+pub const DEFAULT_WATCHDOG_INTERVAL_MS: u64 = 250;
+
+/// Default maximum number of concurrent trade executions.
+pub const DEFAULT_MAX_CONCURRENT: usize = 1;
+
+/// Default maximum size of the signal queue.
+pub const DEFAULT_QUEUE_MAX_SIZE: usize = 256;
+
+/// Default maximum age of a queued signal before it is dropped as stale.
+pub const DEFAULT_QUEUE_MAX_AGE_SECS: u64 = 30;
+
+/// Default TTL for replay protection in seconds.
+pub const DEFAULT_REPLAY_TTL_SECS: u64 = 60;
+
+/// Default interval for balance synchronization in seconds.
+pub const DEFAULT_BALANCE_SYNC_INTERVAL_SECS: u64 = 60;
+
+/// Default tolerance for balance verification (1.0%).
+pub const DEFAULT_BALANCE_VERIFY_TOLERANCE_PCT: f64 = 1.0;
+
+/// Default slippage tolerance for DEX swaps in basis points (50 bps = 0.5%).
+pub const DEFAULT_DEX_SLIPPAGE_BPS: u64 = 50;
+
+/// Default deadline for DEX transactions in seconds.
+pub const DEFAULT_DEX_DEADLINE_SECS: u64 = 60;
+
+/// Default polling interval for the reconcile worker in seconds.
+pub const DEFAULT_RECONCILE_POLL_SECS: u64 = 10;
+
+/// Default maximum age for pending reconcile entries in seconds (1 hour).
+pub const DEFAULT_RECONCILE_MAX_AGE_SECS: u64 = 3600;
+
+pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+
+pub const DEFAULT_LOG_DIR: &str = "logs";
+pub const DEFAULT_ALERT_LARGE_LOSS_USD: u64 = 100;
+pub const DEFAULT_MAX_GAS_GWEI_CAP: u64 = 0;
+
+/// Default minimum score required for a signal to be considered.
+pub const DEFAULT_MIN_SCORE: u32 = 60;
+
+/// Default timeout for waiting for a transaction receipt in seconds.
+pub const DEFAULT_RECEIPT_TIMEOUT_SECS: u64 = 120;
+
+/// Default poll interval for transaction receipts in seconds.
+pub const DEFAULT_RECEIPT_POLL_INTERVAL_SECS: f64 = 1.0;
+
+/// Default maximum acceptable slippage per trade in basis points (50 = 0.5%).
+pub const DEFAULT_MAX_SLIPPAGE_BPS: u64 = 50;
+
+/// Default maximum notional value of a single trade in USD.
+pub const DEFAULT_MAX_SINGLE_TRADE_USD: u64 = 1000;
+
+/// Default minimum fill percentage to accept a partial fill (0.8 = 80%).
+pub const DEFAULT_MIN_FILL_PCT: f64 = 0.8;
+
+/// Default milliseconds between order-status polls.
+pub const DEFAULT_ORDER_POLL_INTERVAL_MS: u64 = 500;
+
+/// Default maximum number of poll attempts before giving up.
+pub const DEFAULT_ORDER_POLL_MAX_ATTEMPTS: u32 = 10;
+
+/// Default depth for exchange order book fetching.
+pub const DEFAULT_ORDERBOOK_DEPTH: u32 = 20;
+
+/// Depth for quick price estimation order book fetching.
+pub const ESTIMATE_PRICE_DEPTH: u32 = 5;
+
+/// Default window for recent event analysis in minutes.
+pub const DEFAULT_RECENT_WINDOW_MINUTES: i64 = 60;
+
+/// Default arbitrage trade size in ETH.
+pub const DEFAULT_ARB_CHECK_SIZE_ETH: &str = "2.0";
+
+/// Default DEX fee in basis points.
+pub const DEFAULT_DEX_FEE_BPS: u64 = 30;
+
+/// Default CEX taker fee in basis points.
+pub const DEFAULT_CEX_FEE_BPS: u64 = 10;
+
+/// Default estimated gas cost for an arbitrage trade in USD.
+pub const DEFAULT_GAS_COST_USD: u64 = 5;
+
+/// Default minimum native balance required for live trading in ETH.
+pub const DEFAULT_MIN_NATIVE_BALANCE_ETH: &str = "0.01";
+
+/// Default initial capital in USD.
+pub const DEFAULT_INITIAL_CAPITAL_USD: &str = "100";
+
+/// Default risk management: maximum single trade size in USD.
+pub const DEFAULT_RISK_MAX_TRADE_USD: &str = "5";
+
+/// Default risk management: maximum daily loss in USD.
+pub const DEFAULT_RISK_MAX_DAILY_LOSS_USD: &str = "10";
+
+/// Default risk management: maximum trades per hour.
+pub const DEFAULT_RISK_MAX_TRADES_PER_HOUR: u32 = 20;
+
+/// Default risk management: consecutive loss limit.
+pub const DEFAULT_RISK_CONSECUTIVE_LOSS_LIMIT: u32 = 3;
+
+pub const DEFAULT_REBALANCE_INTERVAL_SECS: u64 = 60;
+pub const DEFAULT_REBALANCE_QUOTE_ASSET: &str = "USDC";
+pub const DEFAULT_REBALANCE_MAX_SLIPPAGE_BPS: u32 = 50;
+pub const DEFAULT_REBALANCE_ALLOWED_ASSETS: &str = "LINK,ETH,WETH";
+pub const DEFAULT_REBALANCE_ALLOWED_VENUES: &str = "binance,wallet";
+pub const DEFAULT_REBALANCE_MAX_STEP_USD: &str = "5";
+pub const DEFAULT_REBALANCE_MIN_FILL_PCT: f64 = 0.8;
+pub const DEFAULT_REBALANCE_JOURNAL_PATH: &str = "logs/rebalance_journal.jsonl";
+
+/// Default Chain ID for Arbitrum (duplicated for convenience if needed).
+pub const DEFAULT_CHAIN_ID: u64 = MAINNET_CHAIN_ID;
+
+/// Default timeout for the CEX leg (Leg 1).
+pub const DEFAULT_LEG1_TIMEOUT_SECS: u64 = 10;
+
+/// Default timeout for the DEX leg (Leg 2).
+pub const DEFAULT_LEG2_TIMEOUT_SECS: u64 = 60;
+
+/// Default minimum fill ratio (0.8 = 80%).
+pub const DEFAULT_MIN_FILL_RATIO: f64 = 0.8;
+
+/// Default failure threshold for the circuit breaker.
+pub const DEFAULT_BREAKER_FAILURE_THRESHOLD: usize = 3;
+
+/// Default window for the circuit breaker in seconds (5 minutes).
+pub const DEFAULT_BREAKER_WINDOW_SECS: u64 = 300;
+
+/// Default cooldown for the circuit breaker in seconds (10 minutes).
+pub const DEFAULT_BREAKER_COOLDOWN_SECS: u64 = 600;
+
+/// Default maximum daily loss in USD for the PnL breaker.
+pub const DEFAULT_MAX_DAILY_LOSS_USD: i64 = 100;
+
+/// Default retry delay after a loop error in seconds.
+pub const DEFAULT_RETRY_DELAY_SECS: u64 = 5;
+
+/// Default number of order book levels to display.
+pub const DEFAULT_ORDERBOOK_DISPLAY_LEVELS: usize = 5;
+
+/// Default interval for CEX balance refresh in the TUI in seconds.
+pub const DEFAULT_TUI_BALANCE_REFRESH_SECS: u64 = 30;
+
+pub const DEFAULT_FLASHBOTS_RELAY_URL: &str = "https://relay.flashbots.net";
+pub const DEFAULT_FLASHBOTS_TARGET_BLOCK_OFFSET: u64 = 1;
+pub const DEFAULT_FLASHBOTS_MAX_BLOCKS_TO_TRY: u64 = 3;
+pub const DEFAULT_FLASHBOTS_SIMULATION_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_FLASHBOTS_INCLUSION_TIMEOUT_SECS: u64 = 30;
 
 /// String representation of success as a boolean string.
 pub const SUCCESS_BOOL_STR: &str = "true";
@@ -125,11 +283,30 @@ pub const DEFAULT_RETRY_AFTER_SECS: u64 = 10;
 /// Estimated bid/ask spread used to derive best_bid/best_ask from mid_price (1 bps = 0.01%).
 pub const ESTIMATED_SPREAD_BPS: &str = "0.0001";
 
-/// Default RPC client timeout in seconds for on-chain queries.
 pub const RPC_TIMEOUT_SECS: u64 = 30;
 
 /// Default number of RPC retry attempts for transient failures.
-pub const RPC_RETRIES: usize = 2;
+pub const RPC_RETRIES: usize = 3;
+
+pub fn split_pair_symbols(pair: &str) -> Result<(&str, &str), CoreError> {
+    let mut parts = pair.split('/');
+    let base = parts
+        .next()
+        .ok_or_else(|| CoreError::InvalidPair(pair.to_string()))?;
+    let quote = parts
+        .next()
+        .ok_or_else(|| CoreError::InvalidPair(pair.to_string()))?;
+    if base.is_empty() || quote.is_empty() || parts.next().is_some() {
+        return Err(CoreError::InvalidPair(pair.to_string()));
+    }
+    Ok((base, quote))
+}
+
+/// Multiplier to convert ETH to Wei (10^18).
+pub const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+
+/// Default delay before attempting to reconnect to a stream.
+pub const DEFAULT_RECONNECT_DELAY_SECS: u64 = 5;
 
 /// Default estimated transfer time in minutes when fee info is unavailable.
 pub const DEFAULT_TRANSFER_TIME_MIN: u32 = 15;
@@ -229,10 +406,14 @@ pub enum CoreError {
     TokenDecimalsMismatch { left: u8, right: u8 },
     #[error("invalid transaction request: {0}")]
     InvalidTransactionRequest(String),
+    #[error("invalid pair '{0}'")]
+    InvalidPair(String),
     #[error("invalid receipt: {0}")]
     InvalidReceipt(ReceiptError),
     #[error("invalid serialization: {0}")]
     InvalidSerialization(SerializationError),
+    #[error("math error: {0}")]
+    Math(String),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -465,11 +646,13 @@ impl TokenAmount {
 
     /// Converts the amount to its human-readable decimal representation.
     ///
-    /// Returns `None` if the raw value overflows `Decimal` precision.
-    pub fn human(&self) -> Option<Decimal> {
-        let raw_decimal = Decimal::from_str(&self.raw.to_string()).ok()?;
+    /// Returns an error if the raw value overflows `Decimal` precision.
+    pub fn human(&self) -> Result<Decimal, CoreError> {
+        let raw_decimal = Decimal::from_str(&self.raw.to_string()).map_err(|e| {
+            CoreError::Math(format!("failed to convert raw amount to decimal: {e}"))
+        })?;
         let scale = get_scale(self.decimals);
-        Some(raw_decimal / scale)
+        Ok(raw_decimal / scale)
     }
 
     /// Adds two TokenAmounts, ensuring they have the same decimal scale.
@@ -496,9 +679,7 @@ impl TokenAmount {
             ));
         }
 
-        let human = self.human().ok_or_else(|| {
-            CoreError::InvalidTokenAmount("raw value overflows decimal precision".to_string())
-        })?;
+        let human = self.human()?;
         let product = human * factor;
         Self::from_human(product, self.decimals, self.symbol)
     }
@@ -517,7 +698,7 @@ impl fmt::Display for TokenAmount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let human = self
             .human()
-            .map_or_else(|| self.raw.to_string(), |d| d.to_string());
+            .map_or_else(|_| self.raw.to_string(), |d| d.to_string());
         if let Some(symbol) = &self.symbol {
             write!(f, "{human}{symbol}")
         } else {
@@ -820,6 +1001,63 @@ impl Add for TokenAmount {
     }
 }
 
+/// Default path for the kill-switch halt file.
+pub const DEFAULT_KILL_SWITCH_FILE: &str = "/tmp/arb_bot_kill";
+
+/// Absolute maximum trade size allowed by the system (safety cap).
+pub const ABSOLUTE_MAX_TRADE_USD: u64 = 25;
+
+/// Absolute maximum daily loss allowed before a mandatory halt.
+pub const ABSOLUTE_MAX_DAILY_LOSS: i64 = 20;
+
+/// Absolute minimum capital required to continue trading.
+pub const ABSOLUTE_MIN_CAPITAL: u64 = 50;
+
+/// Absolute maximum number of trades allowed per hour.
+pub const ABSOLUTE_MAX_TRADES_PER_HOUR: u32 = 30;
+
+/// Default maximum trade size in USD.
+pub const DEFAULT_MAX_TRADE_USD: u64 = 5;
+
+/// Default maximum trade size as a percentage of total capital (in bps).
+pub const DEFAULT_MAX_TRADE_BPS: u64 = 2000; // 20%
+
+/// Default maximum position size per token in USD.
+pub const DEFAULT_MAX_POSITION_PER_TOKEN: u64 = 30;
+
+/// Default maximum number of open positions.
+pub const DEFAULT_MAX_OPEN_POSITIONS: u32 = 1;
+
+/// Default maximum loss allowed per trade in USD.
+pub const DEFAULT_MAX_LOSS_PER_TRADE_USD: u64 = 5;
+
+/// Default maximum cumulative loss allowed per day in USD.
+pub const DEFAULT_MAX_DAILY_LOSS_LIMIT_USD: u64 = 10;
+
+/// Default maximum drawdown as a percentage of peak capital (in bps).
+pub const DEFAULT_MAX_DRAWDOWN_BPS: u64 = 2000; // 20%
+
+/// Default maximum number of trades allowed per hour.
+pub const DEFAULT_MAX_TRADES_PER_HOUR: u32 = 20;
+
+/// Default limit on consecutive losses before a halt.
+pub const DEFAULT_CONSECUTIVE_LOSS_LIMIT: u32 = 3;
+
+/// Default minimum spread required to consider an opportunity (in basis points).
+pub const DEFAULT_MIN_SPREAD_BPS: u64 = 50;
+
+/// Default minimum net profit in USD required to emit a signal.
+pub const DEFAULT_MIN_PROFIT_USD: u64 = 5;
+
+/// Default maximum notional of a single trade in USD.
+pub const DEFAULT_MAX_POSITION_USD: u64 = 10_000;
+
+/// Default duration (in seconds) that an emitted signal remains valid.
+pub const DEFAULT_SIGNAL_TTL_SECS: u64 = 5;
+
+/// Default minimum gap (in seconds) between consecutive signals for the same pair.
+pub const DEFAULT_COOLDOWN_SECS: u64 = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,7 +1144,7 @@ mod tests {
     fn token_amount_checked_mul_decimal_scales_correctly() {
         let one_eth = TokenAmount::from_eth("1").unwrap();
         let half = one_eth.checked_mul_decimal(Decimal::new(5, 1)).unwrap();
-        assert_eq!(half.human(), Some(Decimal::new(5, 1)));
+        assert_eq!(half.human().unwrap(), Decimal::new(5, 1));
     }
 
     #[test]
@@ -919,7 +1157,7 @@ mod tests {
     fn token_amount_checked_mul_int_scales_raw() {
         let one_eth = TokenAmount::from_eth("2").unwrap();
         let three_eth = one_eth.checked_mul_int(3).unwrap();
-        assert_eq!(three_eth.human(), Some(Decimal::from(6)));
+        assert_eq!(three_eth.human().unwrap(), Decimal::from(6));
     }
 
     #[test]
@@ -927,7 +1165,7 @@ mod tests {
         let a = TokenAmount::from_eth("1").unwrap();
         let b = TokenAmount::from_eth("2").unwrap();
         let sum = a + b;
-        assert_eq!(sum.human(), Some(Decimal::from(3)));
+        assert_eq!(sum.human().unwrap(), Decimal::from(3));
     }
 
     #[test]

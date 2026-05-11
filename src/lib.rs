@@ -44,12 +44,14 @@ pub mod safety;
 pub mod strategy;
 
 pub use chain::{ChainClient, ChainError, ChainResult, RpcHealth, TransactionBuilder};
+pub use core::assets;
+pub use core::format;
 pub use core::serializer::CanonicalSerializer;
 pub use core::types::{
-    Address, BlockId, CoreError, DEFAULT_GAS_BUFFER_BPS, ETH_DECIMALS, ETH_SYMBOL, GasPrice,
-    GasPriority, MAINNET_CHAIN_ID, MIN_GAS_LIMIT, RECEIPT_STATUS_FAILED, RECEIPT_STATUS_SUCCESS,
-    SEPOLIA_CHAIN_ID, Token, TokenAmount, TransactionReceipt, TransactionRequest,
-    TransactionStatus, WEI_PER_GWEI,
+    Address, BlockId, CoreError, DEFAULT_ARB_GAS_UNITS, DEFAULT_GAS_BUFFER_BPS, ETH_DECIMALS,
+    ETH_SYMBOL, GasPrice, GasPriority, MAINNET_CHAIN_ID, MIN_GAS_LIMIT, RECEIPT_STATUS_FAILED,
+    RECEIPT_STATUS_SUCCESS, SEPOLIA_CHAIN_ID, Token, TokenAmount, TransactionReceipt,
+    TransactionRequest, TransactionStatus, WEI_PER_GWEI,
 };
 pub use core::wallet::{WalletError, WalletManager};
 pub use exchange::{

@@ -1,3 +1,5 @@
+pub mod address_book;
+
 pub const ARBITRUM_CHAIN_ID: u64 = 42_161;
 pub const ARBITRUM_PUBLIC_RPC_URL: &str = "https://arb1.arbitrum.io/rpc";
 pub const ARBITRUM_UNISWAP_V2_ROUTER: &str = "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24";
