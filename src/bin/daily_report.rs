@@ -353,7 +353,7 @@ impl DailyReport {
             .sum::<u16>()
             .min(100);
         self.top_risk_causes
-            .sort_by(|left, right| right.score.cmp(&left.score));
+            .sort_by_key(|cause| std::cmp::Reverse(cause.score));
         self.top_risk_causes.truncate(5);
     }
 }
