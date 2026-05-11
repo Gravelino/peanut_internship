@@ -19,27 +19,53 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use ethers::types::{Bytes, U256};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use rust_decimal::prelude::ToPrimitive;
+use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use peanut_internship_rust::assets::{self};
 use peanut_internship_rust::chain::{
     ChainClient, FlashbotsConfig, FlashbotsRelayClient, NonceManager,
 };
+use peanut_internship_rust::config::address_book::{
+    AddressBookPoolKind, AddressBookTokenConfig, dex_pool_fee_bps_map, load_parsed_address_book,
+    rebalance_token_book, selected_pairs, selected_pool_kinds,
+    validate_arbitrum_known_token_symbols, validate_asset_symbol_uniqueness,
+    validate_cex_pair_symbols, validate_selected_pool_compatibility,
+};
 use peanut_internship_rust::core::types::{
-    Address, BlockId, ETH_DECIMALS, GasPriority, TokenAmount, TransactionRequest,
-    ARBITRUM_CHAIN_ID,
+    ARBITRUM_CHAIN_ID, Address, BPS_SCALE, BlockId, DEFAULT_ALERT_LARGE_LOSS_USD,
+    DEFAULT_ARB_GAS_UNITS, DEFAULT_BALANCE_SYNC_INTERVAL_SECS,
+    DEFAULT_BALANCE_VERIFY_TOLERANCE_PCT, DEFAULT_CEX_FEE_BPS, DEFAULT_DEX_DEADLINE_SECS,
+    DEFAULT_DEX_FEE_BPS, DEFAULT_DEX_SLIPPAGE_BPS, DEFAULT_FLASHBOTS_MAX_BLOCKS_TO_TRY,
+    DEFAULT_FLASHBOTS_RELAY_URL, DEFAULT_FLASHBOTS_TARGET_BLOCK_OFFSET, DEFAULT_GAS_BUFFER_BPS,
+    DEFAULT_GAS_COST_USD, DEFAULT_INITIAL_CAPITAL_USD, DEFAULT_KILL_SWITCH_FILE, DEFAULT_LOG_DIR,
+    DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DAILY_LOSS_USD, DEFAULT_MAX_GAS_GWEI_CAP,
+    DEFAULT_MIN_PROFIT_USD, DEFAULT_MIN_SCORE, DEFAULT_MIN_SPREAD_BPS, DEFAULT_ORDERBOOK_DEPTH,
+    DEFAULT_QUEUE_MAX_SIZE, DEFAULT_REBALANCE_ALLOWED_ASSETS, DEFAULT_REBALANCE_ALLOWED_VENUES,
+    DEFAULT_REBALANCE_INTERVAL_SECS, DEFAULT_REBALANCE_JOURNAL_PATH,
+    DEFAULT_REBALANCE_MAX_SLIPPAGE_BPS, DEFAULT_REBALANCE_MAX_STEP_USD,
+    DEFAULT_REBALANCE_MIN_FILL_PCT, DEFAULT_REBALANCE_QUOTE_ASSET, DEFAULT_RECONCILE_MAX_AGE_SECS,
+    DEFAULT_RECONCILE_POLL_SECS, DEFAULT_RECONNECT_DELAY_SECS, DEFAULT_REPLAY_TTL_SECS,
+    DEFAULT_RETRY_DELAY_SECS, DEFAULT_RISK_CONSECUTIVE_LOSS_LIMIT, DEFAULT_RISK_MAX_DAILY_LOSS_USD,
+    DEFAULT_RISK_MAX_TRADE_USD, DEFAULT_RISK_MAX_TRADES_PER_HOUR, DEFAULT_SHUTDOWN_DRAIN_SECS,
+    DEFAULT_TICK_MS, DEFAULT_WATCHDOG_INTERVAL_MS, ETH_DECIMALS, GasPriority, MIN_GAS_LIMIT,
+    REBALANCE_DEVIATION_THRESHOLD_PCT, RPC_RETRIES, RPC_TIMEOUT_SECS, TokenAmount,
+    TransactionRequest, WEI_PER_ETH, WEI_PER_GWEI,
 };
 use peanut_internship_rust::core::wallet::WalletManager;
 use peanut_internship_rust::exchange::client::ExchangeClient;
 use peanut_internship_rust::exchange::config::BinanceConfig;
+use peanut_internship_rust::exchange::types::NormalizedBalance;
 use peanut_internship_rust::exchange::{
-    DepthEvent, DepthSnapshot, LocalOrderBook, OrderBookSnapshot, SequenceStatus,
-    subscribe_book_ticker_stream, subscribe_depth_stream,
+    DepthEvent, DepthSnapshot, LocalOrderBook, OrderBookAnalyzer, OrderBookSnapshot,
+    SequenceStatus, subscribe_book_ticker_stream, subscribe_depth_stream,
 };
+use peanut_internship_rust::executor::dex_swapper::WETH_DEPOSIT_SELECTOR;
 use peanut_internship_rust::executor::engine::{
     Executor, ExecutorConfig, LegExecutor, LiveLegs, SimulatedLegs,
 };
@@ -51,6 +77,7 @@ use peanut_internship_rust::executor::{
     apply_slippage, build_allowance_calldata, build_approve_calldata, build_swap_calldata,
     v3_swap_calldata_for_pair,
 };
+use peanut_internship_rust::format::{self, *};
 use peanut_internship_rust::inventory::pnl::{ArbRecord, PnLEngine, TradeJsonlLogger, TradeLeg};
 use peanut_internship_rust::inventory::rebalancer::RebalancePlanner;
 use peanut_internship_rust::inventory::tracker::InventoryTracker;
@@ -63,12 +90,11 @@ use peanut_internship_rust::observability::{
 use peanut_internship_rust::pricing::{
     AmountOutDecoder, ForkSimulator, SwapParams, V3QuoterConfig, V3QuoterKind,
 };
-use peanut_internship_rust::safety::{
-    DEFAULT_KILL_SWITCH_FILE, PreTradeValidator, RiskLimits, RiskManager,
-};
+use peanut_internship_rust::safety::{PreTradeValidator, RiskLimits, RiskManager};
 use peanut_internship_rust::strategy::fees::{FeeBreakdown, FeeStructure};
 use peanut_internship_rust::strategy::generator::{
-    CexOrderBookSource, GeneratorConfig, MarketState, PriceSource, SignalGenerator, StubPriceSource,
+    CexOrderBookSource, GeneratorConfig, MarketState, PriceSource, SignalGenerator,
+    StubPriceSource, split_pair,
 };
 use peanut_internship_rust::strategy::live_price_source::{
     AnyPriceSource, LivePoolConfig, LivePoolKind, LivePriceSource,
@@ -78,18 +104,41 @@ use peanut_internship_rust::strategy::signal::{Direction, Signal};
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc, watch};
 
-const ARBITRUM_UNISWAP_V3_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
 const ARBITRUM_UNISWAP_V3_SWAP_ROUTER: &str = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+const ARBITRUM_UNISWAP_V3_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
 const ARBITRUM_NATIVE_USDC: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const UNISWAP_V3_POOL_FEE_SELECTOR: [u8; 4] = [0xdd, 0xca, 0x3f, 0x43];
-const FLASHBOTS_MAINNET_RELAY_URL: &str = "https://relay.flashbots.net";
+const DEFAULT_ARB_SIZE: &str = "0.1";
+const DEFAULT_METRICS_PORT: u16 = 9090;
+const DEFAULT_ALERT_PROVIDER: &str = "generic";
+const DEFAULT_WALLET_KEY_ENV: &str = "WALLET_PRIVATE_KEY";
+const DEFAULT_FLASHBOTS_AUTH_KEY_ENV: &str = "FLASHBOTS_AUTH_PRIVATE_KEY";
+const DEFAULT_FEE_GAS_MODE: &str = "fixed";
+const DEFAULT_TRADE_LOG_PATH: &str = "trades.jsonl";
+const DEFAULT_EVENT_LOG_PATH: &str = "events.jsonl";
+const DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK: &str = "ARBITRUM";
+const DEFAULT_REBALANCE_TRANSFER_CONFIRM_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_REBALANCE_TRANSFER_CONFIRM_POLL_SECS: u64 = 15;
+const ETH_SYMBOL: &str = "ETH";
+const WETH_SYMBOL: &str = "WETH";
+const USDC_SYMBOL: &str = "USDC";
+const USDT_SYMBOL: &str = "USDT";
+const USD_SYMBOL: &str = "USD";
+#[cfg(test)]
+const LINK_SYMBOL: &str = "LINK";
+const ETH_USDC_PAIR: &str = "ETH/USDC";
+const ARBITRUM_WETH_ADDRESS: &str = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
+const REBALANCE_NATIVE_TRANSFER_GAS_LIMIT: u64 = 21_000;
+const REBALANCE_TOKEN_TRANSFER_GAS_LIMIT: u64 = 100_000;
+const REBALANCE_WETH_WRAP_GAS_LIMIT: u64 = 100_000;
+const REBALANCE_WETH_WRAP_CONTEXT: &str = "rebalance WETH wrap";
 
 /// CLI arguments.
 #[derive(Debug, Parser)]
 #[command(name = "arb_bot", about = "Cross-venue arbitrage bot")]
 struct Cli {
     /// Trading pairs to watch (repeatable, or comma-separated via env).
-    #[arg(long, default_values_t = vec!["ETH/USDC".to_string()], env = "PAIR", value_delimiter = ',')]
+    #[arg(long, default_values_t = vec![ETH_USDC_PAIR.to_string()], env = "PAIR", value_delimiter = ',')]
     pair: Vec<String>,
 
     /// Use Binance production credentials/endpoints. Env `PRODUCTION=true`
@@ -101,11 +150,11 @@ struct Cli {
     check_config: bool,
 
     /// Base-asset size per leg.
-    #[arg(long, default_value = "0.1", env = "ARB_SIZE")]
+    #[arg(long, default_value = DEFAULT_ARB_SIZE, env = "ARB_SIZE")]
     size: String,
 
     /// Minimum score (0..=100) required to execute a signal.
-    #[arg(long, default_value_t = 60, env = "MIN_SCORE")]
+    #[arg(long, default_value_t = DEFAULT_MIN_SCORE, env = "MIN_SCORE")]
     min_score: u32,
 
     /// Verbose logging: show all market probes even if no signal is found.
@@ -113,7 +162,7 @@ struct Cli {
     verbose: bool,
 
     /// Loop interval in milliseconds.
-    #[arg(long, default_value_t = 1000, env = "TICK_MS")]
+    #[arg(long, default_value_t = DEFAULT_TICK_MS, env = "TICK_MS")]
     tick_ms: u64,
 
     /// Use the simulated leg backend instead of live exchange calls.
@@ -121,17 +170,17 @@ struct Cli {
     simulation: bool,
 
     /// Port for the Prometheus `/metrics` endpoint. Set to 0 to disable.
-    #[arg(long, default_value_t = 9090)]
+    #[arg(long, default_value_t = DEFAULT_METRICS_PORT)]
     metrics_port: u16,
 
     /// Maximum concurrent executions. Default = 1 (safe; matches pre-queue
     /// behaviour). Safely raising above 1 requires inventory locking (see
     /// stretch goal S6 in `docs/STRETCH_GOALS.md`).
-    #[arg(long, default_value_t = 1, env = "MAX_CONCURRENT")]
+    #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT, env = "MAX_CONCURRENT")]
     max_concurrent_executions: usize,
 
     /// Maximum queue depth. When full, the weakest-score signal is evicted.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = DEFAULT_QUEUE_MAX_SIZE)]
     queue_max_size: usize,
 
     /// SQLite path for persistent replay protection. Leave empty for
@@ -140,7 +189,7 @@ struct Cli {
     replay_db: String,
 
     /// Replay protection TTL in seconds. Ignored when `--replay-db` is empty.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = DEFAULT_REPLAY_TTL_SECS)]
     replay_ttl_secs: u64,
 
     /// Ethereum RPC URL for on-chain wallet balance sync. Leave empty to
@@ -157,14 +206,14 @@ struct Cli {
 
     /// Minimum interval (seconds) between full balance re-syncs. Prevents
     /// RPC / CEX hammering on tight tick intervals.
-    #[arg(long, default_value_t = 60, env = "BALANCE_SYNC_INTERVAL")]
+    #[arg(long, default_value_t = DEFAULT_BALANCE_SYNC_INTERVAL_SECS, env = "BALANCE_SYNC_INTERVAL")]
     pub balance_sync_interval_secs: u64,
 
     /// Tolerance (%) for post-trade balance verification. If the absolute
     /// difference between tracked and actual CEX balance exceeds this
     /// percentage, the bot emits a `BalanceMismatch` alert and halts.
     /// Set to 0 to disable verification.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = DEFAULT_BALANCE_VERIFY_TOLERANCE_PCT)]
     balance_verify_tolerance_pct: f64,
 
     /// Webhook URL for alerting. Empty = alerts disabled (uses NoopSink).
@@ -173,7 +222,7 @@ struct Cli {
     alert_webhook_url: String,
 
     /// Webhook payload format: `telegram` or `generic` (default).
-    #[arg(long, default_value = "generic", env = "ALERT_PROVIDER")]
+    #[arg(long, default_value = DEFAULT_ALERT_PROVIDER, env = "ALERT_PROVIDER")]
     alert_provider: String,
 
     /// Telegram chat ID for alerts. Required when `--alert-provider telegram`.
@@ -182,7 +231,7 @@ struct Cli {
 
     /// Absolute-value loss (quote-asset units) that triggers a
     /// `LargeLoss` alert. Default 100 — tune to portfolio size.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = DEFAULT_ALERT_LARGE_LOSS_USD)]
     alert_large_loss: u64,
 
     /// SQLite path for the reconcile store. When set, LEG2_TIMEOUT events
@@ -192,12 +241,12 @@ struct Cli {
     reconcile_db: String,
 
     /// Reconcile worker polling interval in seconds.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = DEFAULT_RECONCILE_POLL_SECS)]
     reconcile_poll_secs: u64,
 
     /// Maximum age (seconds) of a pending reconcile entry before it expires
     /// and is flagged for manual review.
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, default_value_t = DEFAULT_RECONCILE_MAX_AGE_SECS)]
     reconcile_max_age_secs: u64,
 
     /// Path to a JSON file mapping pair symbols to on-chain token addresses.
@@ -208,11 +257,11 @@ struct Cli {
     dex_address_book: String,
 
     /// Slippage tolerance in basis points for DEX swaps.
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = DEFAULT_DEX_SLIPPAGE_BPS)]
     dex_slippage_bps: u64,
 
     /// DEX tx deadline in seconds from submission.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = DEFAULT_DEX_DEADLINE_SECS)]
     dex_deadline_secs: u64,
 
     #[arg(long, default_value = "", env = "DEX_ROUTER")]
@@ -223,27 +272,27 @@ struct Cli {
 
     /// Maximum EIP-1559 maxFeePerGas for live DEX transactions, in gwei.
     /// Set to 0 to disable the cap.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_MAX_GAS_GWEI_CAP)]
     max_gas_gwei: u64,
 
     /// Environment variable name for the wallet private key used to sign
     /// DEX transactions. Only read when `--dex-address-book` is set.
-    #[arg(long, default_value = "WALLET_PRIVATE_KEY")]
+    #[arg(long, default_value = DEFAULT_WALLET_KEY_ENV)]
     wallet_key_env: String,
 
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_flashbots: bool,
 
-    #[arg(long, default_value = "https://relay.flashbots.net")]
+    #[arg(long, default_value = DEFAULT_FLASHBOTS_RELAY_URL)]
     flashbots_relay_url: String,
 
-    #[arg(long, default_value = "FLASHBOTS_AUTH_PRIVATE_KEY")]
+    #[arg(long, default_value = DEFAULT_FLASHBOTS_AUTH_KEY_ENV)]
     flashbots_auth_key_env: String,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = DEFAULT_FLASHBOTS_TARGET_BLOCK_OFFSET)]
     flashbots_target_block_offset: u64,
 
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = DEFAULT_FLASHBOTS_MAX_BLOCKS_TO_TRY)]
     flashbots_max_blocks_to_try: u64,
 
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -264,38 +313,38 @@ struct Cli {
     /// to emit a signal. Overrides `GeneratorConfig::default().min_profit_usd`
     /// (which is 5). Lower this for small-notional demos where default
     /// fees consume more than the achievable spread.
-    #[arg(long, default_value = "5", env = "MIN_PROFIT_USD")]
+    #[arg(long, default_value_t = DEFAULT_MIN_PROFIT_USD.to_string(), env = "MIN_PROFIT_USD")]
     min_profit_usd: String,
 
     /// Minimum spread in basis points required to consider an opportunity.
     /// Overrides `GeneratorConfig::default().min_spread_bps` (50).
-    #[arg(long, default_value_t = 50, env = "MIN_SPREAD_BPS")]
+    #[arg(long, default_value_t = DEFAULT_MIN_SPREAD_BPS, env = "MIN_SPREAD_BPS")]
     min_spread_bps: u64,
 
     /// CEX taker fee in basis points. Drives both pre-trade profitability
     /// gating and post-trade realised PnL accounting (shared
     /// [`FeeStructure`]). Binance spot default = 10 bps.
-    #[arg(long, default_value_t = 10, env = "FEE_CEX_TAKER_BPS")]
+    #[arg(long, default_value_t = DEFAULT_CEX_FEE_BPS, env = "FEE_CEX_TAKER_BPS")]
     fee_cex_taker_bps: u64,
 
     /// DEX swap fee in basis points. Uniswap V2 = 30 bps; Uniswap V3 tiers
     /// vary (5 / 30 / 100 / 1000 bps). Used in both generator and executor.
-    #[arg(long, default_value_t = 30, env = "FEE_DEX_SWAP_BPS")]
+    #[arg(long, default_value_t = DEFAULT_DEX_FEE_BPS, env = "FEE_DEX_SWAP_BPS")]
     fee_dex_swap_bps: u64,
 
     /// Flat on-chain gas cost in USD per execution. Amortised per trade
     /// inside `FeeStructure::total_fee_bps` — small notionals pay a
     /// disproportionately higher %-ge. Default $5.
-    #[arg(long, default_value = "5", env = "FEE_GAS_USD")]
+    #[arg(long, default_value_t = DEFAULT_GAS_COST_USD.to_string(), env = "FEE_GAS_USD")]
     fee_gas_usd: String,
 
-    #[arg(long, default_value = "fixed", env = "FEE_GAS_MODE")]
+    #[arg(long, default_value = DEFAULT_FEE_GAS_MODE, env = "FEE_GAS_MODE")]
     fee_gas_mode: String,
 
-    #[arg(long, default_value_t = 250_000, env = "FEE_GAS_UNITS")]
+    #[arg(long, default_value_t = DEFAULT_ARB_GAS_UNITS, env = "FEE_GAS_UNITS")]
     fee_gas_units: u64,
 
-    #[arg(long, default_value_t = 12_000, env = "FEE_GAS_BUFFER_BPS")]
+    #[arg(long, default_value_t = DEFAULT_GAS_BUFFER_BPS, env = "FEE_GAS_BUFFER_BPS")]
     fee_gas_buffer_bps: u64,
 
     #[arg(long, default_value = "", env = "ANVIL_FORK_URL")]
@@ -303,47 +352,47 @@ struct Cli {
 
     /// Append-only structured trade log path. Completed executions are
     /// written as one JSON object per line. Leave empty to disable.
-    #[arg(long, default_value = "trades.jsonl", env = "TRADE_LOG_PATH")]
+    #[arg(long, default_value = DEFAULT_TRADE_LOG_PATH, env = "TRADE_LOG_PATH")]
     trade_log_path: String,
 
-    #[arg(long, default_value = "events.jsonl", env = "EVENT_LOG_PATH")]
+    #[arg(long, default_value = DEFAULT_EVENT_LOG_PATH, env = "EVENT_LOG_PATH")]
     event_log_path: String,
 
     /// Maximum time to wait for queued/in-flight executions to finish during
     /// graceful shutdown.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_SHUTDOWN_DRAIN_SECS)]
     shutdown_drain_secs: u64,
 
     /// Maximum cumulative daily loss (USD) before the bot auto-halts.
     /// Set to 0 to disable. Default $100.
-    #[arg(long, default_value = "100", env = "MAX_DAILY_LOSS")]
+    #[arg(long, default_value_t = DEFAULT_MAX_DAILY_LOSS_USD.to_string(), env = "MAX_DAILY_LOSS")]
     max_daily_loss_usd: String,
 
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
 
-    #[arg(long, default_value = "100", env = "INITIAL_CAPITAL_USD")]
+    #[arg(long, default_value = DEFAULT_INITIAL_CAPITAL_USD, env = "INITIAL_CAPITAL_USD")]
     initial_capital_usd: String,
 
-    #[arg(long, default_value = "5", env = "RISK_MAX_TRADE_USD")]
+    #[arg(long, default_value = DEFAULT_RISK_MAX_TRADE_USD, env = "RISK_MAX_TRADE_USD")]
     risk_max_trade_usd: String,
 
-    #[arg(long, default_value = "10", env = "RISK_MAX_DAILY_LOSS_USD")]
+    #[arg(long, default_value = DEFAULT_RISK_MAX_DAILY_LOSS_USD, env = "RISK_MAX_DAILY_LOSS_USD")]
     risk_max_daily_loss_usd: String,
 
-    #[arg(long, default_value_t = 20, env = "RISK_MAX_TRADES_PER_HOUR")]
+    #[arg(long, default_value_t = DEFAULT_RISK_MAX_TRADES_PER_HOUR, env = "RISK_MAX_TRADES_PER_HOUR")]
     risk_max_trades_per_hour: u32,
 
-    #[arg(long, default_value_t = 3, env = "RISK_CONSECUTIVE_LOSS_LIMIT")]
+    #[arg(long, default_value_t = DEFAULT_RISK_CONSECUTIVE_LOSS_LIMIT, env = "RISK_CONSECUTIVE_LOSS_LIMIT")]
     risk_consecutive_loss_limit: u32,
 
-    #[arg(long, default_value = "logs", env = "LOG_DIR")]
+    #[arg(long, default_value = DEFAULT_LOG_DIR, env = "LOG_DIR")]
     log_dir: String,
 
     /// Path to a watchdog halt file. When this file exists, the bot halts
     /// immediately. Useful for emergency stops via `touch STOP`. Leave
     /// empty to disable.
-    #[arg(long, default_value = "/tmp/arb_bot_kill", env = "HALT_FILE")]
+    #[arg(long, default_value = DEFAULT_KILL_SWITCH_FILE, env = "HALT_FILE")]
     halt_file_path: String,
 
     /// Enable periodic inventory rebalance planning.
@@ -355,19 +404,19 @@ struct Cli {
     rebalance_dry_run: bool,
 
     /// Seconds between rebalance checks.
-    #[arg(long, default_value_t = 60, env = "REBALANCE_INTERVAL_SECS")]
+    #[arg(long, default_value_t = DEFAULT_REBALANCE_INTERVAL_SECS, env = "REBALANCE_INTERVAL_SECS")]
     rebalance_interval_secs: u64,
 
     /// Maximum allowed inventory skew before a rebalance plan is generated.
-    #[arg(long, default_value_t = 30.0, env = "REBALANCE_THRESHOLD_PCT")]
+    #[arg(long, default_value_t = REBALANCE_DEVIATION_THRESHOLD_PCT, env = "REBALANCE_THRESHOLD_PCT")]
     rebalance_threshold_pct: f64,
 
     /// Quote asset used for executable rebalance trade symbols.
-    #[arg(long, default_value = "USDC", env = "REBALANCE_QUOTE_ASSET")]
+    #[arg(long, default_value = DEFAULT_REBALANCE_QUOTE_ASSET, env = "REBALANCE_QUOTE_ASSET")]
     rebalance_quote_asset: String,
 
     /// Maximum slippage allowed for executable rebalance trade steps.
-    #[arg(long, default_value_t = 50, env = "REBALANCE_MAX_SLIPPAGE_BPS")]
+    #[arg(long, default_value_t = DEFAULT_REBALANCE_MAX_SLIPPAGE_BPS, env = "REBALANCE_MAX_SLIPPAGE_BPS")]
     rebalance_max_slippage_bps: u32,
 
     /// Destination wallet address for CEX→Wallet withdrawals. Defaults to signer/wallet address.
@@ -377,7 +426,7 @@ struct Cli {
     /// Binance withdrawal network for CEX→Wallet withdrawals.
     #[arg(
         long,
-        default_value = "ARBITRUM",
+        default_value = DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK,
         env = "REBALANCE_CEX_WITHDRAW_NETWORK"
     )]
     rebalance_cex_withdraw_network: String,
@@ -389,6 +438,46 @@ struct Cli {
     /// Chain ID used for Wallet→CEX transfer transactions.
     #[arg(long, default_value_t = ARBITRUM_CHAIN_ID, env = "REBALANCE_CHAIN_ID")]
     rebalance_chain_id: u64,
+
+    #[arg(long, default_value = DEFAULT_REBALANCE_ALLOWED_ASSETS, env = "REBALANCE_ALLOWED_ASSETS")]
+    rebalance_allowed_assets: String,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_REBALANCE_ALLOWED_VENUES,
+        env = "REBALANCE_ALLOWED_VENUES"
+    )]
+    rebalance_allowed_venues: String,
+
+    #[arg(long, default_value = DEFAULT_REBALANCE_MAX_STEP_USD, env = "REBALANCE_MAX_STEP_USD")]
+    rebalance_max_step_usd: String,
+
+    #[arg(long, default_value_t = DEFAULT_REBALANCE_MIN_FILL_PCT, env = "REBALANCE_MIN_FILL_PCT")]
+    rebalance_min_fill_pct: f64,
+
+    #[arg(long, default_value_t = true, env = "REBALANCE_PAUSE_TRADING")]
+    rebalance_pause_trading: bool,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_REBALANCE_JOURNAL_PATH,
+        env = "REBALANCE_JOURNAL_PATH"
+    )]
+    rebalance_journal_path: String,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REBALANCE_TRANSFER_CONFIRM_TIMEOUT_SECS,
+        env = "REBALANCE_TRANSFER_CONFIRM_TIMEOUT_SECS"
+    )]
+    rebalance_transfer_confirm_timeout_secs: u64,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REBALANCE_TRANSFER_CONFIRM_POLL_SECS,
+        env = "REBALANCE_TRANSFER_CONFIRM_POLL_SECS"
+    )]
+    rebalance_transfer_confirm_poll_secs: u64,
 }
 
 #[derive(Clone)]
@@ -398,6 +487,22 @@ struct RebalanceLoopConfig {
     threshold_pct: f64,
     quote_asset: String,
     max_slippage_bps: Decimal,
+    allowed_assets: Vec<String>,
+    allowed_venues: Vec<String>,
+    max_step_usd: Decimal,
+    min_fill_pct: f64,
+    pause_trading: bool,
+    balance_verify_tolerance_pct: Decimal,
+    journal_path: String,
+}
+
+struct RebalanceRuntime<'a> {
+    inventory: &'a Arc<RwLock<InventoryTracker>>,
+    transfer: Option<&'a RebalanceTransferContext>,
+    alert_sink: &'a Arc<dyn AlertSink>,
+    rebalance_pause: &'a Arc<Mutex<Option<String>>>,
+    halt: &'a Arc<HaltCoordinator>,
+    price_source: &'a Arc<AnyPriceSource>,
 }
 
 #[derive(Clone)]
@@ -412,13 +517,11 @@ struct RebalanceTransferContext {
     token_book: HashMap<String, RebalanceTokenConfig>,
     chain_id: u64,
     max_gas_gwei: Option<u64>,
+    transfer_confirm_timeout: Duration,
+    transfer_confirm_poll: Duration,
 }
 
-#[derive(Clone)]
-struct RebalanceTokenConfig {
-    address: Address,
-    decimals: u8,
-}
+type RebalanceTokenConfig = AddressBookTokenConfig;
 
 struct WsCexOrderBookSource {
     exchange: Arc<ExchangeClient>,
@@ -432,7 +535,10 @@ impl WsCexOrderBookSource {
         let depth_snapshots = Arc::new(RwLock::new(HashMap::new()));
         let top_snapshots = Arc::new(RwLock::new(HashMap::new()));
         for pair in pairs {
-            match exchange.fetch_order_book(pair, 20).await {
+            match exchange
+                .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
+                .await
+            {
                 Ok(snapshot) => {
                     depth_snapshots.write().await.insert(pair.clone(), snapshot);
                     info!(pair, "CEX order book seeded from REST snapshot");
@@ -450,7 +556,7 @@ impl WsCexOrderBookSource {
             exchange,
             depth_snapshots,
             top_snapshots,
-            max_age: Duration::from_secs(60),
+            max_age: Duration::from_secs(DEFAULT_BALANCE_SYNC_INTERVAL_SECS),
         }
     }
 }
@@ -533,7 +639,7 @@ fn spawn_depth_cache(
                     warn!(pair, error = %error, "CEX depth stream connect failed");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(DEFAULT_RECONNECT_DELAY_SECS)).await;
         }
     });
 }
@@ -559,10 +665,14 @@ fn local_book_from_snapshot(snapshot: &OrderBookSnapshot) -> LocalOrderBook {
 fn spawn_rebalance_loop(
     inventory: Arc<RwLock<InventoryTracker>>,
     halt: Arc<HaltCoordinator>,
+    alert_sink: Arc<dyn AlertSink>,
+    rebalance_pause: Arc<Mutex<Option<String>>>,
+    price_source: Arc<AnyPriceSource>,
     config: RebalanceLoopConfig,
     transfer: Option<RebalanceTransferContext>,
 ) {
     tokio::spawn(async move {
+        let mut active_rebalance_key = None::<String>;
         info!(
             dry_run = config.dry_run,
             interval_s = config.interval.as_secs(),
@@ -577,21 +687,34 @@ fn spawn_rebalance_loop(
                 break;
             }
 
-            run_rebalance_check(&inventory, &config, transfer.as_ref()).await;
+            run_rebalance_check(
+                RebalanceRuntime {
+                    inventory: &inventory,
+                    transfer: transfer.as_ref(),
+                    alert_sink: &alert_sink,
+                    rebalance_pause: &rebalance_pause,
+                    halt: &halt,
+                    price_source: &price_source,
+                },
+                &config,
+                &mut active_rebalance_key,
+            )
+            .await;
             tokio::time::sleep(config.interval).await;
         }
     });
 }
 
 async fn run_rebalance_check(
-    inventory: &Arc<RwLock<InventoryTracker>>,
+    runtime: RebalanceRuntime<'_>,
     config: &RebalanceLoopConfig,
-    transfer: Option<&RebalanceTransferContext>,
+    active_rebalance_key: &mut Option<String>,
 ) {
-    let tracker_snapshot = inventory.read().await.clone();
+    let tracker_snapshot = runtime.inventory.read().await.clone();
     let planner = RebalancePlanner::new(tracker_snapshot, config.threshold_pct);
     let plans = planner.plan_executable_all(&config.quote_asset, config.max_slippage_bps);
     if plans.is_empty() {
+        *active_rebalance_key = None;
         debug!("auto-rebalance check complete: no rebalance needed");
         return;
     }
@@ -603,9 +726,84 @@ async fn run_rebalance_check(
         dry_run = config.dry_run,
         "auto-rebalance plan generated"
     );
+    let plan_key = rebalance_plan_key(&plans);
+    if active_rebalance_key.as_deref() != Some(plan_key.as_str()) {
+        *active_rebalance_key = Some(plan_key.clone());
+        append_rebalance_journal(
+            &config.journal_path,
+            json!({
+                "event": "plan_generated",
+                "plan_key": plan_key,
+                "assets": plans.len(),
+                "steps": total_steps,
+                "dry_run": config.dry_run,
+                "quote_asset": config.quote_asset,
+            }),
+        );
+        emit_best_effort(
+            runtime.alert_sink,
+            &AlertEvent::RebalanceTriggered {
+                assets: plans.len(),
+                steps: total_steps,
+                dry_run: config.dry_run,
+                quote_asset: config.quote_asset.clone(),
+            },
+        )
+        .await;
+    }
+
+    let mut trading_paused = false;
+    if !config.dry_run && config.pause_trading {
+        let reason = format!("rebalance active plan={plan_key}");
+        *runtime.rebalance_pause.lock().await = Some(reason.clone());
+        append_rebalance_journal(
+            &config.journal_path,
+            json!({
+                "event": "trading_paused",
+                "plan_key": plan_key,
+                "reason": reason,
+            }),
+        );
+        trading_paused = true;
+    }
 
     for (asset, steps) in plans {
         for step in steps {
+            let validation = validate_rebalance_step(&step, config, runtime.price_source).await;
+            if let Err(error) = validation {
+                warn!(error = %error, "auto-rebalance step rejected by safety guard");
+                append_rebalance_journal(
+                    &config.journal_path,
+                    json!({
+                        "event": "step_rejected",
+                        "plan_key": plan_key,
+                        "asset": asset,
+                        "step": rebalance_step_label(&step),
+                        "reason": error,
+                    }),
+                );
+                emit_best_effort(
+                    runtime.alert_sink,
+                    &AlertEvent::RebalanceStepFailed {
+                        asset: asset.clone(),
+                        step: rebalance_step_label(&step),
+                        reason: error,
+                    },
+                )
+                .await;
+                if !config.dry_run {
+                    if trading_paused {
+                        clear_rebalance_pause(
+                            runtime.rebalance_pause,
+                            &config.journal_path,
+                            &plan_key,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                continue;
+            }
             match &step {
                 RebalanceStep::Trade(trade) => {
                     info!(
@@ -630,30 +828,129 @@ async fn run_rebalance_check(
                 }
             }
             if !config.dry_run {
-                match execute_rebalance_step(&step, transfer).await {
+                append_rebalance_journal(
+                    &config.journal_path,
+                    json!({
+                        "event": "step_started",
+                        "plan_key": plan_key,
+                        "asset": asset,
+                        "step": rebalance_step_label(&step),
+                    }),
+                );
+                match execute_rebalance_step(
+                    &step,
+                    runtime.transfer,
+                    runtime.inventory,
+                    config.min_fill_pct,
+                )
+                .await
+                {
                     Ok(reference) => {
                         info!(reference, "auto-rebalance step submitted");
+                        append_rebalance_journal(
+                            &config.journal_path,
+                            json!({
+                                "event": "step_completed",
+                                "plan_key": plan_key,
+                                "asset": asset,
+                                "step": rebalance_step_label(&step),
+                                "reference": reference,
+                            }),
+                        );
+                        emit_best_effort(
+                            runtime.alert_sink,
+                            &AlertEvent::RebalanceStepCompleted {
+                                asset: asset.clone(),
+                                step: rebalance_step_label(&step),
+                                reference,
+                            },
+                        )
+                        .await;
+                        if let Err(error) = verify_rebalance_after_step(
+                            &step,
+                            runtime.transfer,
+                            runtime.inventory,
+                            runtime.alert_sink,
+                            runtime.halt,
+                            &config.journal_path,
+                            config.balance_verify_tolerance_pct,
+                        )
+                        .await
+                        {
+                            warn!(error = %error, "auto-rebalance post-step verification failed");
+                            append_rebalance_journal(
+                                &config.journal_path,
+                                json!({
+                                    "event": "post_step_verify_failed",
+                                    "plan_key": plan_key,
+                                    "asset": asset,
+                                    "step": rebalance_step_label(&step),
+                                    "reason": error,
+                                }),
+                            );
+                            if trading_paused {
+                                clear_rebalance_pause(
+                                    runtime.rebalance_pause,
+                                    &config.journal_path,
+                                    &plan_key,
+                                )
+                                .await;
+                            }
+                            return;
+                        }
                     }
                     Err(error) => {
                         warn!(error = %error, "auto-rebalance step execution failed");
+                        append_rebalance_journal(
+                            &config.journal_path,
+                            json!({
+                                "event": "step_failed",
+                                "plan_key": plan_key,
+                                "asset": asset,
+                                "step": rebalance_step_label(&step),
+                                "reason": error,
+                            }),
+                        );
+                        emit_best_effort(
+                            runtime.alert_sink,
+                            &AlertEvent::RebalanceStepFailed {
+                                asset: asset.clone(),
+                                step: rebalance_step_label(&step),
+                                reason: error,
+                            },
+                        )
+                        .await;
+                        if trading_paused {
+                            clear_rebalance_pause(
+                                runtime.rebalance_pause,
+                                &config.journal_path,
+                                &plan_key,
+                            )
+                            .await;
+                        }
                         return;
                     }
                 }
             }
         }
     }
+    if trading_paused {
+        clear_rebalance_pause(runtime.rebalance_pause, &config.journal_path, &plan_key).await;
+    }
 }
 
 async fn execute_rebalance_step(
     step: &RebalanceStep,
     transfer: Option<&RebalanceTransferContext>,
+    inventory: &Arc<RwLock<InventoryTracker>>,
+    min_fill_pct: f64,
 ) -> Result<String, String> {
     let Some(transfer) = transfer else {
         return Err("real rebalance transfer context is not configured".into());
     };
     match step {
-        RebalanceStep::Trade(_) => {
-            Err("real CEX rebalance trade execution is not wired here".into())
+        RebalanceStep::Trade(trade) => {
+            execute_rebalance_trade(trade, transfer, inventory, min_fill_pct).await
         }
         RebalanceStep::Withdraw(withdraw) => {
             if withdraw.from_venue.is_cex() && withdraw.to_venue == Venue::Wallet {
@@ -670,6 +967,387 @@ async fn execute_rebalance_step(
     }
 }
 
+fn rebalance_plan_key(plans: &HashMap<String, Vec<RebalanceStep>>) -> String {
+    let mut parts = Vec::new();
+    let mut assets: Vec<_> = plans.keys().collect();
+    assets.sort();
+    for asset in assets {
+        if let Some(steps) = plans.get(asset) {
+            let mut step_labels: Vec<_> = steps.iter().map(rebalance_step_label).collect();
+            step_labels.sort();
+            parts.push(format!("{asset}:{}", step_labels.join(",")));
+        }
+    }
+    parts.join("|")
+}
+
+fn rebalance_step_label(step: &RebalanceStep) -> String {
+    match step {
+        RebalanceStep::Trade(trade) => format!(
+            "trade:{}:{}:{}:{}",
+            trade.venue, trade.symbol, trade.side, trade.amount
+        ),
+        RebalanceStep::Withdraw(withdraw) => format!(
+            "withdraw:{}->{}:{}:{}",
+            withdraw.from_venue, withdraw.to_venue, withdraw.asset, withdraw.amount
+        ),
+    }
+}
+
+async fn clear_rebalance_pause(
+    rebalance_pause: &Arc<Mutex<Option<String>>>,
+    journal_path: &str,
+    plan_key: &str,
+) {
+    let reason = rebalance_pause.lock().await.take();
+    append_rebalance_journal(
+        journal_path,
+        json!({
+            "event": "trading_resumed",
+            "plan_key": plan_key,
+            "reason": reason,
+        }),
+    );
+}
+
+fn append_rebalance_journal<T: Serialize>(path: &str, payload: T) {
+    if path.trim().is_empty() {
+        return;
+    }
+    let mut value = serde_json::to_value(payload).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("ts".into(), json!(Utc::now().to_rfc3339()));
+    }
+    if let Some(parent) = Path::new(path).parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        warn!(path, error = %error, "failed to create rebalance journal directory");
+        return;
+    }
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "{value}") {
+                warn!(path, error = %error, "failed to write rebalance journal event");
+            }
+        }
+        Err(error) => warn!(path, error = %error, "failed to open rebalance journal"),
+    }
+}
+
+async fn validate_rebalance_step(
+    step: &RebalanceStep,
+    config: &RebalanceLoopConfig,
+    price_source: &Arc<AnyPriceSource>,
+) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&config.min_fill_pct) {
+        return Err(format!(
+            "REBALANCE_MIN_FILL_PCT must be between 0 and 1, got {}",
+            config.min_fill_pct
+        ));
+    }
+    validate_rebalance_assets(step, &config.allowed_assets)?;
+    validate_rebalance_venues(step, &config.allowed_venues)?;
+    if config.max_step_usd > Decimal::ZERO {
+        let notional_usd = rebalance_step_notional_usd(step, price_source).await?;
+        if notional_usd > config.max_step_usd {
+            return Err(format!(
+                "rebalance step notional ${notional_usd} exceeds max ${}",
+                config.max_step_usd
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rebalance_assets(step: &RebalanceStep, allowed: &[String]) -> Result<(), String> {
+    match step {
+        RebalanceStep::Trade(trade) => {
+            for asset in [&trade.base_asset, &trade.quote_asset] {
+                if !contains_ignore_ascii_case(allowed, asset) {
+                    return Err(format!("rebalance asset {asset} is not allowlisted"));
+                }
+            }
+        }
+        RebalanceStep::Withdraw(withdraw) => {
+            if !contains_ignore_ascii_case(allowed, &withdraw.asset) {
+                return Err(format!(
+                    "rebalance asset {} is not allowlisted",
+                    withdraw.asset
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rebalance_venues(step: &RebalanceStep, allowed: &[String]) -> Result<(), String> {
+    match step {
+        RebalanceStep::Trade(trade) => {
+            if !contains_ignore_ascii_case(allowed, &trade.venue.to_string()) {
+                return Err(format!(
+                    "rebalance venue {} is not allowlisted",
+                    trade.venue
+                ));
+            }
+        }
+        RebalanceStep::Withdraw(withdraw) => {
+            for venue in [withdraw.from_venue, withdraw.to_venue] {
+                if !contains_ignore_ascii_case(allowed, &venue.to_string()) {
+                    return Err(format!("rebalance venue {venue} is not allowlisted"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn rebalance_step_notional_usd(
+    step: &RebalanceStep,
+    price_source: &Arc<AnyPriceSource>,
+) -> Result<Decimal, String> {
+    match step {
+        RebalanceStep::Trade(trade) => {
+            let price = asset_usd_price(&trade.base_asset, price_source).await?;
+            Ok(trade.amount * price)
+        }
+        RebalanceStep::Withdraw(withdraw) => {
+            let price = asset_usd_price(&withdraw.asset, price_source).await?;
+            Ok(withdraw.amount * price)
+        }
+    }
+}
+
+async fn asset_usd_price(
+    asset: &str,
+    price_source: &Arc<AnyPriceSource>,
+) -> Result<Decimal, String> {
+    if asset.eq_ignore_ascii_case(USDC_SYMBOL)
+        || asset.eq_ignore_ascii_case(USDT_SYMBOL)
+        || asset.eq_ignore_ascii_case(USD_SYMBOL)
+    {
+        return Ok(Decimal::ONE);
+    }
+    let priced_asset = rebalance_pricing_asset(asset);
+    let direct_pair = format!("{}/{}", priced_asset, USDC_SYMBOL);
+    if let Ok(price) = price_source.get_latest_price(&direct_pair).await {
+        return Ok(price);
+    }
+    if priced_asset == ETH_SYMBOL {
+        return Err("failed to price ETH via ETH/USDC for rebalance max-step guard".into());
+    }
+    let eth_pair = format!("{}/ETH", priced_asset);
+    let asset_eth = price_source
+        .get_latest_price(&eth_pair)
+        .await
+        .map_err(|e| format!("failed to price {asset} via {eth_pair}: {e}"))?;
+    let eth_usd = price_source
+        .get_latest_price(ETH_USDC_PAIR)
+        .await
+        .map_err(|e| format!("failed to price ETH via ETH/USDC: {e}"))?;
+    Ok(asset_eth * eth_usd)
+}
+
+fn rebalance_pricing_asset(asset: &str) -> String {
+    if asset.eq_ignore_ascii_case(WETH_SYMBOL) {
+        ETH_SYMBOL.to_string()
+    } else {
+        asset.to_ascii_uppercase()
+    }
+}
+
+fn contains_ignore_ascii_case(values: &[String], needle: &str) -> bool {
+    values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(needle))
+}
+
+async fn verify_rebalance_after_step(
+    step: &RebalanceStep,
+    transfer: Option<&RebalanceTransferContext>,
+    inventory: &Arc<RwLock<InventoryTracker>>,
+    alert_sink: &Arc<dyn AlertSink>,
+    halt: &Arc<HaltCoordinator>,
+    journal_path: &str,
+    tolerance_pct: Decimal,
+) -> Result<(), String> {
+    if tolerance_pct <= Decimal::ZERO {
+        return Ok(());
+    }
+    match step {
+        RebalanceStep::Trade(_) => {
+            let Some(transfer) = transfer else {
+                return Err(
+                    "rebalance transfer context missing for post-trade verification".into(),
+                );
+            };
+            let mismatches = verify_cex_balance(&transfer.exchange, inventory, tolerance_pct)
+                .await
+                .ok_or_else(|| {
+                    "failed to fetch CEX balances for rebalance verification".to_string()
+                })?;
+            if mismatches.is_empty() {
+                append_rebalance_journal(
+                    journal_path,
+                    json!({
+                        "event": "post_step_verified",
+                        "step": rebalance_step_label(step),
+                        "venue": "binance",
+                    }),
+                );
+                return Ok(());
+            }
+            for mismatch in mismatches {
+                append_rebalance_journal(
+                    journal_path,
+                    json!({
+                        "event": "balance_mismatch",
+                        "venue": mismatch.venue.to_string(),
+                        "asset": mismatch.asset,
+                        "tracked": mismatch.tracked.to_string(),
+                        "actual": mismatch.actual.to_string(),
+                        "diff": mismatch.diff.to_string(),
+                    }),
+                );
+                emit_best_effort(
+                    alert_sink,
+                    &AlertEvent::BalanceMismatch {
+                        venue: mismatch.venue.to_string(),
+                        asset: mismatch.asset,
+                        tracked: mismatch.tracked.to_string(),
+                        actual: mismatch.actual.to_string(),
+                        diff: mismatch.diff.to_string(),
+                    },
+                )
+                .await;
+            }
+            halt.halt("rebalance post-step balance mismatch");
+            Err("rebalance post-step balance mismatch; bot halted".into())
+        }
+        RebalanceStep::Withdraw(withdraw) => {
+            append_rebalance_journal(
+                journal_path,
+                json!({
+                    "event": "post_step_verified",
+                    "step": rebalance_step_label(step),
+                    "asset": withdraw.asset,
+                    "venue": "transfer",
+                }),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn parse_rebalance_csv_upper(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+        .collect()
+}
+
+fn parse_rebalance_csv_lower(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+async fn execute_rebalance_trade(
+    trade: &peanut_internship_rust::inventory::types::TradeStep,
+    transfer: &RebalanceTransferContext,
+    inventory: &Arc<RwLock<InventoryTracker>>,
+    min_fill_pct: f64,
+) -> Result<String, String> {
+    if trade.venue != Venue::Binance {
+        return Err(format!(
+            "real CEX rebalance trade only supports Binance, got {}",
+            trade.venue
+        ));
+    }
+    let order_book = transfer
+        .exchange
+        .fetch_order_book(&trade.symbol, DEFAULT_ORDERBOOK_DEPTH)
+        .await
+        .map_err(|e| format!("failed to fetch rebalance order book: {e}"))?;
+    let analyzer = OrderBookAnalyzer::new(order_book);
+    let walk = analyzer
+        .walk_the_book(&trade.side.to_lowercase(), trade.amount)
+        .map_err(|e| format!("rebalance book walk failed: {e}"))?;
+    if walk.slippage_bps > trade.max_slippage_bps {
+        return Err(format!(
+            "rebalance slippage {} bps exceeds limit {} bps",
+            walk.slippage_bps, trade.max_slippage_bps
+        ));
+    }
+    let price = match trade.side.as_str() {
+        "BUY" => analyzer
+            .orderbook()
+            .best_ask
+            .map(|(price, _)| price)
+            .unwrap_or(walk.avg_price),
+        "SELL" => analyzer
+            .orderbook()
+            .best_bid
+            .map(|(price, _)| price)
+            .unwrap_or(walk.avg_price),
+        other => return Err(format!("unsupported rebalance trade side: {other}")),
+    };
+    let amount_f = trade.amount.to_f64().ok_or_else(|| {
+        format!(
+            "rebalance amount {} cannot be represented as f64",
+            trade.amount
+        )
+    })?;
+    let price_f = price
+        .to_f64()
+        .ok_or_else(|| format!("rebalance price {price} cannot be represented as f64"))?;
+    let order = transfer
+        .exchange
+        .create_limit_ioc_order(&trade.symbol, &trade.side, amount_f, price_f)
+        .await
+        .map_err(|e| e.to_string())?;
+    if order.amount_filled <= Decimal::ZERO {
+        return Err(format!(
+            "rebalance order did not fill: status={}, order_id={}",
+            order.status, order.id
+        ));
+    }
+    let min_fill_ratio = Decimal::from_f64_retain(min_fill_pct)
+        .ok_or_else(|| format!("invalid rebalance min fill pct: {min_fill_pct}"))?;
+    let min_fill = trade.amount * min_fill_ratio;
+    if order.amount_filled < min_fill {
+        return Err(format!(
+            "rebalance order underfilled: filled={}, required={}, order_id={}",
+            order.amount_filled, min_fill, order.id
+        ));
+    }
+    let fee_asset = if order.fee_asset.is_empty() {
+        trade.quote_asset.as_str()
+    } else {
+        order.fee_asset.as_str()
+    };
+    inventory
+        .write()
+        .await
+        .record_trade(
+            trade.venue,
+            &trade.side.to_lowercase(),
+            &trade.base_asset,
+            &trade.quote_asset,
+            order.amount_filled,
+            order.amount_filled * order.avg_fill_price,
+            order.fee,
+            fee_asset,
+        )
+        .map_err(|e| format!("failed to record rebalance trade in inventory: {e}"))?;
+    Ok(format!(
+        "binance_order:{} status={} filled={} avg_price={}",
+        order.id, order.status, order.amount_filled, order.avg_fill_price
+    ))
+}
+
 async fn execute_cex_to_wallet_withdraw(
     withdraw: &peanut_internship_rust::inventory::types::WithdrawStep,
     transfer: &RebalanceTransferContext,
@@ -681,17 +1359,335 @@ async fn execute_cex_to_wallet_withdraw(
             withdraw.amount, withdraw.fee
         ));
     }
-    transfer
+    if withdraw.asset.eq_ignore_ascii_case(WETH_SYMBOL)
+        && !transfer
+            .cex_withdraw_address
+            .eq_ignore_ascii_case(&transfer.wallet.address())
+    {
+        return Err("WETH rebalance requires Binance withdrawal address to be the signer wallet so native ETH can be wrapped after receipt".into());
+    }
+    verify_binance_withdrawal_capability(transfer, withdraw, send_amount).await?;
+    let cex_asset = rebalance_cex_asset(&withdraw.asset);
+    let withdraw_id = transfer
         .exchange
         .withdraw_to_address(
-            &withdraw.asset,
+            &cex_asset,
             &transfer.cex_withdraw_address,
             send_amount,
             &transfer.cex_withdraw_network,
         )
         .await
-        .map(|id| format!("binance_withdraw:{id}"))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let record = wait_for_binance_withdrawal(transfer, &cex_asset, &withdraw_id).await?;
+    let mut reference = format!(
+        "binance_withdraw:{} status={} tx_id={}",
+        withdraw_id,
+        record.status,
+        record.tx_id.unwrap_or_default()
+    );
+    if withdraw.asset.eq_ignore_ascii_case(WETH_SYMBOL) {
+        let wrap_tx = wrap_native_eth_for_rebalance(withdraw, transfer, send_amount).await?;
+        reference.push_str(&format!(" wrapped_weth_tx={wrap_tx}"));
+    }
+    Ok(reference)
+}
+
+async fn verify_binance_withdrawal_capability(
+    transfer: &RebalanceTransferContext,
+    withdraw: &peanut_internship_rust::inventory::types::WithdrawStep,
+    send_amount: Decimal,
+) -> Result<(), String> {
+    let configs = transfer
+        .exchange
+        .fetch_capital_config()
+        .await
+        .map_err(|e| format!("failed to fetch Binance capital config: {e}"))?;
+    validate_binance_withdrawal_capability(
+        &configs,
+        withdraw,
+        send_amount,
+        &transfer.cex_withdraw_network,
+    )
+}
+
+fn validate_binance_withdrawal_capability(
+    configs: &[peanut_internship_rust::exchange::CapitalCoinConfig],
+    withdraw: &peanut_internship_rust::inventory::types::WithdrawStep,
+    send_amount: Decimal,
+    expected_network: &str,
+) -> Result<(), String> {
+    let cex_asset = rebalance_cex_asset(&withdraw.asset);
+    let coin = configs
+        .iter()
+        .find(|coin| coin.coin.eq_ignore_ascii_case(&cex_asset))
+        .ok_or_else(|| format!("Binance capital config missing coin {cex_asset}"))?;
+    let network = coin
+        .networks
+        .iter()
+        .find(|network| network.network.eq_ignore_ascii_case(expected_network))
+        .ok_or_else(|| {
+            let available = coin
+                .networks
+                .iter()
+                .map(|network| network.network.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "Binance coin {} does not support withdrawal network {}; available networks: {}",
+                cex_asset, expected_network, available
+            )
+        })?;
+    if !network.withdraw_enable {
+        return Err(format!(
+            "Binance withdrawal disabled for {} on network {}",
+            cex_asset, network.network
+        ));
+    }
+    if send_amount < network.withdraw_min {
+        return Err(format!(
+            "Binance withdrawal amount {} below minimum {} for {} on {}",
+            send_amount, network.withdraw_min, cex_asset, network.network
+        ));
+    }
+    if withdraw.fee < network.withdraw_fee {
+        return Err(format!(
+            "rebalance configured withdrawal fee {} below Binance fee {} for {} on {}",
+            withdraw.fee, network.withdraw_fee, cex_asset, network.network
+        ));
+    }
+    Ok(())
+}
+
+fn rebalance_cex_asset(asset: &str) -> String {
+    if asset.eq_ignore_ascii_case(WETH_SYMBOL) {
+        ETH_SYMBOL.to_string()
+    } else {
+        asset.to_ascii_uppercase()
+    }
+}
+
+fn rebalance_weth_token(
+    transfer: &RebalanceTransferContext,
+) -> Result<&RebalanceTokenConfig, String> {
+    transfer
+        .token_book
+        .get(WETH_SYMBOL)
+        .or_else(|| transfer.token_book.get(ETH_SYMBOL))
+        .ok_or_else(|| "asset WETH missing from rebalance token book".to_string())
+}
+
+fn rebalance_weth_token_from_book(
+    token_book: &HashMap<String, RebalanceTokenConfig>,
+) -> Result<&RebalanceTokenConfig, String> {
+    token_book
+        .get(WETH_SYMBOL)
+        .or_else(|| token_book.get(ETH_SYMBOL))
+        .ok_or_else(|| "asset WETH missing from rebalance token book".to_string())
+}
+
+fn validate_rebalance_weth_transfer_config(
+    allowed_assets: &[String],
+    token_book: &HashMap<String, RebalanceTokenConfig>,
+    chain_id: u64,
+    cex_withdraw_address: &str,
+    wallet_address: &str,
+) -> Result<(), String> {
+    if !allowed_assets
+        .iter()
+        .any(|asset| asset.eq_ignore_ascii_case(WETH_SYMBOL))
+    {
+        return Ok(());
+    }
+    if chain_id != ARBITRUM_CHAIN_ID {
+        return Err(format!(
+            "WETH rebalance auto-wrap is currently supported only on Arbitrum chain {ARBITRUM_CHAIN_ID}, got {chain_id}"
+        ));
+    }
+    if !cex_withdraw_address.eq_ignore_ascii_case(wallet_address) {
+        return Err("WETH rebalance requires Binance withdrawal address to be the signer wallet so native ETH can be wrapped after receipt".to_string());
+    }
+    let token = rebalance_weth_token_from_book(token_book)?;
+    if token.decimals != ETH_DECIMALS {
+        return Err(format!(
+            "rebalance WETH token decimals {} do not match expected {}",
+            token.decimals, ETH_DECIMALS
+        ));
+    }
+    let expected_weth =
+        Address::new(ARBITRUM_WETH_ADDRESS).map_err(|e| format!("invalid WETH constant: {e}"))?;
+    if token.address != expected_weth {
+        return Err(format!(
+            "rebalance WETH token address {} does not match Arbitrum WETH {}",
+            token.address, expected_weth
+        ));
+    }
+    Ok(())
+}
+
+fn native_balance_required_for_value_and_gas(
+    value: U256,
+    max_fee_per_gas: U256,
+    gas_limit: u64,
+) -> U256 {
+    value.saturating_add(max_fee_per_gas.saturating_mul(U256::from(gas_limit)))
+}
+
+async fn wait_for_native_balance_for_rebalance(
+    transfer: &RebalanceTransferContext,
+    address: &Address,
+    value: U256,
+    max_fee_per_gas: U256,
+    gas_limit: u64,
+    context: &str,
+) -> Result<(), String> {
+    let required = native_balance_required_for_value_and_gas(value, max_fee_per_gas, gas_limit);
+    let start = std::time::Instant::now();
+    loop {
+        let balance = transfer
+            .chain
+            .get_balance(address)
+            .await
+            .map_err(|e| format!("{context} failed to fetch native ETH balance: {e}"))?;
+        if balance.raw >= required {
+            return Ok(());
+        }
+        if start.elapsed() >= transfer.transfer_confirm_timeout {
+            let current = balance.human().map_err(|e| e.to_string())?;
+            let required_human = TokenAmount::eth(required)
+                .human()
+                .map_err(|e| e.to_string())?;
+            return Err(format!(
+                "{context} timed out waiting for native ETH balance: current {current}, required {required_human}"
+            ));
+        }
+        warn!(
+            context,
+            current_wei = %balance.raw,
+            required_wei = %required,
+            poll_secs = transfer.transfer_confirm_poll.as_secs(),
+            "waiting for native ETH balance before rebalance on-chain transaction"
+        );
+        tokio::time::sleep(transfer.transfer_confirm_poll).await;
+    }
+}
+
+async fn wrap_native_eth_for_rebalance(
+    withdraw: &peanut_internship_rust::inventory::types::WithdrawStep,
+    transfer: &RebalanceTransferContext,
+    amount: Decimal,
+) -> Result<String, String> {
+    let from = Address::new(transfer.wallet.address()).map_err(|e| e.to_string())?;
+    let token = rebalance_weth_token(transfer)?;
+    if token.decimals != ETH_DECIMALS {
+        return Err(format!(
+            "rebalance WETH token decimals {} do not match expected {}",
+            token.decimals, ETH_DECIMALS
+        ));
+    }
+    let wrap_value = TokenAmount::from_human(amount, ETH_DECIMALS, Some(ETH_SYMBOL.to_string()))
+        .map_err(|e| e.to_string())?;
+    let gas = transfer
+        .chain
+        .get_gas_price()
+        .await
+        .map_err(|e| e.to_string())?;
+    let max_priority_fee = gas.priority_fee_medium;
+    let max_fee = gas.get_max_fee(GasPriority::Medium, DEFAULT_GAS_BUFFER_BPS);
+    if let Some(max_gas_gwei) = transfer.max_gas_gwei {
+        let cap = U256::from(max_gas_gwei) * U256::from(WEI_PER_GWEI);
+        if max_fee > cap {
+            return Err(format!(
+                "rebalance WETH wrap max_fee_per_gas {} exceeds cap {}",
+                max_fee, cap
+            ));
+        }
+    }
+    let mut tx = TransactionRequest {
+        to: token.address.clone(),
+        value: wrap_value.clone(),
+        data: Bytes::from(WETH_DEPOSIT_SELECTOR.to_vec()),
+        nonce: None,
+        gas_limit: Some(REBALANCE_WETH_WRAP_GAS_LIMIT),
+        max_fee_per_gas: Some(max_fee),
+        max_priority_fee: Some(max_priority_fee),
+        chain_id: transfer.chain_id,
+    };
+    wait_for_native_balance_for_rebalance(
+        transfer,
+        &from,
+        wrap_value.raw,
+        max_fee,
+        tx.gas_limit.unwrap_or(REBALANCE_WETH_WRAP_GAS_LIMIT),
+        REBALANCE_WETH_WRAP_CONTEXT,
+    )
+    .await?;
+    match transfer.chain.estimate_gas(&tx).await {
+        Ok(estimated) => {
+            let buffered: U256 = U256::from(estimated)
+                .saturating_mul(U256::from(DEFAULT_GAS_BUFFER_BPS))
+                / U256::from(BPS_SCALE);
+            tx.gas_limit = Some(buffered.as_u64().max(MIN_GAS_LIMIT));
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                asset = %withdraw.asset,
+                amount = %amount,
+                "failed to estimate rebalance WETH wrap gas, using configured fallback gas limit"
+            );
+        }
+    }
+    wait_for_native_balance_for_rebalance(
+        transfer,
+        &from,
+        wrap_value.raw,
+        max_fee,
+        tx.gas_limit.unwrap_or(REBALANCE_WETH_WRAP_GAS_LIMIT),
+        REBALANCE_WETH_WRAP_CONTEXT,
+    )
+    .await?;
+    let nonce = transfer
+        .nonce_manager
+        .reserve_next(&transfer.chain, transfer.chain_id, &from)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.nonce = Some(nonce);
+    let signed = match transfer.wallet.sign_transaction_bytes(&tx).await {
+        Ok(signed) => signed,
+        Err(e) => {
+            transfer
+                .nonce_manager
+                .mark_failed(transfer.chain_id, &from, nonce)
+                .await;
+            return Err(format!("rebalance WETH wrap sign failed: {e}"));
+        }
+    };
+    let tx_hash = match transfer.chain.send_transaction(&signed).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            transfer
+                .nonce_manager
+                .mark_failed(transfer.chain_id, &from, nonce)
+                .await;
+            return Err(format!("rebalance WETH wrap send failed: {e}"));
+        }
+    };
+    let receipt = transfer
+        .chain
+        .wait_for_receipt(&tx_hash, transfer.transfer_confirm_timeout.as_secs(), 2.0)
+        .await
+        .map_err(|e| format!("rebalance WETH wrap tx {tx_hash} confirmation failed: {e}"))?;
+    if !receipt.status {
+        return Err(format!(
+            "rebalance WETH wrap tx {tx_hash} reverted on-chain"
+        ));
+    }
+    info!(
+        tx = %tx_hash,
+        amount = %amount,
+        "auto-rebalance wrapped native ETH to WETH"
+    );
+    Ok(tx_hash)
 }
 
 async fn execute_wallet_to_cex_transfer(
@@ -699,15 +1695,18 @@ async fn execute_wallet_to_cex_transfer(
     transfer: &RebalanceTransferContext,
 ) -> Result<String, String> {
     let from = Address::new(transfer.wallet.address()).map_err(|e| e.to_string())?;
+    if withdraw.asset.eq_ignore_ascii_case(WETH_SYMBOL) {
+        return Err("Wallet→CEX WETH rebalance requires unwrap-to-ETH before Binance deposit; refusing to send ERC-20 WETH to Binance".into());
+    }
     let gas = transfer
         .chain
         .get_gas_price()
         .await
         .map_err(|e| e.to_string())?;
     let max_priority_fee = gas.priority_fee_medium;
-    let max_fee = gas.get_max_fee(GasPriority::Medium, 12_000);
+    let max_fee = gas.get_max_fee(GasPriority::Medium, DEFAULT_GAS_BUFFER_BPS);
     if let Some(max_gas_gwei) = transfer.max_gas_gwei {
-        let cap = U256::from(max_gas_gwei) * U256::from(1_000_000_000u64);
+        let cap = U256::from(max_gas_gwei) * U256::from(WEI_PER_GWEI);
         if max_fee > cap {
             return Err(format!(
                 "rebalance tx max_fee_per_gas {} exceeds cap {}",
@@ -716,14 +1715,18 @@ async fn execute_wallet_to_cex_transfer(
         }
     }
 
-    let mut tx = if withdraw.asset.eq_ignore_ascii_case("ETH") {
+    let mut tx = if withdraw.asset.eq_ignore_ascii_case(ETH_SYMBOL) {
         TransactionRequest {
             to: transfer.cex_deposit_address.clone(),
-            value: TokenAmount::from_human(withdraw.amount, ETH_DECIMALS, Some("ETH".to_string()))
-                .map_err(|e| e.to_string())?,
+            value: TokenAmount::from_human(
+                withdraw.amount,
+                ETH_DECIMALS,
+                Some(ETH_SYMBOL.to_string()),
+            )
+            .map_err(|e| e.to_string())?,
             data: Bytes::new(),
             nonce: None,
-            gas_limit: Some(21_000),
+            gas_limit: Some(REBALANCE_NATIVE_TRANSFER_GAS_LIMIT),
             max_fee_per_gas: Some(max_fee),
             max_priority_fee: Some(max_priority_fee),
             chain_id: transfer.chain_id,
@@ -747,7 +1750,7 @@ async fn execute_wallet_to_cex_transfer(
                 amount.raw,
             )),
             nonce: None,
-            gas_limit: Some(100_000),
+            gas_limit: Some(REBALANCE_TOKEN_TRANSFER_GAS_LIMIT),
             max_fee_per_gas: Some(max_fee),
             max_priority_fee: Some(max_priority_fee),
             chain_id: transfer.chain_id,
@@ -755,7 +1758,10 @@ async fn execute_wallet_to_cex_transfer(
     };
 
     if let Ok(estimated) = transfer.chain.estimate_gas(&tx).await {
-        tx.gas_limit = Some((estimated.saturating_mul(12_000) / 10_000).max(21_000));
+        let buffered: U256 = U256::from(estimated)
+            .saturating_mul(U256::from(DEFAULT_GAS_BUFFER_BPS))
+            / U256::from(BPS_SCALE);
+        tx.gas_limit = Some(buffered.as_u64().max(MIN_GAS_LIMIT));
     }
     let nonce = transfer
         .nonce_manager
@@ -773,12 +1779,98 @@ async fn execute_wallet_to_cex_transfer(
             return Err(e.to_string());
         }
     };
-    transfer
+    let tx_hash = match transfer.chain.send_transaction(&signed).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            transfer
+                .nonce_manager
+                .mark_failed(transfer.chain_id, &from, nonce)
+                .await;
+            return Err(e.to_string());
+        }
+    };
+    let receipt = transfer
         .chain
-        .send_transaction(&signed)
+        .wait_for_receipt(&tx_hash, transfer.transfer_confirm_timeout.as_secs(), 2.0)
         .await
-        .map(|hash| format!("wallet_tx:{hash}"))
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("wallet tx {tx_hash} confirmation failed: {e}"))?;
+    if !receipt.status {
+        return Err(format!("wallet tx {tx_hash} reverted on-chain"));
+    }
+    let deposit = wait_for_binance_deposit(transfer, &withdraw.asset, &tx_hash).await?;
+    Ok(format!(
+        "wallet_tx:{tx_hash} confirmed_block={} gas_used={} binance_deposit_status={}",
+        receipt.block_number, receipt.gas_used, deposit.status
+    ))
+}
+
+async fn wait_for_binance_withdrawal(
+    transfer: &RebalanceTransferContext,
+    asset: &str,
+    withdraw_id: &str,
+) -> Result<peanut_internship_rust::exchange::WithdrawalRecord, String> {
+    let deadline = tokio::time::Instant::now() + transfer.transfer_confirm_timeout;
+    loop {
+        let records = transfer
+            .exchange
+            .fetch_withdrawal_history(asset)
+            .await
+            .map_err(|e| format!("failed to fetch Binance withdrawal history: {e}"))?;
+        if let Some(record) = records.into_iter().find(|record| record.id == withdraw_id) {
+            if record.completed() {
+                return Ok(record);
+            }
+            if record.failed() {
+                return Err(format!(
+                    "Binance withdrawal {withdraw_id} failed with status {}",
+                    record.status
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting for Binance withdrawal {withdraw_id} completion"
+            ));
+        }
+        tokio::time::sleep(transfer.transfer_confirm_poll).await;
+    }
+}
+
+async fn wait_for_binance_deposit(
+    transfer: &RebalanceTransferContext,
+    asset: &str,
+    tx_hash: &str,
+) -> Result<peanut_internship_rust::exchange::DepositRecord, String> {
+    let deadline = tokio::time::Instant::now() + transfer.transfer_confirm_timeout;
+    loop {
+        let records = transfer
+            .exchange
+            .fetch_deposit_history(asset, Some(tx_hash))
+            .await
+            .map_err(|e| format!("failed to fetch Binance deposit history: {e}"))?;
+        if let Some(record) = records.into_iter().find(|record| {
+            record
+                .tx_id
+                .as_deref()
+                .is_some_and(|tx_id| tx_id.eq_ignore_ascii_case(tx_hash))
+        }) {
+            if record.credited() {
+                return Ok(record);
+            }
+            if record.failed() {
+                return Err(format!(
+                    "Binance deposit for tx {tx_hash} failed with status {}",
+                    record.status
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting for Binance deposit credit for tx {tx_hash}"
+            ));
+        }
+        tokio::time::sleep(transfer.transfer_confirm_poll).await;
+    }
 }
 
 fn erc20_transfer_calldata(to: &Address, amount: U256) -> Vec<u8> {
@@ -817,7 +1909,7 @@ fn spawn_book_ticker_cache(
                         let spread_bps = if mid.is_zero() {
                             None
                         } else {
-                            Some((ask_price - bid_price) / mid * Decimal::from(10_000))
+                            Some((ask_price - bid_price) / mid * Decimal::from(BPS_SCALE))
                         };
                         let snapshot = OrderBookSnapshot {
                             symbol: pair.clone(),
@@ -838,7 +1930,7 @@ fn spawn_book_ticker_cache(
                     warn!(pair, error = %error, "CEX bookTicker stream connect failed");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(DEFAULT_RECONNECT_DELAY_SECS)).await;
         }
     });
 }
@@ -876,7 +1968,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.halt_file_path.is_empty() {
         let halt = Arc::clone(&halt_coordinator);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(DEFAULT_WATCHDOG_INTERVAL_MS));
             loop {
                 interval.tick().await;
                 halt.check_watchdog();
@@ -981,10 +2074,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Inventory tracker (empty; will be populated by sync_balances).
-    let inventory = Arc::new(RwLock::new(InventoryTracker::new(vec![
-        Venue::Binance,
-        Venue::Wallet,
-    ])));
+    let inventory = Arc::new(RwLock::new(InventoryTracker::new(
+        vec![Venue::Binance, Venue::Wallet],
+        cli.dex_chain_id,
+    )));
 
     // Optional synthetic seed so simulation demos work without live balance
     // endpoints. Applied BEFORE the first tick so the inventory pre-check
@@ -1001,7 +2094,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok((venue, balances)) => {
                     let count = balances.len();
                     info!(venue = %venue, assets = count, "seeding inventory");
-                    guard.update_from_wallet(venue, balances);
+                    seed_inventory_balances(&mut guard, venue, balances);
                 }
                 Err(e) => {
                     return Err(format!("invalid --seed-inventory {spec:?}: {e}").into());
@@ -1034,7 +2127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rpc_urls = resolve_rpc_urls(&cli).ok_or(
                 "--dex-address-book was provided, so --eth-rpc-url or ETH_RPC_URL is required",
             )?;
-            let client = ChainClient::new(rpc_urls.clone(), 30, 3)?;
+            let client = ChainClient::new(rpc_urls.clone(), RPC_TIMEOUT_SECS, RPC_RETRIES)?;
             log_rpc_health("live price source", &client).await;
             let live = LivePriceSource::new_with_order_books(
                 Arc::clone(&cex_order_books),
@@ -1044,7 +2137,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             // Start the background WS block feed so DEX prices update
             // on every new block (same real-time pattern as CEX bookTicker).
-            let size = Decimal::from_str_exact(&cli.size).unwrap_or(Decimal::ONE);
+            let size = Decimal::from_str_exact(&cli.size).unwrap_or_else(|e| {
+                warn!(
+                    configured_size = %cli.size,
+                    error = %e,
+                    "failed to parse --size for DEX block feed; using 1"
+                );
+                Decimal::ONE
+            });
             if let Some(ws_url) = resolve_ws_url(&rpc_urls) {
                 match live.start_block_feed(&ws_url, size).await {
                     Ok(()) => info!(ws_url, "DEX block feed started"),
@@ -1085,7 +2185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rpc_urls = resolve_rpc_urls(&cli)
                 .ok_or("--fee-gas-mode rpc requires --eth-rpc-url or ETH_RPC_URL")?;
             GasFeeEstimator::Rpc {
-                client: ChainClient::new(rpc_urls, 30, 3)?,
+                client: ChainClient::new(rpc_urls, RPC_TIMEOUT_SECS, RPC_RETRIES)?,
                 gas_units: cli.fee_gas_units,
                 buffer_bps: cli.fee_gas_buffer_bps,
             }
@@ -1098,7 +2198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("--fee-gas-mode estimate requires --dex-address-book".into());
             }
             GasFeeEstimator::Estimate {
-                client: ChainClient::new(rpc_urls, 30, 3)?,
+                client: ChainClient::new(rpc_urls, RPC_TIMEOUT_SECS, RPC_RETRIES)?,
                 fallback_gas_units: cli.fee_gas_units,
                 buffer_bps: cli.fee_gas_buffer_bps,
                 wallet: Address::new(&wallet_address)?,
@@ -1126,7 +2226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("--fee-gas-mode anvil requires --dex-address-book".into());
             }
             GasFeeEstimator::Anvil {
-                client: ChainClient::new(vec![fork_url.clone()], 30, 3)?,
+                client: ChainClient::new(vec![fork_url.clone()], RPC_TIMEOUT_SECS, RPC_RETRIES)?,
                 simulator: ForkSimulator::new(&fork_url)?,
                 fallback_gas_units: cli.fee_gas_units,
                 buffer_bps: cli.fee_gas_buffer_bps,
@@ -1200,13 +2300,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let legs: Arc<dyn peanut_internship_rust::executor::engine::LegExecutor> = if cli.simulation
         || cli.dry_run
     {
-        Arc::new(SimulatedLegs::default())
+        Arc::new(
+            SimulatedLegs::default().with_price_source(Arc::clone(&price_source)
+                as Arc<dyn peanut_internship_rust::strategy::generator::PriceSource + Send + Sync>),
+        )
     } else {
         if !cli.dex_address_book.is_empty() {
             let rpc_urls = resolve_wallet_config(&cli)
                 .map(|(rpc, _)| rpc)
                 .ok_or("live DEX execution requires --eth-rpc-url/ETH_RPC_URL and --wallet-address/WALLET_ADDRESS")?;
-            let chain_client = ChainClient::new(rpc_urls, 30, 3)?;
+            let chain_client = ChainClient::new(rpc_urls, RPC_TIMEOUT_SECS, RPC_RETRIES)?;
             log_rpc_health("live dex", &chain_client).await;
             let wallet = WalletManager::from_env(&cli.wallet_key_env)?;
             let recipient = Address::new(wallet.address())?;
@@ -1452,9 +2555,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let signal = &ctx.signal;
                 let buy_venue = signal.direction.buy_venue();
                 let sell_venue = signal.direction.sell_venue();
-                let mut parts = signal.pair.split('/');
-                let base = parts.next().unwrap();
-                let quote = parts.next().unwrap();
+                let (base, quote) = match split_pair(&signal.pair) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        warn!(
+                            pair = %signal.pair,
+                            error = %error,
+                            "malformed pair in completion handler; skipping inventory release"
+                        );
+                        continue;
+                    }
+                };
 
                 let buy_asset = quote;
                 let buy_amount = signal.size * signal.cex_price;
@@ -1495,23 +2606,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scorer.lock().await.record_result(&pair_str, done);
                 if done {
                     if let Some(net) = ctx.actual_net_pnl {
-                        info!(pair = pair_str, pnl = %net, state = %ctx.state, "SUCCESS");
+                        info!(
+                            "✅ TRADE DONE | pair={} | state={} | expected_net={} | actual_net={} | actual_gross={} | fees={} | cex_fee={} | gas_fee={} | gas_used={} | gas_wei={}",
+                            pair_str,
+                            ctx.state,
+                            fmt_usd(ctx.signal.expected_net_pnl),
+                            fmt_usd(net),
+                            fmt_usd(ctx.actual_gross_pnl_usd.unwrap_or(Decimal::ZERO)),
+                            fmt_usd(ctx.actual_fees_usd.unwrap_or(Decimal::ZERO)),
+                            fmt_usd(ctx.actual_cex_fee_usd.unwrap_or(Decimal::ZERO)),
+                            fmt_usd(ctx.actual_onchain_gas_fee_usd.unwrap_or(Decimal::ZERO)),
+                            ctx.onchain_gas_used
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                            ctx.onchain_gas_fee_wei
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "n/a".to_string())
+                        );
+                        emit_best_effort(
+                            &alert_sink,
+                            &AlertEvent::TradeExecuted {
+                                signal_id: ctx.signal.signal_id.clone(),
+                                pair: pair_str.clone(),
+                                direction: ctx.signal.direction.to_string(),
+                                expected_net_pnl: fmt_usd(ctx.signal.expected_net_pnl),
+                                actual_net_pnl: fmt_usd(net),
+                                actual_gross_pnl: fmt_usd(
+                                    ctx.actual_gross_pnl_usd.unwrap_or(Decimal::ZERO),
+                                ),
+                                actual_fees: fmt_usd(ctx.actual_fees_usd.unwrap_or(Decimal::ZERO)),
+                                actual_cex_fee: fmt_usd(
+                                    ctx.actual_cex_fee_usd.unwrap_or(Decimal::ZERO),
+                                ),
+                                actual_gas_fee: fmt_usd(
+                                    ctx.actual_onchain_gas_fee_usd.unwrap_or(Decimal::ZERO),
+                                ),
+                                gas_used: ctx.onchain_gas_used.map(|v| v.to_string()),
+                            },
+                        )
+                        .await;
                         // Feed PnL breaker — trips halt when daily loss exceeded.
-                        let mut pb = pnl_breaker.lock().await;
-                        let was_halted = pb.is_halted();
-                        pb.record_pnl(net);
-                        if pb.is_halted() && !was_halted {
+                        let (is_halted, was_halted, cumulative_pnl, max_daily_loss) = {
+                            let mut pb = pnl_breaker.lock().await;
+                            let was_h = pb.is_halted();
+                            pb.record_pnl(net);
+                            (
+                                pb.is_halted(),
+                                was_h,
+                                pb.cumulative_pnl().to_string(),
+                                pb.max_daily_loss().to_string(),
+                            )
+                        };
+
+                        if is_halted && !was_halted {
                             let ev = AlertEvent::DailyLossHalt {
-                                cumulative_pnl: pb.cumulative_pnl().to_string(),
-                                max_daily_loss: pb.max_daily_loss().to_string(),
+                                cumulative_pnl,
+                                max_daily_loss,
                             };
-                            drop(pb); // release lock before async emit
                             emit_best_effort(&alert_sink, &ev).await;
                             halt_coordinator.halt("daily PnL loss threshold exceeded");
                         }
+
                         peanut_internship_rust::observability::metrics_handle()
-                            .set_pnl_breaker_halted(pnl_breaker.lock().await.is_halted());
-                        risk_manager.lock().await.record_trade(net);
+                            .set_pnl_breaker_halted(is_halted);
+                        risk_manager.lock().await.record_trade_result(net);
                         // Auto kill switch: halt the bot if capital fell below
                         // the absolute minimum safety threshold.
                         {
@@ -1538,6 +2696,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     pnl.lock().await.record(record);
                 } else {
+                    risk_manager.lock().await.record_trade_cancelled();
                     warn!(pair = pair_str, state = %ctx.state, error = ?ctx.error, "FAILED");
                 }
                 for ev in evaluate_execution(&ctx, &alert_rules) {
@@ -1568,6 +2727,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         AlertEvent::BreakerClosed
                     };
+                    info!(alert = %ev.summary(), "circuit breaker alert");
                     emit_best_effort(&alert_sink, &ev).await;
                     last_open = is_open;
                 }
@@ -1581,7 +2741,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref store) = reconcile_store {
         let rpc_urls = resolve_wallet_config(&cli).map(|(rpc, _)| rpc);
         if let Some(rpc_urls) = rpc_urls {
-            match ChainClient::new(rpc_urls, 30, 3) {
+            match ChainClient::new(rpc_urls, RPC_TIMEOUT_SECS, RPC_RETRIES) {
                 Ok(chain_client) => {
                     log_rpc_health("reconcile worker", &chain_client).await;
                     let provider = Arc::new(ChainReceiptProvider::new(chain_client));
@@ -1650,7 +2810,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             }
         },
-        None => None,
+        None => {
+            info!(
+                "wallet balance fetcher disabled; missing --eth-rpc-url/ETH_RPC_URL or --wallet-address/WALLET_ADDRESS"
+            );
+            None
+        }
     };
 
     let mode_str = if cli.dry_run {
@@ -1695,24 +2860,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if preserve_seeded_inventory {
         info!("simulation/dry-run seed inventory active; skipping balance sync");
     } else {
-        sync_cex_balance(&exchange, &inventory).await;
+        // Pre-initialize inventory with 0s for the target pairs to avoid noisy
+        // "lookup missing" warnings before the first sync completes.
+        {
+            let mut inv = inventory.write().await;
+            for p in &cli.pair {
+                if let Ok((base, quote)) = split_pair(p) {
+                    for venue in inv.venues().to_vec() {
+                        let mut initial_bals = HashMap::new();
+                        initial_bals.insert(base.to_string(), Decimal::ZERO);
+                        initial_bals.insert(quote.to_string(), Decimal::ZERO);
+                        inv.update_from_wallet(venue, initial_bals);
+                    }
+                }
+            }
+        }
+
+        let _ = sync_cex_balance(&exchange, &inventory).await;
         if let Some(ref f) = wallet_fetcher {
             sync_wallet_balance(f, &inventory).await;
         }
     }
 
+    let risk_pause_reason = Arc::new(Mutex::new(None::<String>));
+    let rebalance_pause_reason = Arc::new(Mutex::new(None::<String>));
+
     if cli.rebalance_enabled {
         let transfer_context =
             build_rebalance_transfer_context(&cli, Arc::clone(&exchange), nonce_manager.clone())?;
+        let rebalance_max_step_usd = Decimal::from_str_exact(&cli.rebalance_max_step_usd)
+            .map_err(|e| format!("invalid --rebalance-max-step-usd: {e}"))?;
+        let rebalance_balance_verify_tolerance_pct =
+            Decimal::from_f64_retain(cli.balance_verify_tolerance_pct).unwrap_or(Decimal::ONE);
         spawn_rebalance_loop(
             Arc::clone(&inventory),
             Arc::clone(&halt_coordinator),
+            Arc::clone(&alert_sink),
+            Arc::clone(&rebalance_pause_reason),
+            Arc::clone(&price_source),
             RebalanceLoopConfig {
                 dry_run: cli.rebalance_dry_run,
                 interval: Duration::from_secs(cli.rebalance_interval_secs.max(1)),
                 threshold_pct: cli.rebalance_threshold_pct,
                 quote_asset: cli.rebalance_quote_asset.clone(),
                 max_slippage_bps: Decimal::from(cli.rebalance_max_slippage_bps),
+                allowed_assets: parse_rebalance_csv_upper(&cli.rebalance_allowed_assets),
+                allowed_venues: parse_rebalance_csv_lower(&cli.rebalance_allowed_venues),
+                max_step_usd: rebalance_max_step_usd,
+                min_fill_pct: cli.rebalance_min_fill_pct,
+                pause_trading: cli.rebalance_pause_trading,
+                balance_verify_tolerance_pct: rebalance_balance_verify_tolerance_pct,
+                journal_path: cli.rebalance_journal_path.clone(),
             },
             transfer_context,
         );
@@ -1729,12 +2927,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dry_run: cli.dry_run,
         verbose: cli.verbose,
         risk_manager: Arc::clone(&risk_manager),
+        risk_pause_reason: Arc::clone(&risk_pause_reason),
+        rebalance_pause_reason: Arc::clone(&rebalance_pause_reason),
+        alert_sink: Arc::clone(&alert_sink),
         pre_trade_validator: Arc::clone(&pre_trade_validator),
         cex_order_books: Arc::clone(&cex_order_books),
         price_source: Arc::clone(&price_source),
         base_fees: fees.clone(),
         gas_estimator,
         dex_fee_included_in_quote: !cli.dex_address_book.is_empty(),
+        dex_pool_fee_bps: load_dex_pool_fee_bps_map(&cli.dex_address_book)?,
         min_profit_usd: configured_min_profit_usd,
     };
 
@@ -1791,16 +2993,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Err(e) = tick_result {
             error!("tick error: {e}");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(DEFAULT_RETRY_DELAY_SECS)).await;
             continue;
         }
         // Gate balance syncs by the configured interval — tight `--tick-ms`
         // loops must not hammer the exchange `/account` or RPC endpoints.
         if last_sync.elapsed() >= sync_interval {
             if !preserve_seeded_inventory {
-                sync_cex_balance(&exchange, &inventory).await;
+                let cex_sync_ok = sync_cex_balance(&exchange, &inventory).await;
                 // Post-trade balance verification: compare tracked vs actual.
-                if cli.balance_verify_tolerance_pct > 0.0 {
+                if cli.balance_verify_tolerance_pct > 0.0 && cex_sync_ok {
                     let tolerance = Decimal::from_f64_retain(cli.balance_verify_tolerance_pct)
                         .unwrap_or(Decimal::ONE);
                     if let Some(mismatches) =
@@ -1829,6 +3031,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .halt("balance mismatch — manual investigation required");
                         }
                     }
+                } else if cli.balance_verify_tolerance_pct > 0.0 {
+                    warn!("skipping CEX balance verification because CEX balance sync failed");
                 }
                 if let Some(ref f) = wallet_fetcher {
                     sync_wallet_balance(f, &inventory).await;
@@ -1881,12 +3085,16 @@ struct TickDeps {
     dry_run: bool,
     verbose: bool,
     risk_manager: Arc<Mutex<RiskManager>>,
+    risk_pause_reason: Arc<Mutex<Option<String>>>,
+    rebalance_pause_reason: Arc<Mutex<Option<String>>>,
+    alert_sink: Arc<dyn AlertSink>,
     pre_trade_validator: Arc<PreTradeValidator>,
     cex_order_books: Arc<dyn CexOrderBookSource>,
     price_source: Arc<AnyPriceSource>,
     base_fees: FeeStructure,
     gas_estimator: GasFeeEstimator,
     dex_fee_included_in_quote: bool,
+    dex_pool_fee_bps: HashMap<String, Decimal>,
     min_profit_usd: Decimal,
 }
 
@@ -1969,7 +3177,7 @@ impl GasFeeEstimator {
                 let max_fee = gas_price.get_max_fee(GasPriority::Medium, *buffer_bps);
                 let max_fee_wei = u256_to_decimal(max_fee)?;
                 let gas_units_decimal = Decimal::from(*gas_units);
-                let wei_per_eth = Decimal::from(10u64.pow(ETH_DECIMALS as u32));
+                let wei_per_eth = Decimal::from(WEI_PER_ETH);
                 let gas_usd = max_fee_wei * gas_units_decimal / wei_per_eth * eth_usd;
                 Ok(GasFeeEstimate {
                     mode: match self {
@@ -1979,7 +3187,7 @@ impl GasFeeEstimator {
                         Self::Fixed => "fixed",
                     },
                     gas_units: *gas_units,
-                    max_fee_gwei: max_fee_wei / Decimal::from(1_000_000_000u64),
+                    max_fee_gwei: max_fee_wei / Decimal::from(WEI_PER_GWEI),
                     eth_usd: Some(eth_usd),
                     gas_usd,
                 })
@@ -2003,12 +3211,12 @@ async fn gas_units_to_usd(
     let gas_price = client.get_gas_price().await?;
     let max_fee = gas_price.get_max_fee(GasPriority::Medium, buffer_bps);
     let max_fee_wei = u256_to_decimal(max_fee)?;
-    let wei_per_eth = Decimal::from(10u64.pow(ETH_DECIMALS as u32));
+    let wei_per_eth = Decimal::from(WEI_PER_ETH);
     let gas_usd = max_fee_wei * Decimal::from(gas_units) / wei_per_eth * eth_usd;
     Ok(GasFeeEstimate {
         mode,
         gas_units,
-        max_fee_gwei: max_fee_wei / Decimal::from(1_000_000_000u64),
+        max_fee_gwei: max_fee_wei / Decimal::from(WEI_PER_GWEI),
         eth_usd: Some(eth_usd),
         gas_usd,
     })
@@ -2308,7 +3516,7 @@ fn expected_pnl_preview(
         market.spread_buy_dex_bps
     };
     let trade_value_usd = market.size * cex_price * market.quote_usd_price;
-    let bps = Decimal::from(10_000);
+    let bps = Decimal::from(BPS_SCALE);
     let expected_gross_pnl = spread_bps / bps * trade_value_usd;
     let fee_breakdown = fees.breakdown(trade_value_usd);
     let expected_fees = fee_breakdown.total_fee_usd;
@@ -2335,24 +3543,31 @@ fn expected_pnl_preview(
     }
 }
 
-fn fmt_usd(value: Decimal) -> String {
-    format!("${:.6}", value.round_dp(6))
-}
-
-fn fmt_bps(value: Decimal) -> String {
-    format!("{:.2} bps", value.round_dp(2))
-}
-
-fn fmt_qty(value: Decimal) -> String {
-    format!("{:.6}", value.round_dp(6))
-}
-
-fn fmt_price(value: Decimal) -> String {
-    format!("{:.9}", value.round_dp(9))
-}
-
-fn fmt_optional_usd(value: Option<Decimal>) -> String {
-    value.map(fmt_usd).unwrap_or_else(|| "-".to_string())
+fn dry_run_preview_signal(
+    pair: &str,
+    market: &MarketState,
+    preview: &ExpectedPnlPreview,
+) -> Signal {
+    let now = Utc::now();
+    Signal {
+        signal_id: format!("dry-run-preview-{pair}"),
+        pair: pair.to_string(),
+        direction: preview.direction,
+        cex_price: preview.cex_price,
+        dex_price: preview.dex_price,
+        spread_bps: preview.spread_bps,
+        size: market.size,
+        notional_quote: market.size * preview.cex_price,
+        notional_usd: preview.trade_value_usd,
+        expected_gross_pnl: preview.expected_gross_pnl,
+        expected_fees: preview.expected_fees,
+        expected_net_pnl: preview.expected_net_pnl,
+        score: Decimal::ZERO,
+        timestamp: now,
+        expiry: now + chrono::Duration::seconds(60),
+        inventory_ok: true,
+        within_limits: true,
+    }
 }
 
 fn fmt_gas_units(gas: &GasFeeEstimate) -> String {
@@ -2367,29 +3582,34 @@ fn fmt_max_fee_gwei(gas: &GasFeeEstimate) -> String {
     if gas.gas_units == 0 {
         "-".to_string()
     } else {
-        format!("{} gwei", fmt_qty(gas.max_fee_gwei))
+        format!("{} gwei", format::fmt_qty(gas.max_fee_gwei))
     }
 }
 
-fn fmt_dex_fee_mode(included_in_quote: bool) -> &'static str {
+fn fmt_dex_fee_mode(included_in_quote: bool, pool_fee_bps: Option<Decimal>) -> String {
+    let pool_fee = pool_fee_bps
+        .map(|bps| format!("pool fee {}", format::fmt_bps(bps)))
+        .unwrap_or_else(|| "pool fee unknown".to_string());
     if included_in_quote {
-        "included in quote"
+        format!("included in quote; {pool_fee}")
     } else {
-        "explicit bps"
+        format!("explicit; {pool_fee}")
     }
 }
 
 fn render_dry_run_opportunity(
     pair: &str,
+    status: &str,
     market: &MarketState,
     preview: &ExpectedPnlPreview,
     gas: &GasFeeEstimate,
     dex_fee_included_in_quote: bool,
+    dex_pool_fee_bps: Option<Decimal>,
 ) -> String {
     format!(
         "\n┌─ 🧪 DRY RUN OPPORTUNITY ─────────────────────────────────────\n\
          │ pair         │ {pair}\n\
-         │ status       │ no_signal\n\
+         │ status       │ {status}\n\
          │ direction    │ {direction}\n\
          │ size         │ {size}\n\
          │ notional     │ {notional}\n\
@@ -2432,7 +3652,7 @@ fn render_dry_run_opportunity(
         breakeven = fmt_bps(preview.breakeven_spread_bps),
         cex_fee = fmt_usd(preview.fee_breakdown.cex_fee_usd),
         dex_fee = fmt_usd(preview.fee_breakdown.dex_fee_usd),
-        dex_fee_mode = fmt_dex_fee_mode(dex_fee_included_in_quote),
+        dex_fee_mode = fmt_dex_fee_mode(dex_fee_included_in_quote, dex_pool_fee_bps),
         gas_fee = fmt_usd(preview.fee_breakdown.gas_fee_usd),
         gas_mode = gas.mode,
         gas_units = fmt_gas_units(gas),
@@ -2497,10 +3717,18 @@ fn init_tracing(log_dir: impl AsRef<Path>) -> Result<PathBuf, Box<dyn std::error
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let stdout_layer = tracing_subscriber::fmt::layer().with_writer(io::stdout);
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_writer(io::stdout)
+        .with_ansi(false)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false);
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -2521,6 +3749,14 @@ async fn wait_for_halt(halt: Arc<HaltCoordinator>) {
     }
 }
 
+fn risk_pause_key(reason: &str) -> String {
+    if reason.starts_with("Hourly trade limit reached") {
+        "Hourly trade limit reached".to_string()
+    } else {
+        reason.to_string()
+    }
+}
+
 async fn tick(
     pairs: &[String],
     size: Decimal,
@@ -2528,6 +3764,66 @@ async fn tick(
     generator: &mut SignalGenerator<AnyPriceSource>,
     deps: &TickDeps,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(reason) = deps.rebalance_pause_reason.lock().await.clone() {
+        let key = risk_pause_key(&reason);
+        let should_alert = {
+            let mut last = deps.risk_pause_reason.lock().await;
+            if last.as_deref() == Some(key.as_str()) {
+                false
+            } else {
+                *last = Some(key);
+                true
+            }
+        };
+        if should_alert {
+            warn!("⏸ REBALANCE PAUSE | {}", reason);
+            emit_best_effort(
+                &deps.alert_sink,
+                &AlertEvent::RiskPaused {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+        } else {
+            info!("⏸ REBALANCE PAUSE active | {}", reason);
+        }
+        return Ok(());
+    }
+
+    let pause_decision = deps.risk_manager.lock().await.trading_pause();
+    if !pause_decision.allowed() {
+        let reason = pause_decision.reason().to_string();
+        let key = risk_pause_key(&reason);
+        let should_alert = {
+            let mut last = deps.risk_pause_reason.lock().await;
+            if last.as_deref() == Some(key.as_str()) {
+                false
+            } else {
+                *last = Some(key);
+                true
+            }
+        };
+        if should_alert {
+            warn!("⏸ RISK PAUSE | {}", reason);
+            emit_best_effort(
+                &deps.alert_sink,
+                &AlertEvent::RiskPaused {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+        } else {
+            info!("⏸ RISK PAUSE active | {}", reason);
+        }
+        return Ok(());
+    }
+
+    let resumed_reason = deps.risk_pause_reason.lock().await.take();
+    if let Some(reason) = resumed_reason {
+        info!("▶️ RISK PAUSE CLEARED | {}", reason);
+        emit_best_effort(&deps.alert_sink, &AlertEvent::RiskResumed { reason }).await;
+    }
+
     // Fast path: skip the tick entirely when the breaker is open. The queue
     // worker also pre-flight-checks the breaker via `Executor::execute`, but
     // filtering here avoids burning cycles on signal generation we know we
@@ -2537,7 +3833,10 @@ async fn tick(
         let mut cb_guard = cb.lock().await;
         if cb_guard.is_open() {
             let remaining = cb_guard.time_until_reset();
-            warn!(remaining_s = remaining.as_secs(), "circuit breaker open");
+            info!(
+                "⏸ CIRCUIT BREAKER active | trades blocked | resumes in ~{}s",
+                remaining.as_secs()
+            );
             return Ok(());
         }
     }
@@ -2558,15 +3857,36 @@ async fn tick(
             None => {
                 if deps.dry_run {
                     if let Some(m) = maybe_market {
-                        let preview = expected_pnl_preview(&m, &tick_fees, deps.min_profit_usd);
+                        let mut preview = expected_pnl_preview(&m, &tick_fees, deps.min_profit_usd);
+                        let mut preview_gas_estimate = gas_estimate.clone();
+                        let preview_signal = dry_run_preview_signal(pair, &m, &preview);
+                        if let Some(exact_gas) = estimate_signal_gas(
+                            &deps.gas_estimator,
+                            deps.price_source.as_ref(),
+                            &preview_signal,
+                        )
+                        .await?
+                        {
+                            let mut exact_fees = deps.base_fees.clone();
+                            exact_fees.gas_cost_usd = exact_gas.gas_usd;
+                            preview = expected_pnl_preview(&m, &exact_fees, deps.min_profit_usd);
+                            preview_gas_estimate = exact_gas;
+                        }
+                        let preview_status = if preview.expected_net_pnl >= deps.min_profit_usd {
+                            "would_signal_after_exact_gas"
+                        } else {
+                            "no_signal"
+                        };
                         info!(
                             "{}",
                             render_dry_run_opportunity(
                                 pair,
+                                preview_status,
                                 &m,
                                 &preview,
-                                &gas_estimate,
-                                deps.dex_fee_included_in_quote
+                                &preview_gas_estimate,
+                                deps.dex_fee_included_in_quote,
+                                deps.dex_pool_fee_bps.get(pair).copied()
                             )
                         );
                     } else {
@@ -2585,6 +3905,25 @@ async fn tick(
         {
             apply_gas_estimate_to_signal(&mut signal, &deps.base_fees, &exact_gas);
             signal_gas_estimate = exact_gas;
+        }
+        if signal.expected_net_pnl < deps.min_profit_usd {
+            info!(
+                pair,
+                status = "skipped_low_profit_after_gas_estimate",
+                direction = %signal.direction,
+                size = %signal.size,
+                notional_usd = %signal.notional_usd,
+                spread_bps = %signal.spread_bps,
+                expected_gross_pnl_usd = %signal.expected_gross_pnl,
+                expected_fees_usd = %signal.expected_fees,
+                expected_net_pnl_usd = %signal.expected_net_pnl,
+                min_profit_usd = %deps.min_profit_usd,
+                gas_mode = signal_gas_estimate.mode,
+                gas_units = signal_gas_estimate.gas_units,
+                gas_fee_usd = %signal_gas_estimate.gas_usd,
+                "🟡 trade skipped"
+            );
+            continue;
         }
 
         let validation = deps.pre_trade_validator.validate_signal(&signal);
@@ -2626,7 +3965,10 @@ async fn tick(
         // Score + threshold. Acquire scorer lock briefly; don't hold across
         // the queue push below (push takes its own lock internally).
         let skews = generator_inventory_skews(generator).await;
-        let book_result = deps.cex_order_books.fetch_order_book(pair, 20).await;
+        let book_result = deps
+            .cex_order_books
+            .fetch_order_book(pair, DEFAULT_ORDERBOOK_DEPTH)
+            .await;
         let book_ref = match &book_result {
             Ok(b) => Some(b),
             Err(e) => {
@@ -2681,18 +4023,22 @@ async fn tick(
         }
 
         info!(
+            "🚀 ENQUEUE | pair={} | direction={} | size={} | notional={} | spread={} | score={} | expected_net={} | gas={}",
             pair,
-            status = "enqueue",
-            spread_bps = %signal.spread_bps,
-            score = %signal.score,
-            direction = %signal.direction,
-            expected_net_pnl_usd = %signal.expected_net_pnl,
-            "🚀 enqueue"
+            signal.direction,
+            fmt_qty(signal.size),
+            fmt_usd(signal.notional_usd),
+            fmt_bps(signal.spread_bps),
+            signal.score.round_dp(1),
+            fmt_usd(signal.expected_net_pnl),
+            fmt_usd(signal_gas_estimate.gas_usd)
         );
 
+        deps.risk_manager.lock().await.record_trade_started();
         // Enqueue for the worker to pick up. Push returns `false` when the
         // signal lost backpressure (queue full and score was the weakest).
         if !deps.queue.push(signal).await {
+            deps.risk_manager.lock().await.record_trade_not_started();
             warn!(pair, "signal dropped by queue (backpressure)");
         }
     }
@@ -2714,15 +4060,25 @@ async fn generator_inventory_skews(
 async fn sync_cex_balance(
     exchange: &Arc<ExchangeClient>,
     inventory: &Arc<RwLock<InventoryTracker>>,
-) {
+) -> bool {
     match exchange.fetch_balance().await {
-        Ok(bals) => {
+        Ok(balances) => {
+            for (asset, bal) in &balances {
+                if bal.total > Decimal::ZERO {
+                    info!(asset, total_balance = %bal.total, "Fetched CEX token balance");
+                }
+            }
+
             inventory
                 .write()
                 .await
-                .update_from_cex(Venue::Binance, bals);
+                .update_from_cex(Venue::Binance, balances);
+            true
         }
-        Err(e) => warn!("fetch_balance failed: {e}"),
+        Err(e) => {
+            warn!("fetch_balance failed: {e}");
+            false
+        }
     }
 }
 
@@ -2735,6 +4091,14 @@ async fn verify_cex_balance(
     tolerance_pct: Decimal,
 ) -> Option<Vec<peanut_internship_rust::inventory::tracker::BalanceMismatch>> {
     let fresh = exchange.fetch_balance().await.ok()?;
+
+    // Canonicalize assets using unified logic
+    let mut canonical_fresh = HashMap::new();
+    for (asset, bal) in fresh {
+        canonical_fresh.insert(assets::canonicalize_asset(&asset), bal);
+    }
+    let fresh = canonical_fresh;
+
     // Build a simple total-balance map from the NormalizedBalance values.
     let actual: HashMap<String, Decimal> = fresh
         .iter()
@@ -2744,7 +4108,12 @@ async fn verify_cex_balance(
         .read()
         .await
         .verify_balances(Venue::Binance, &actual, tolerance_pct);
-    Some(mismatches)
+
+    if mismatches.is_empty() {
+        None
+    } else {
+        Some(mismatches)
+    }
 }
 
 /// Snapshot on-chain wallet balances (native + well-known ERC-20) into
@@ -2764,51 +4133,6 @@ async fn sync_wallet_balance(
     }
 }
 
-/// JSON shape for each entry in the `--dex-address-book` file.
-#[derive(Deserialize)]
-struct AddressBookEntry {
-    base: String,
-    base_decimals: u8,
-    quote: String,
-    quote_decimals: u8,
-    /// Optional Uniswap V2 pool address. When present and a chain RPC is
-    /// configured, the bot reads live reserves from this pool for signal
-    /// generation (`LivePriceSource`). Absent -> falls back to stub prices.
-    #[serde(default)]
-    pool: Option<String>,
-    #[serde(default = "default_pool_type")]
-    pool_type: String,
-    #[serde(default, alias = "fee", alias = "fee_tier", alias = "fee_bps")]
-    v3_fee: Option<u32>,
-    #[serde(default)]
-    v3_path: Option<Vec<String>>,
-    #[serde(default, alias = "fees", alias = "fee_path", alias = "v3_fee_path")]
-    v3_fees: Option<Vec<u32>>,
-    #[serde(default)]
-    quoter: Option<String>,
-    #[serde(default = "default_quoter_type")]
-    quoter_type: String,
-}
-
-fn default_pool_type() -> String {
-    "v2".to_string()
-}
-
-fn default_quoter_type() -> String {
-    "quoter_v2".to_string()
-}
-
-fn parse_optional_v3_path(
-    raw: Option<Vec<String>>,
-) -> Result<Option<Vec<Address>>, Box<dyn std::error::Error>> {
-    raw.map(|path| {
-        path.into_iter()
-            .map(|address| Address::new(&address).map_err(|e| e.into()))
-            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()
-    })
-    .transpose()
-}
-
 fn run_config_check(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Decimal::from_str_exact(&cli.size).map_err(|e| format!("invalid --size: {e}"))?;
     Decimal::from_str_exact(&cli.max_daily_loss_usd)
@@ -2820,6 +4144,23 @@ fn run_config_check(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Decimal::from_str_exact(&cli.risk_max_daily_loss_usd)
         .map_err(|e| format!("invalid --risk-max-daily-loss-usd: {e}"))?;
     Decimal::from_str_exact(&cli.fee_gas_usd).map_err(|e| format!("invalid --fee-gas-usd: {e}"))?;
+    Decimal::from_str_exact(&cli.rebalance_max_step_usd)
+        .map_err(|e| format!("invalid --rebalance-max-step-usd: {e}"))?;
+    if !(0.0..=1.0).contains(&cli.rebalance_min_fill_pct) {
+        return Err(format!(
+            "--rebalance-min-fill-pct must be between 0 and 1, got {}",
+            cli.rebalance_min_fill_pct
+        )
+        .into());
+    }
+    if cli.rebalance_enabled {
+        if parse_rebalance_csv_upper(&cli.rebalance_allowed_assets).is_empty() {
+            return Err("--rebalance-allowed-assets must not be empty".into());
+        }
+        if parse_rebalance_csv_lower(&cli.rebalance_allowed_venues).is_empty() {
+            return Err("--rebalance-allowed-venues must not be empty".into());
+        }
+    }
     match cli.fee_gas_mode.to_ascii_lowercase().as_str() {
         "fixed" => {}
         "rpc" => {
@@ -2921,6 +4262,16 @@ fn effective_dex_fee_bps(
     Ok(Decimal::ZERO)
 }
 
+fn load_dex_pool_fee_bps_map(
+    dex_address_book: &str,
+) -> Result<HashMap<String, Decimal>, Box<dyn std::error::Error>> {
+    if dex_address_book.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let pairs = load_parsed_address_book(dex_address_book)?;
+    Ok(dex_pool_fee_bps_map(&pairs))
+}
+
 fn validate_live_execution_config(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.simulation || cli.dry_run {
         return Ok(());
@@ -2946,10 +4297,20 @@ fn validate_live_execution_config(cli: &Cli) -> Result<(), Box<dyn std::error::E
     validate_live_asset_symbol_uniqueness(&cli.dex_address_book, &cli.pair)?;
     validate_live_known_token_symbols(&cli.dex_address_book, &cli.pair, cli.dex_chain_id)?;
     if cli.rebalance_enabled && !cli.rebalance_dry_run {
-        return Err(
-            "live rebalance execution is implemented but not production-enabled; keep REBALANCE_DRY_RUN=true until withdrawal/deposit confirmation tracking and allowlists are added"
-                .into(),
-        );
+        if resolve_rpc_urls(cli).is_none() {
+            return Err("live rebalance requires --eth-rpc-url or ETH_RPC_URL".into());
+        }
+        WalletManager::from_env(&cli.wallet_key_env)
+            .map_err(|e| format!("invalid rebalance wallet config: {e}"))?;
+        if cli.rebalance_cex_deposit_address.is_empty() {
+            return Err("live rebalance requires --rebalance-cex-deposit-address or REBALANCE_CEX_DEPOSIT_ADDRESS".into());
+        }
+        Address::new(&cli.rebalance_cex_deposit_address)
+            .map_err(|e| format!("invalid rebalance CEX deposit address: {e}"))?;
+        if !cli.rebalance_cex_withdraw_address.is_empty() {
+            Address::new(&cli.rebalance_cex_withdraw_address)
+                .map_err(|e| format!("invalid rebalance CEX withdraw address: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -2957,10 +4318,10 @@ fn validate_live_execution_config(cli: &Cli) -> Result<(), Box<dyn std::error::E
 fn validate_flashbots_relay_chain(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.use_flashbots
         && cli.dex_chain_id != 1
-        && cli.flashbots_relay_url.trim_end_matches('/') == FLASHBOTS_MAINNET_RELAY_URL
+        && cli.flashbots_relay_url.trim_end_matches('/') == DEFAULT_FLASHBOTS_RELAY_URL
     {
         return Err(format!(
-            "default Flashbots relay {FLASHBOTS_MAINNET_RELAY_URL} is Ethereum mainnet-only; set --use-flashbots=false for chain {} public DEX mode or provide a chain-specific private relay via --flashbots-relay-url",
+            "default Flashbots relay {DEFAULT_FLASHBOTS_RELAY_URL} is Ethereum mainnet-only; set --use-flashbots=false for chain {} public DEX mode or provide a chain-specific private relay via --flashbots-relay-url",
             cli.dex_chain_id
         )
         .into());
@@ -2972,90 +4333,13 @@ fn validate_live_dex_pool_compatibility(
     path: &str,
     pairs: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
-    for pair in pairs {
-        let entry = raw.get(pair).ok_or_else(|| {
-            format!("live execution pair '{pair}' missing from --dex-address-book")
-        })?;
-        if entry.pool.as_deref().unwrap_or_default().is_empty() {
-            return Err(
-                format!("live execution pair '{pair}' has no pool in --dex-address-book").into(),
-            );
-        }
-        let kind = match entry.pool_type.to_ascii_lowercase().as_str() {
-            "v2" => DexPoolKind::V2,
-            "v3" => {
-                match (&entry.v3_path, &entry.v3_fees) {
-                    (Some(path), Some(fees)) => {
-                        if path.len() < 2 {
-                            return Err(format!(
-                                "live execution pair '{pair}' has v3_path with fewer than 2 tokens"
-                            )
-                            .into());
-                        }
-                        if fees.len() + 1 != path.len() {
-                            return Err(format!(
-                                "live execution pair '{pair}' has v3_fees length {}, expected {} for v3_path length {}",
-                                fees.len(),
-                                path.len().saturating_sub(1),
-                                path.len()
-                            )
-                            .into());
-                        }
-                        let route = parse_optional_v3_path(Some(path.clone()))?
-                            .ok_or("v3_path parse returned no route")?;
-                        let base = Address::new(&entry.base)?;
-                        let quote = Address::new(&entry.quote)?;
-                        let starts_base_ends_quote =
-                            route.first() == Some(&base) && route.last() == Some(&quote);
-                        let starts_quote_ends_base =
-                            route.first() == Some(&quote) && route.last() == Some(&base);
-                        if !starts_base_ends_quote && !starts_quote_ends_base {
-                            return Err(format!(
-                                "live execution pair '{pair}' v3_path endpoints must match pair base/quote token addresses"
-                            )
-                            .into());
-                        }
-                    }
-                    (None, None) => {}
-                    _ => {
-                        return Err(format!(
-                            "live execution pair '{pair}' uses V3 route but must provide both v3_path and v3_fees"
-                        )
-                        .into());
-                    }
-                }
-                let _ = entry.v3_fee;
-                DexPoolKind::V3
-            }
-            other => {
-                return Err(format!(
-                    "live execution pair '{pair}' has unsupported pool_type '{other}'"
-                )
-                .into());
-            }
-        };
-        let _ = kind;
-    }
-    Ok(())
+    let address_book = load_parsed_address_book(path)?;
+    let selected = selected_pairs(&address_book, pairs)?;
+    validate_selected_pool_compatibility(&selected)
 }
 
 fn validate_live_cex_pair_symbols(pairs: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    for pair in pairs {
-        let (base, quote) = pair.split_once('/').ok_or_else(|| {
-            format!("live execution pair '{pair}' missing '/' separator for CEX symbol mapping")
-        })?;
-        for asset in [base, quote] {
-            if asset.is_empty() || !asset.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Err(format!(
-                    "live execution pair '{pair}' contains CEX-incompatible asset symbol '{asset}'; Binance symbol mapping only supports alphanumeric asset symbols"
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
+    validate_cex_pair_symbols(pairs)
 }
 
 fn validate_live_known_token_symbols(
@@ -3067,88 +4351,27 @@ fn validate_live_known_token_symbols(
         return Ok(());
     }
     let native_usdc = Address::new(ARBITRUM_NATIVE_USDC)?;
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
-    for pair in pairs {
-        let entry = raw.get(pair).ok_or_else(|| {
-            format!("live execution pair '{pair}' missing from --dex-address-book")
-        })?;
-        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
-            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
-        })?;
-        for (symbol, address) in [(base_symbol, &entry.base), (quote_symbol, &entry.quote)] {
-            if symbol.eq_ignore_ascii_case("USDC") {
-                let parsed = Address::new(address)?;
-                if parsed != native_usdc {
-                    return Err(format!(
-                        "live execution pair '{pair}' uses symbol USDC for token {}; on Arbitrum live CEX↔DEX accounting requires native USDC {ARBITRUM_NATIVE_USDC}; use a distinct symbol such as USDC_E for bridged USDC.e",
-                        parsed
-                    )
-                    .into());
-                }
-            }
-        }
-    }
-    Ok(())
+    let address_book = load_parsed_address_book(path)?;
+    let selected = selected_pairs(&address_book, pairs)?;
+    validate_arbitrum_known_token_symbols(&selected, &native_usdc)
 }
 
 fn validate_live_asset_symbol_uniqueness(
     path: &str,
     pairs: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
-    let mut by_symbol: HashMap<String, (String, String)> = HashMap::new();
-    for pair in pairs {
-        let entry = raw.get(pair).ok_or_else(|| {
-            format!("live execution pair '{pair}' missing from --dex-address-book")
-        })?;
-        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
-            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
-        })?;
-        for (symbol, address) in [(base_symbol, &entry.base), (quote_symbol, &entry.quote)] {
-            let key = symbol.to_ascii_uppercase();
-            let parsed = Address::new(address)?;
-            let lower = parsed.lower();
-            if let Some((seen_address, seen_pair)) = by_symbol.get(&key) {
-                if seen_address != &lower {
-                    return Err(format!(
-                        "live execution asset symbol '{key}' maps to multiple token addresses across selected pairs: {seen_address} in {seen_pair}, {lower} in {pair}; use distinct symbols such as USDC and USDC_E"
-                    )
-                    .into());
-                }
-            } else {
-                by_symbol.insert(key, (lower, pair.clone()));
-            }
-        }
-    }
-    Ok(())
+    let address_book = load_parsed_address_book(path)?;
+    let selected = selected_pairs(&address_book, pairs)?;
+    validate_asset_symbol_uniqueness(&selected)
 }
 
 fn live_execution_pool_kinds(
     path: &str,
     pairs: &[String],
 ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
-    let mut has_v2 = false;
-    let mut has_v3 = false;
-    for pair in pairs {
-        let entry = raw.get(pair).ok_or_else(|| {
-            format!("live execution pair '{pair}' missing from --dex-address-book")
-        })?;
-        match entry.pool_type.to_ascii_lowercase().as_str() {
-            "v2" => has_v2 = true,
-            "v3" => has_v3 = true,
-            other => {
-                return Err(format!(
-                    "live execution pair '{pair}' has unsupported pool_type '{other}'"
-                )
-                .into());
-            }
-        }
-    }
-    Ok((has_v2, has_v3))
+    let address_book = load_parsed_address_book(path)?;
+    let selected = selected_pairs(&address_book, pairs)?;
+    Ok(selected_pool_kinds(&selected))
 }
 
 fn build_rebalance_transfer_context(
@@ -3161,7 +4384,7 @@ fn build_rebalance_transfer_context(
     }
     let rpc_urls = resolve_rpc_urls(cli)
         .ok_or("live rebalance requires --eth-rpc-url or ETH_RPC_URL for Wallet→CEX transfers")?;
-    let chain = ChainClient::new(rpc_urls, 30, 3)?;
+    let chain = ChainClient::new(rpc_urls, RPC_TIMEOUT_SECS, RPC_RETRIES)?;
     let wallet = WalletManager::from_env(&cli.wallet_key_env)?;
     let cex_withdraw_address = if cli.rebalance_cex_withdraw_address.is_empty() {
         wallet.address()
@@ -3180,6 +4403,14 @@ fn build_rebalance_transfer_context(
     } else {
         load_rebalance_token_book(&cli.dex_address_book)?
     };
+    validate_rebalance_weth_transfer_config(
+        &parse_rebalance_csv_upper(&cli.rebalance_allowed_assets),
+        &token_book,
+        cli.rebalance_chain_id,
+        &cex_withdraw_address,
+        &wallet.address(),
+    )
+    .map_err(|e| format!("invalid WETH rebalance transfer config: {e}"))?;
     info!(
         cex_withdraw_address = %cex_withdraw_address,
         cex_withdraw_network = %cli.rebalance_cex_withdraw_network,
@@ -3199,59 +4430,39 @@ fn build_rebalance_transfer_context(
         token_book,
         chain_id: cli.rebalance_chain_id,
         max_gas_gwei: (cli.max_gas_gwei > 0).then_some(cli.max_gas_gwei),
+        transfer_confirm_timeout: Duration::from_secs(
+            cli.rebalance_transfer_confirm_timeout_secs.max(1),
+        ),
+        transfer_confirm_poll: Duration::from_secs(cli.rebalance_transfer_confirm_poll_secs.max(1)),
     }))
 }
 
 fn load_rebalance_token_book(
     path: &str,
 ) -> Result<HashMap<String, RebalanceTokenConfig>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
-    let mut out = HashMap::new();
-    for (pair, entry) in raw {
-        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
-            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
-        })?;
-        out.entry(base_symbol.to_ascii_uppercase())
-            .or_insert(RebalanceTokenConfig {
-                address: Address::new(&entry.base)?,
-                decimals: entry.base_decimals,
-            });
-        out.entry(quote_symbol.to_ascii_uppercase())
-            .or_insert(RebalanceTokenConfig {
-                address: Address::new(&entry.quote)?,
-                decimals: entry.quote_decimals,
-            });
-    }
-    Ok(out)
+    let pairs = load_parsed_address_book(path)?;
+    Ok(rebalance_token_book(&pairs))
 }
 
 fn load_address_book(path: &str) -> Result<PairAddressBook, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let pairs = load_parsed_address_book(path)?;
     let mut book = PairAddressBook::new();
-    for (pair, entry) in raw {
+    for pair in pairs {
         book.insert(
-            pair,
+            pair.pair,
             PairTokens {
-                base: Address::new(&entry.base)?,
-                base_decimals: entry.base_decimals,
-                quote: Address::new(&entry.quote)?,
-                quote_decimals: entry.quote_decimals,
-                pool_kind: match entry.pool_type.to_ascii_lowercase().as_str() {
-                    "v2" => DexPoolKind::V2,
-                    "v3" => DexPoolKind::V3,
-                    other => {
-                        return Err(format!(
-                            "pair has unsupported pool_type '{other}', expected 'v2' or 'v3'"
-                        )
-                        .into());
-                    }
+                base: pair.base,
+                base_decimals: pair.base_decimals,
+                quote: pair.quote,
+                quote_decimals: pair.quote_decimals,
+                pool_kind: match pair.pool_kind {
+                    AddressBookPoolKind::V2 => DexPoolKind::V2,
+                    AddressBookPoolKind::V3 => DexPoolKind::V3,
                 },
-                v3_fee: entry.v3_fee,
-                v3_path: parse_optional_v3_path(entry.v3_path)?,
-                v3_fees: entry.v3_fees,
-                v3_quoter: entry.quoter.as_deref().map(Address::new).transpose()?,
+                v3_fee: pair.v3_fee,
+                v3_path: pair.v3_path,
+                v3_fees: pair.v3_fees,
+                v3_quoter: pair.quoter,
             },
         );
     }
@@ -3286,42 +4497,34 @@ async fn load_address_book_with_fee_discovery(
     chain: &ChainClient,
     chain_id: u64,
 ) -> Result<PairAddressBook, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let pairs = load_parsed_address_book(path)?;
     let mut book = PairAddressBook::new();
-    for (pair, entry) in raw {
-        let pool_kind = match entry.pool_type.to_ascii_lowercase().as_str() {
-            "v2" => DexPoolKind::V2,
-            "v3" => DexPoolKind::V3,
-            other => {
-                return Err(format!(
-                    "pair has unsupported pool_type '{other}', expected 'v2' or 'v3'"
-                )
-                .into());
-            }
+    for pair in pairs {
+        let pool_kind = match pair.pool_kind {
+            AddressBookPoolKind::V2 => DexPoolKind::V2,
+            AddressBookPoolKind::V3 => DexPoolKind::V3,
         };
         let v3_fee =
-            if pool_kind == DexPoolKind::V3 && entry.v3_fee.is_none() && entry.v3_path.is_none() {
-                let pool = entry
-                    .pool
-                    .as_deref()
-                    .ok_or_else(|| format!("pair '{pair}' missing pool for V3 fee discovery"))?;
-                Some(discover_v3_pool_fee(chain, &Address::new(pool)?, chain_id).await?)
+            if pool_kind == DexPoolKind::V3 && pair.v3_fee.is_none() && pair.v3_path.is_none() {
+                let pool = pair.pool.as_ref().ok_or_else(|| {
+                    format!("pair '{}' missing pool for V3 fee discovery", pair.pair)
+                })?;
+                Some(discover_v3_pool_fee(chain, pool, chain_id).await?)
             } else {
-                entry.v3_fee
+                pair.v3_fee
             };
         book.insert(
-            pair,
+            pair.pair,
             PairTokens {
-                base: Address::new(&entry.base)?,
-                base_decimals: entry.base_decimals,
-                quote: Address::new(&entry.quote)?,
-                quote_decimals: entry.quote_decimals,
+                base: pair.base,
+                base_decimals: pair.base_decimals,
+                quote: pair.quote,
+                quote_decimals: pair.quote_decimals,
                 pool_kind,
                 v3_fee,
-                v3_path: parse_optional_v3_path(entry.v3_path)?,
-                v3_fees: entry.v3_fees,
-                v3_quoter: entry.quoter.as_deref().map(Address::new).transpose()?,
+                v3_path: pair.v3_path,
+                v3_fees: pair.v3_fees,
+                v3_quoter: pair.quoter,
             },
         );
     }
@@ -3340,66 +4543,55 @@ fn load_live_pool_book(
     pair_filter: Option<&[String]>,
 ) -> Result<Vec<LivePoolEntry>, Box<dyn std::error::Error>> {
     use peanut_internship_rust::core::types::Token;
-    let content = std::fs::read_to_string(path)?;
-    let raw: std::collections::HashMap<String, AddressBookEntry> = serde_json::from_str(&content)?;
+    let pairs = load_parsed_address_book(path)?;
     let mut out = Vec::new();
-    for (pair, entry) in raw {
+    for pair in pairs {
         if let Some(filter) = pair_filter
-            && !filter.iter().any(|wanted| wanted == &pair)
+            && !filter.iter().any(|wanted| wanted == &pair.pair)
         {
             continue;
         }
-        let Some(pool_str) = entry.pool.as_deref() else {
+        let Some(pool) = pair.pool else {
             continue;
         };
-        let (base_symbol, quote_symbol) = pair.split_once('/').ok_or_else(|| {
-            format!("pair '{pair}' missing '/' separator; cannot infer token symbols")
-        })?;
-        let pool = Address::new(pool_str)?;
-        let kind = match entry.pool_type.to_ascii_lowercase().as_str() {
-            "v2" => LivePoolKind::V2,
-            "v3" => LivePoolKind::V3,
-            other => {
-                return Err(format!(
-                    "pair '{pair}' has unsupported pool_type '{other}', expected 'v2' or 'v3'"
-                )
-                .into());
-            }
+        let kind = match pair.pool_kind {
+            AddressBookPoolKind::V2 => LivePoolKind::V2,
+            AddressBookPoolKind::V3 => LivePoolKind::V3,
         };
         let quoter = match kind {
             LivePoolKind::V2 => None,
             LivePoolKind::V3 => {
-                let quoter_address = entry
+                let quoter_address = pair
                     .quoter
-                    .as_deref()
-                    .unwrap_or(ARBITRUM_UNISWAP_V3_QUOTER_V2);
-                let quoter_kind = match entry.quoter_type.to_ascii_lowercase().as_str() {
+                    .unwrap_or(Address::new(ARBITRUM_UNISWAP_V3_QUOTER_V2)?);
+                let quoter_kind = match pair.quoter_type.to_ascii_lowercase().as_str() {
                     "v2" | "quoter_v2" => V3QuoterKind::QuoterV2,
                     other => {
                         return Err(format!(
-                            "pair '{pair}' has unsupported quoter_type '{other}', expected 'quoter_v2'"
+                            "pair '{}' has unsupported quoter_type '{other}', expected 'quoter_v2'",
+                            pair.pair
                         )
                         .into());
                     }
                 };
                 Some(V3QuoterConfig {
-                    address: Address::new(quoter_address)?,
+                    address: quoter_address,
                     kind: quoter_kind,
                 })
             }
         };
         let base = Token {
-            address: Address::new(&entry.base)?,
-            symbol: base_symbol.to_string(),
-            decimals: entry.base_decimals,
+            address: pair.base,
+            symbol: pair.base_symbol,
+            decimals: pair.base_decimals,
         };
         let quote = Token {
-            address: Address::new(&entry.quote)?,
-            symbol: quote_symbol.to_string(),
-            decimals: entry.quote_decimals,
+            address: pair.quote,
+            symbol: pair.quote_symbol,
+            decimals: pair.quote_decimals,
         };
         out.push(LivePoolConfig {
-            pair_name: pair,
+            pair_name: pair.pair,
             address: pool,
             base,
             quote,
@@ -3538,7 +4730,50 @@ async fn handle_reconcile_outcomes(
                 );
             }
             TickOutcome::ReceiptReverted => {
-                let size = Decimal::from_str_exact(&entry.leg1_fill_size).unwrap_or(Decimal::ZERO);
+                let size = match Decimal::from_str_exact(&entry.leg1_fill_size) {
+                    Ok(size) if size > Decimal::ZERO => size,
+                    Ok(size) => {
+                        error!(
+                            signal = %entry.signal_id,
+                            pair = %entry.pair,
+                            size = %size,
+                            "reconcile: invalid non-positive leg1 fill size; cannot unwind"
+                        );
+                        emit_best_effort(
+                            alert_sink,
+                            &AlertEvent::ExecutionFailed {
+                                signal_id: entry.signal_id,
+                                pair: entry.pair,
+                                reason: format!(
+                                    "leg2 reverted on-chain but unwind size was non-positive ({size})"
+                                ),
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
+                            signal = %entry.signal_id,
+                            pair = %entry.pair,
+                            raw_size = %entry.leg1_fill_size,
+                            error = %e,
+                            "reconcile: failed to parse leg1 fill size; cannot unwind"
+                        );
+                        emit_best_effort(
+                            alert_sink,
+                            &AlertEvent::ExecutionFailed {
+                                signal_id: entry.signal_id,
+                                pair: entry.pair,
+                                reason: format!(
+                                    "leg2 reverted on-chain but unwind size could not be parsed: {e}"
+                                ),
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 if let Err(e) = legs
                     .unwind_position(&entry.pair, &entry.leg1_venue, entry.direction, size)
                     .await
@@ -3580,14 +4815,11 @@ fn execution_to_arb_record(
     ctx: &peanut_internship_rust::executor::engine::ExecutionContext,
 ) -> ArbRecord {
     let signal = &ctx.signal;
-    let parts: Vec<&str> = signal.pair.split('/').collect();
-    let quote = parts
-        .get(1)
-        .copied()
-        .map(|q| q.to_string())
-        .unwrap_or_else(|| {
-            warn!(pair = %signal.pair, "malformed pair in arb record; defaulting fee_asset to USDT");
-            "USDT".to_string()
+    let quote = split_pair(&signal.pair)
+        .map(|(_, quote)| quote.to_string())
+        .unwrap_or_else(|error| {
+            warn!(pair = %signal.pair, error = %error, "malformed pair in arb record; leaving fee_asset empty");
+            String::new()
         });
 
     // Map leg1/leg2 -> buy/sell. This depends on BOTH the direction (which
@@ -3608,19 +4840,36 @@ fn execution_to_arb_record(
         (signal.direction, ctx.leg1_venue),
         (Direction::BuyCexSellDex, "cex") | (Direction::BuyDexSellCex, "dex")
     );
-    let (buy_size, buy_price, sell_size, sell_price) = if buy_is_leg1 {
+    let (
+        buy_size,
+        buy_price,
+        buy_fee,
+        buy_fee_asset,
+        sell_size,
+        sell_price,
+        sell_fee,
+        sell_fee_asset,
+    ) = if buy_is_leg1 {
         (
             ctx.leg1_fill_size,
             ctx.leg1_fill_price,
+            ctx.leg1_fee,
+            ctx.leg1_fee_asset.clone().unwrap_or_else(|| quote.clone()),
             ctx.leg2_fill_size,
             ctx.leg2_fill_price,
+            ctx.leg2_fee,
+            ctx.leg2_fee_asset.clone().unwrap_or_else(|| quote.clone()),
         )
     } else {
         (
             ctx.leg2_fill_size,
             ctx.leg2_fill_price,
+            ctx.leg2_fee,
+            ctx.leg2_fee_asset.clone().unwrap_or_else(|| quote.clone()),
             ctx.leg1_fill_size,
             ctx.leg1_fill_price,
+            ctx.leg1_fee,
+            ctx.leg1_fee_asset.clone().unwrap_or_else(|| quote.clone()),
         )
     };
 
@@ -3641,6 +4890,21 @@ fn execution_to_arb_record(
         warn!(signal = %signal.signal_id, "arb record missing leg2 fill data");
     }
 
+    let expected_quote_value = signal.size * signal.cex_price;
+    let quote_usd_price = if expected_quote_value > Decimal::ZERO {
+        signal.notional_usd / expected_quote_value
+    } else {
+        warn!(
+            signal = %signal.signal_id,
+            pair = %signal.pair,
+            size = %signal.size,
+            cex_price = %signal.cex_price,
+            notional_usd = %signal.notional_usd,
+            "arb record could not derive quote_usd_price; recording leg prices without USD conversion"
+        );
+        Decimal::ONE
+    };
+
     let buy_leg = TradeLeg {
         id: format!("{}_buy", signal.signal_id),
         timestamp: started,
@@ -3648,9 +4912,9 @@ fn execution_to_arb_record(
         symbol: signal.pair.clone(),
         side: "buy".into(),
         amount: buy_size.unwrap_or(Decimal::ZERO),
-        price: buy_price.unwrap_or(Decimal::ZERO),
-        fee: Decimal::ZERO,
-        fee_asset: quote.clone(),
+        price: buy_price.unwrap_or(Decimal::ZERO) * quote_usd_price,
+        fee: buy_fee,
+        fee_asset: buy_fee_asset,
     };
     let sell_leg = TradeLeg {
         id: format!("{}_sell", signal.signal_id),
@@ -3659,17 +4923,47 @@ fn execution_to_arb_record(
         symbol: signal.pair.clone(),
         side: "sell".into(),
         amount: sell_size.unwrap_or(Decimal::ZERO),
-        price: sell_price.unwrap_or(Decimal::ZERO),
-        fee: Decimal::ZERO,
-        fee_asset: quote,
+        price: sell_price.unwrap_or(Decimal::ZERO) * quote_usd_price,
+        fee: sell_fee,
+        fee_asset: sell_fee_asset,
     };
+
+    let actual_gas_cost_usd = ctx.actual_onchain_gas_fee_usd.unwrap_or_else(|| {
+        warn!(
+            signal = %signal.signal_id,
+            "arb record missing actual on-chain gas fee; recording gas_cost_usd as zero"
+        );
+        Decimal::ZERO
+    });
 
     ArbRecord {
         id: signal.signal_id.clone(),
         timestamp: started,
         buy_leg,
         sell_leg,
-        gas_cost_usd: Decimal::ZERO,
+        gas_cost_usd: actual_gas_cost_usd,
+        expected_gross_pnl_usd: signal.expected_gross_pnl,
+        expected_fees_usd: signal.expected_fees,
+        expected_net_pnl_usd: signal.expected_net_pnl,
+        actual_gross_pnl_usd: ctx.actual_gross_pnl_usd.unwrap_or_else(|| {
+            warn!(signal = %signal.signal_id, "arb record missing actual gross PnL");
+            Decimal::ZERO
+        }),
+        actual_fees_usd: ctx.actual_fees_usd.unwrap_or_else(|| {
+            warn!(signal = %signal.signal_id, "arb record missing actual fees");
+            Decimal::ZERO
+        }),
+        actual_cex_fee_usd: ctx.actual_cex_fee_usd.unwrap_or_else(|| {
+            warn!(signal = %signal.signal_id, "arb record missing actual CEX fee");
+            Decimal::ZERO
+        }),
+        actual_onchain_gas_fee_usd: actual_gas_cost_usd,
+        actual_net_pnl_usd: ctx.actual_net_pnl.unwrap_or_else(|| {
+            warn!(signal = %signal.signal_id, "arb record missing actual net PnL");
+            Decimal::ZERO
+        }),
+        onchain_gas_used: ctx.onchain_gas_used.map(|v| v.to_string()),
+        onchain_gas_fee_wei: ctx.onchain_gas_fee_wei.map(|v| v.to_string()),
     }
 }
 
@@ -3716,23 +5010,70 @@ fn parse_seed_spec(
     Ok((venue, balances))
 }
 
+fn seed_inventory_balances(
+    tracker: &mut InventoryTracker,
+    venue: Venue,
+    balances: HashMap<String, Decimal>,
+) {
+    if venue.is_cex() {
+        let normalized = balances
+            .into_iter()
+            .map(|(asset, amount)| {
+                (
+                    asset,
+                    NormalizedBalance {
+                        free: amount,
+                        locked: Decimal::ZERO,
+                        total: amount,
+                    },
+                )
+            })
+            .collect();
+        tracker.update_from_cex(venue, normalized);
+    } else {
+        tracker.update_from_wallet(venue, balances);
+    }
+}
+
 #[cfg(test)]
 mod seed_tests {
     use super::*;
+
+    struct FixedOrderBookSource;
+
+    #[async_trait]
+    impl CexOrderBookSource for FixedOrderBookSource {
+        async fn fetch_order_book(
+            &self,
+            pair: &str,
+            _limit: u32,
+        ) -> peanut_internship_rust::strategy::StrategyResult<OrderBookSnapshot> {
+            Ok(OrderBookSnapshot {
+                symbol: pair.to_string(),
+                timestamp: 0,
+                bids: vec![(Decimal::ONE, Decimal::ONE)],
+                asks: vec![(Decimal::ONE, Decimal::ONE)],
+                best_bid: Some((Decimal::ONE, Decimal::ONE)),
+                best_ask: Some((Decimal::ONE, Decimal::ONE)),
+                mid_price: Some(Decimal::ONE),
+                spread_bps: Some(Decimal::ZERO),
+            })
+        }
+    }
 
     #[test]
     fn parses_binance_single_asset() {
         let (venue, map) = parse_seed_spec("binance:USDT=10000").unwrap();
         assert_eq!(venue, Venue::Binance);
-        assert_eq!(map.get("USDT"), Some(&Decimal::from(10000)));
+        assert_eq!(map.get(USDT_SYMBOL), Some(&Decimal::from(10000)));
     }
 
     #[test]
     fn parses_wallet_multi_with_case_insensitive_venue_and_asset() {
         let (venue, map) = parse_seed_spec("Wallet: eth=2.5 , usdc=100").unwrap();
         assert_eq!(venue, Venue::Wallet);
-        assert_eq!(map.get("ETH"), Some(&Decimal::new(25, 1)));
-        assert_eq!(map.get("USDC"), Some(&Decimal::from(100)));
+        assert_eq!(map.get(ETH_SYMBOL), Some(&Decimal::new(25, 1)));
+        assert_eq!(map.get(USDC_SYMBOL), Some(&Decimal::from(100)));
     }
 
     #[test]
@@ -3753,6 +5094,65 @@ mod seed_tests {
     #[test]
     fn rejects_invalid_amount() {
         assert!(parse_seed_spec("binance:USDT=notanumber").is_err());
+    }
+
+    #[test]
+    fn seed_inventory_canonicalizes_cex_eth_to_weth_on_arbitrum() {
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], ARBITRUM_CHAIN_ID);
+        let (_, binance_balances) = parse_seed_spec("binance:ETH=0.05").unwrap();
+        seed_inventory_balances(&mut tracker, Venue::Binance, binance_balances);
+        assert_eq!(
+            tracker.get_total(Venue::Binance, WETH_SYMBOL),
+            Some(Decimal::new(5, 2))
+        );
+        assert_eq!(tracker.get_total(Venue::Binance, ETH_SYMBOL), None);
+    }
+
+    #[test]
+    fn seed_inventory_keeps_wallet_eth_native() {
+        let mut tracker =
+            InventoryTracker::new(vec![Venue::Binance, Venue::Wallet], ARBITRUM_CHAIN_ID);
+        let (_, wallet_balances) = parse_seed_spec("wallet:ETH=0.05").unwrap();
+        seed_inventory_balances(&mut tracker, Venue::Wallet, wallet_balances);
+        assert_eq!(
+            tracker.get_total(Venue::Wallet, ETH_SYMBOL),
+            Some(Decimal::new(5, 2))
+        );
+        assert_eq!(tracker.get_total(Venue::Wallet, WETH_SYMBOL), None);
+    }
+
+    #[tokio::test]
+    async fn rebalance_max_step_usd_rejects_oversized_dry_run_step() {
+        let price_source = Arc::new(AnyPriceSource::Stub(StubPriceSource::new_with_order_books(
+            Arc::new(FixedOrderBookSource),
+        )));
+        let config = RebalanceLoopConfig {
+            dry_run: true,
+            interval: Duration::from_secs(60),
+            threshold_pct: 10.0,
+            quote_asset: USDC_SYMBOL.to_string(),
+            max_slippage_bps: Decimal::from(50),
+            allowed_assets: vec![LINK_SYMBOL.to_string()],
+            allowed_venues: vec!["wallet".to_string(), "binance".to_string()],
+            max_step_usd: Decimal::from(5),
+            min_fill_pct: 1.0,
+            pause_trading: false,
+            balance_verify_tolerance_pct: Decimal::ONE,
+            journal_path: String::new(),
+        };
+        let step =
+            RebalanceStep::Withdraw(peanut_internship_rust::inventory::types::WithdrawStep {
+                from_venue: Venue::Wallet,
+                to_venue: Venue::Binance,
+                asset: LINK_SYMBOL.to_string(),
+                amount: Decimal::new(75, 1),
+                fee: Decimal::ZERO,
+            });
+        let err = validate_rebalance_step(&step, &config, &price_source)
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeds max"));
     }
 
     #[test]
@@ -3787,6 +5187,282 @@ mod seed_tests {
             tracked_pairs_for_price_source(&["LINK/ETH".to_string(), "ETH/USDC".to_string()]),
             vec!["LINK/ETH".to_string(), "ETH/USDC".to_string()]
         );
+    }
+
+    #[test]
+    fn rebalance_csv_parsers_normalize_values() {
+        assert_eq!(
+            parse_rebalance_csv_upper(" link, ETH ,,"),
+            vec![LINK_SYMBOL.to_string(), ETH_SYMBOL.to_string()]
+        );
+        assert_eq!(
+            parse_rebalance_csv_lower(" Binance, WALLET ,,"),
+            vec!["binance".to_string(), "wallet".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebalance_weth_helpers_alias_to_eth_where_required() {
+        assert_eq!(rebalance_cex_asset(WETH_SYMBOL), ETH_SYMBOL);
+        assert_eq!(rebalance_cex_asset("link"), LINK_SYMBOL);
+        assert_eq!(rebalance_pricing_asset(WETH_SYMBOL), ETH_SYMBOL);
+        assert_eq!(rebalance_pricing_asset("link"), LINK_SYMBOL);
+    }
+
+    #[test]
+    fn rebalance_asset_allowlist_accepts_weth_when_allowed() {
+        let step =
+            RebalanceStep::Withdraw(peanut_internship_rust::inventory::types::WithdrawStep {
+                from_venue: Venue::Binance,
+                to_venue: Venue::Wallet,
+                asset: WETH_SYMBOL.to_string(),
+                amount: Decimal::ONE,
+                fee: Decimal::ZERO,
+            });
+        validate_rebalance_assets(
+            &step,
+            &[
+                LINK_SYMBOL.to_string(),
+                ETH_SYMBOL.to_string(),
+                WETH_SYMBOL.to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rebalance_native_balance_requirement_includes_gas_reserve() {
+        let required = native_balance_required_for_value_and_gas(
+            U256::from(1_000u64),
+            U256::from(10u64),
+            REBALANCE_WETH_WRAP_GAS_LIMIT,
+        );
+        assert_eq!(
+            required,
+            U256::from(1_000u64) + U256::from(10u64) * U256::from(REBALANCE_WETH_WRAP_GAS_LIMIT)
+        );
+    }
+
+    #[test]
+    fn rebalance_weth_transfer_config_accepts_arbitrum_weth() {
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let mut token_book = HashMap::new();
+        token_book.insert(
+            ETH_SYMBOL.to_string(),
+            AddressBookTokenConfig {
+                address: Address::new(ARBITRUM_WETH_ADDRESS).unwrap(),
+                decimals: ETH_DECIMALS,
+            },
+        );
+        validate_rebalance_weth_transfer_config(
+            &[WETH_SYMBOL.to_string()],
+            &token_book,
+            ARBITRUM_CHAIN_ID,
+            wallet,
+            wallet,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rebalance_weth_transfer_config_rejects_non_signer_withdraw_address() {
+        let mut token_book = HashMap::new();
+        token_book.insert(
+            WETH_SYMBOL.to_string(),
+            AddressBookTokenConfig {
+                address: Address::new(ARBITRUM_WETH_ADDRESS).unwrap(),
+                decimals: ETH_DECIMALS,
+            },
+        );
+        let err = validate_rebalance_weth_transfer_config(
+            &[WETH_SYMBOL.to_string()],
+            &token_book,
+            ARBITRUM_CHAIN_ID,
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        )
+        .unwrap_err();
+        assert!(err.contains("signer wallet"));
+    }
+
+    #[test]
+    fn rebalance_weth_transfer_config_rejects_wrong_weth_address() {
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let mut token_book = HashMap::new();
+        token_book.insert(
+            WETH_SYMBOL.to_string(),
+            AddressBookTokenConfig {
+                address: Address::new("0x3333333333333333333333333333333333333333").unwrap(),
+                decimals: ETH_DECIMALS,
+            },
+        );
+        let err = validate_rebalance_weth_transfer_config(
+            &[WETH_SYMBOL.to_string()],
+            &token_book,
+            ARBITRUM_CHAIN_ID,
+            wallet,
+            wallet,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not match Arbitrum WETH"));
+    }
+
+    #[test]
+    fn rebalance_asset_allowlist_rejects_unlisted_quote_asset() {
+        let step = RebalanceStep::Trade(peanut_internship_rust::inventory::types::TradeStep {
+            venue: Venue::Binance,
+            symbol: "LINKUSDT".to_string(),
+            side: "SELL".to_string(),
+            base_asset: "LINK".to_string(),
+            quote_asset: USDT_SYMBOL.to_string(),
+            amount: Decimal::ONE,
+            max_slippage_bps: Decimal::from(50),
+        });
+        let err =
+            validate_rebalance_assets(&step, &[LINK_SYMBOL.to_string(), ETH_SYMBOL.to_string()])
+                .unwrap_err();
+        assert!(err.contains(USDT_SYMBOL));
+    }
+
+    #[test]
+    fn rebalance_venue_allowlist_rejects_unlisted_venue() {
+        let step =
+            RebalanceStep::Withdraw(peanut_internship_rust::inventory::types::WithdrawStep {
+                from_venue: Venue::Bybit,
+                to_venue: Venue::Wallet,
+                asset: "LINK".to_string(),
+                amount: Decimal::ONE,
+                fee: Decimal::ZERO,
+            });
+        let err = validate_rebalance_venues(&step, &["binance".to_string(), "wallet".to_string()])
+            .unwrap_err();
+        assert!(err.contains("bybit"));
+    }
+
+    #[test]
+    fn dex_pool_fee_map_converts_v3_fee_tier_to_bps() {
+        let file = write_address_book(
+            r#"{
+                "LINK/ETH": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 18,
+                    "pool": "0x0000000000000000000000000000000000000003",
+                    "pool_type": "v3",
+                    "fee": 3000
+                },
+                "ETH/USDC": {
+                    "base": "0x0000000000000000000000000000000000000001",
+                    "base_decimals": 18,
+                    "quote": "0x0000000000000000000000000000000000000002",
+                    "quote_decimals": 6,
+                    "pool": "0x0000000000000000000000000000000000000004",
+                    "pool_type": "v2"
+                }
+            }"#,
+        );
+        let fees = load_dex_pool_fee_bps_map(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(fees.get("LINK/ETH"), Some(&Decimal::from(30)));
+        assert_eq!(fees.get("ETH/USDC"), Some(&Decimal::from(30)));
+    }
+
+    fn sample_capital_config(
+        withdraw_enable: bool,
+        withdraw_min: Decimal,
+        withdraw_fee: Decimal,
+    ) -> Vec<peanut_internship_rust::exchange::CapitalCoinConfig> {
+        vec![peanut_internship_rust::exchange::CapitalCoinConfig {
+            coin: LINK_SYMBOL.to_string(),
+            name: Some("ChainLink".to_string()),
+            networks: vec![peanut_internship_rust::exchange::CapitalNetworkConfig {
+                network: DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK.to_string(),
+                name: Some("Arbitrum One".to_string()),
+                withdraw_enable,
+                deposit_enable: true,
+                withdraw_fee,
+                withdraw_min,
+            }],
+        }]
+    }
+
+    fn sample_withdraw_step(
+        fee: Decimal,
+    ) -> peanut_internship_rust::inventory::types::WithdrawStep {
+        peanut_internship_rust::inventory::types::WithdrawStep {
+            from_venue: Venue::Binance,
+            to_venue: Venue::Wallet,
+            asset: "LINK".to_string(),
+            amount: Decimal::from(5),
+            fee,
+        }
+    }
+
+    #[test]
+    fn binance_withdrawal_capability_accepts_enabled_network() {
+        let configs =
+            sample_capital_config(true, Decimal::ONE, Decimal::from_str_exact("0.1").unwrap());
+        let withdraw = sample_withdraw_step(Decimal::from_str_exact("0.1").unwrap());
+        assert!(
+            validate_binance_withdrawal_capability(
+                &configs,
+                &withdraw,
+                Decimal::from_str_exact("4.9").unwrap(),
+                DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn binance_withdrawal_capability_rejects_wrong_network() {
+        let configs = sample_capital_config(true, Decimal::ONE, Decimal::ZERO);
+        let withdraw = sample_withdraw_step(Decimal::ZERO);
+        let err = validate_binance_withdrawal_capability(
+            &configs,
+            &withdraw,
+            Decimal::from(5),
+            ETH_SYMBOL,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not support withdrawal network"));
+    }
+
+    #[test]
+    fn binance_withdrawal_capability_rejects_disabled_network() {
+        let configs = sample_capital_config(false, Decimal::ONE, Decimal::ZERO);
+        let withdraw = sample_withdraw_step(Decimal::ZERO);
+        let err = validate_binance_withdrawal_capability(
+            &configs,
+            &withdraw,
+            Decimal::from(5),
+            DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK,
+        )
+        .unwrap_err();
+        assert!(err.contains("withdrawal disabled"));
+    }
+
+    #[test]
+    fn binance_withdrawal_capability_rejects_minimum_and_fee() {
+        let configs = sample_capital_config(true, Decimal::from(10), Decimal::ONE);
+        let withdraw = sample_withdraw_step(Decimal::ZERO);
+        let min_err = validate_binance_withdrawal_capability(
+            &configs,
+            &withdraw,
+            Decimal::from(5),
+            DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK,
+        )
+        .unwrap_err();
+        assert!(min_err.contains("below minimum"));
+
+        let fee_err = validate_binance_withdrawal_capability(
+            &configs,
+            &withdraw,
+            Decimal::from(10),
+            DEFAULT_REBALANCE_CEX_WITHDRAW_NETWORK,
+        )
+        .unwrap_err();
+        assert!(fee_err.contains("below Binance fee"));
     }
 
     fn write_address_book(body: &str) -> tempfile::NamedTempFile {
